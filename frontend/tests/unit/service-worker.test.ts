@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 const origin = "https://hub.example.test";
 
@@ -67,10 +67,14 @@ function createHarness() {
   const networkCalls: Array<{ cache?: RequestCache; url: string }> = [];
   const notifications: Array<{ options: NotificationOptions; title: string }> = [];
   const navigations: string[] = [];
+  const focusedClients: string[] = [];
   const openedWindows: string[] = [];
   const controls = {
     apiStatus: 200,
+    manifestHangs: false,
     manifestOffline: false,
+    navigationFails: false,
+    navigationReturnsNull: false,
     navigationResponse: "html" as "external" | "html" | "text",
     networkOffline: false,
   };
@@ -102,6 +106,15 @@ function createHarness() {
       (controls.manifestOffline && pathname === "/manifest.webmanifest")
     )
       throw new TypeError("offline");
+    if (controls.manifestHangs && pathname === "/manifest.webmanifest") {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("The operation was aborted.", "AbortError")),
+          { once: true },
+        );
+      });
+    }
     if (pathname === "/runtime-config.js") return new Response("fresh-runtime-config");
     if (pathname === "/manifest.webmanifest") {
       return new Response('{"name":"Network Hub"}', {
@@ -134,10 +147,19 @@ function createHarness() {
     }
     return new Response("backend-metrics");
   };
+  const navigatedWindowClient = {
+    focus: async () => {
+      focusedClients.push("navigated");
+    },
+  };
   const windowClient = {
-    focus: async () => undefined,
+    focus: async () => {
+      focusedClients.push("original");
+    },
     navigate: async (url: string) => {
       navigations.push(url);
+      if (controls.navigationFails) throw new Error("stale window client");
+      return controls.navigationReturnsNull ? null : navigatedWindowClient;
     },
     url: `${origin}/settings`,
   };
@@ -162,17 +184,21 @@ function createHarness() {
     skipWaiting: async () => undefined,
   };
   vm.runInNewContext(readFileSync("public/sw.js", "utf8"), {
+    AbortController,
     Headers,
     Request,
     Response,
     URL,
     caches,
+    clearTimeout,
     fetch,
     self,
+    setTimeout,
   });
   return {
     caches,
     controls,
+    focusedClients,
     listeners,
     navigations,
     networkCalls,
@@ -218,6 +244,15 @@ describe("service worker fetch boundaries", () => {
     );
     expect(metricsResponse).toBeUndefined();
     expect(await (await shell.match("/"))?.text()).toBe("known-good-shell");
+  });
+
+  it("never caches or substitutes the VAPID public key", async () => {
+    const { listeners } = createHarness();
+    const vapidResponse = await dispatchFetch(
+      listeners.fetch,
+      request("/api/v1/push/vapid-public-key"),
+    );
+    expect(vapidResponse).toBeUndefined();
   });
 
   it("keeps runtime config network-only while manifest branding has an offline fallback", async () => {
@@ -287,9 +322,39 @@ describe("service worker fetch boundaries", () => {
 });
 
 describe("service worker push contract", () => {
+  it("shows a fallback notification when runtime branding stalls", async () => {
+    vi.useFakeTimers();
+    try {
+      const { controls, listeners, notifications } = createHarness();
+      controls.manifestHangs = true;
+      const pushed = dispatchWaitable(listeners.push, {
+        data: {
+          json: () => ({ body: "A visible notification must not wait for branding." }),
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(750);
+      await pushed;
+      expect(notifications).toHaveLength(1);
+      expect(notifications[0]).toMatchObject({
+        title: "Alert Hub: incident",
+        options: { body: "A visible notification must not wait for branding." },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("uses backend nested data/tag and confines notification clicks to SPA routes", async () => {
-    const { caches, controls, listeners, navigations, notifications, openedWindows } =
-      createHarness();
+    const {
+      caches,
+      controls,
+      focusedClients,
+      listeners,
+      navigations,
+      notifications,
+      openedWindows,
+    } = createHarness();
     controls.manifestOffline = true;
     const shell = await caches.open("alert-hub-v3-shell");
     await shell.put(
@@ -339,7 +404,33 @@ describe("service worker push contract", () => {
     });
     expect(closed).toBe(true);
     expect(navigations).toEqual([`${origin}/incidents`]);
+    expect(focusedClients).toEqual(["navigated"]);
     expect(openedWindows).toEqual([]);
+
+    controls.navigationFails = true;
+    await dispatchWaitable(listeners.notificationclick, {
+      notification: {
+        close: () => undefined,
+        data: { url: "/incidents/incident-42" },
+      },
+    });
+    expect(openedWindows).toEqual([`${origin}/incidents/incident-42`]);
+  });
+
+  it("opens a new app window when navigation returns no client", async () => {
+    const { controls, focusedClients, listeners, navigations, openedWindows } = createHarness();
+    controls.navigationReturnsNull = true;
+
+    await dispatchWaitable(listeners.notificationclick, {
+      notification: {
+        close: () => undefined,
+        data: { url: "/incidents/incident-42" },
+      },
+    });
+
+    expect(navigations).toEqual([`${origin}/incidents/incident-42`]);
+    expect(focusedClients).toEqual([]);
+    expect(openedWindows).toEqual([`${origin}/incidents/incident-42`]);
   });
 });
 

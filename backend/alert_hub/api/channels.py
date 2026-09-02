@@ -11,14 +11,23 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from alert_hub.api.dependencies import admin_user, get_db, get_envelope_cipher, get_settings
-from alert_hub.application.auth import add_audit
+from alert_hub.application.auth import (
+    add_audit,
+    disable_push_subscription,
+    disable_session_push_subscriptions,
+    eligible_push_subscriptions,
+    push_subscription_session_state,
+    push_subscription_state_requires_tombstone,
+)
 from alert_hub.application.incidents import append_cluster_event
 from alert_hub.application.notifications import (
     DeliveryResult,
     DeliveryTarget,
     NotificationMessage,
     ProviderRegistry,
+    advance_push_subscription_success,
     push_subscription_payload,
+    push_subscription_success_payload,
 )
 from alert_hub.infrastructure.db.base import new_id, utc_now
 from alert_hub.infrastructure.db.models import (
@@ -442,15 +451,15 @@ async def test_channel(
     config = _decrypt_config(channel, cipher)
     missing = _missing_fields(channel.kind, config)
     active_subscriptions = 0
+    subscriptions: list[PushSubscription | None] = [None]
     if channel.kind == "web_push":
-        active_subscriptions = int(
-            db.scalar(
-                select(func.count(PushSubscription.id)).where(
-                    PushSubscription.disabled_at.is_(None)
-                )
-            )
-            or 0
+        push_subscriptions = eligible_push_subscriptions(
+            db,
+            settings,
+            now=utc_now(),
         )
+        subscriptions = list(push_subscriptions)
+        active_subscriptions = len(push_subscriptions)
         if active_subscriptions == 0:
             missing.append("active_push_subscription")
     add_audit(
@@ -505,20 +514,9 @@ async def test_channel(
         annotations={},
         incident_url=settings.public_api_url,
     )
-    subscriptions: list[PushSubscription | None]
-    if channel.kind == "web_push":
-        subscriptions = list(
-            db.scalars(
-                select(PushSubscription)
-                .where(PushSubscription.disabled_at.is_(None))
-                .order_by(PushSubscription.id)
-            ).all()
-        )
-    else:
-        subscriptions = [None]
-
     outcomes: list[dict[str, Any]] = []
     gone_subscriptions: list[PushSubscription] = []
+    successful_subscriptions: list[PushSubscription] = []
     for subscription in subscriptions:
         if provider is None:
             result = DeliveryResult(
@@ -529,32 +527,64 @@ async def test_channel(
         else:
             endpoint = p256dh = auth = None
             if subscription is not None:
-                try:
-                    endpoint, p256dh, auth = decrypt_push_subscription(subscription, cipher)
-                except EncryptionError:
+                observed_at = utc_now()
+                session_state = push_subscription_session_state(
+                    db,
+                    subscription,
+                    now=observed_at,
+                )
+                if subscription.disabled_at is not None or session_state != "active":
+                    if (
+                        subscription.disabled_at is None
+                        and push_subscription_state_requires_tombstone(session_state)
+                    ):
+                        if subscription.session_id is not None:
+                            disable_session_push_subscriptions(
+                                db,
+                                subscription.session_id,
+                                settings,
+                                disabled_at=observed_at,
+                            )
+                        else:
+                            disable_push_subscription(
+                                db,
+                                subscription,
+                                settings,
+                                disabled_at=observed_at,
+                            )
+                        db.commit()
                     result = DeliveryResult(
                         "permanent",
-                        "configuration_error",
-                        "decrypt_failed",
+                        "not_configured",
+                        "inactive_session",
                     )
                 else:
-                    target = DeliveryTarget(
-                        channel_id=channel.id,
-                        channel_kind=channel.kind,
-                        config=config,
-                        subscription_id=subscription.id,
-                        endpoint=endpoint,
-                        p256dh=p256dh,
-                        auth=auth,
-                    )
                     try:
-                        result = await provider.send(message, target)
-                    except Exception:
+                        endpoint, p256dh, auth = decrypt_push_subscription(subscription, cipher)
+                    except EncryptionError:
                         result = DeliveryResult(
-                            "retryable",
-                            "transport_error",
-                            "provider_unavailable",
+                            "permanent",
+                            "configuration_error",
+                            "decrypt_failed",
                         )
+                    else:
+                        target = DeliveryTarget(
+                            channel_id=channel.id,
+                            channel_kind=channel.kind,
+                            config=config,
+                            subscription_id=subscription.id,
+                            endpoint=endpoint,
+                            p256dh=p256dh,
+                            auth=auth,
+                        )
+                        try:
+                            result = await provider.send(message, target)
+                        except Exception:
+                            result = DeliveryResult(
+                                "retryable",
+                                "transport_error",
+                                "provider_unavailable",
+                            )
             else:
                 target = DeliveryTarget(
                     channel_id=channel.id,
@@ -572,6 +602,9 @@ async def test_channel(
         if result.outcome == "gone" and subscription is not None:
             subscription.disabled_at = utc_now()
             gone_subscriptions.append(subscription)
+        elif result.outcome == "succeeded" and subscription is not None:
+            if advance_push_subscription_success(subscription, utc_now()):
+                successful_subscriptions.append(subscription)
         outcomes.append(
             {
                 "subscription_id": subscription.id if subscription is not None else None,
@@ -590,6 +623,19 @@ async def test_channel(
             operation="tombstone",
             payload=push_subscription_payload(subscription),
             occurred_at=subscription.disabled_at,
+        )
+    for subscription in successful_subscriptions:
+        succeeded_at = subscription.last_success_at
+        if succeeded_at is None:
+            continue
+        append_cluster_event(
+            db,
+            settings,
+            entity_type="push_subscription",
+            entity_id=subscription.id,
+            operation="delivery_success",
+            payload=push_subscription_success_payload(succeeded_at),
+            occurred_at=succeeded_at,
         )
     succeeded = sum(item["outcome"] == "succeeded" for item in outcomes)
     overall = (

@@ -25,13 +25,13 @@ APPROVED_FINDINGS = {
 }
 REVIEWED_SOURCE_DIGESTS = {
     "backend/alert_hub/api/auth.py": (
-        "9d3f94580193d0624050498de4b7d782f63bdb4c082e98d3244638baaab07200"
+        "4f1a3de109386c007c70d744ec0b2a31af2839b993ae6cffeca12f72b36ccd8e"
     ),
     "backend/alert_hub/api/dependencies.py": (
         "3c6f31d61bcef3950ce5fc2564b0f683e24f85004f32eda34d3193d9e7d91556"
     ),
     "backend/alert_hub/application/auth.py": (
-        "307a5bb3d61a88c23eafc5542c7b1be2247ad940ab4fb10e2edb765a403eec71"
+        "80d393b5300b561ae9eab121ba0f0a8137777becfe54b4d6dca24c130fa2b8b4"
     ),
     "backend/alert_hub/security.py": (
         "912f34432dbc46a2c801096d61fc5065bd2bf2c48c28c8acbd0b93707163cb58"

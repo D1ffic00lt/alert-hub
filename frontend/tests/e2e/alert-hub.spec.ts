@@ -1,9 +1,14 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page, type Route } from "@playwright/test";
+import { readFile } from "node:fs/promises";
+
+const TEST_TOKEN_EXPIRY_SECONDS = Math.floor(Date.now() / 1000) + 60 * 60;
+const TEST_VAPID_PUBLIC_KEY =
+  "BHqKzvWvL4jD7SjGmLTrgV9eQYB3sE0JQF3mVZl-B4gtUJvrYJJaM7_zsY4ErX5L5E8cTDPb5i7-pwQ6S2K4h3A";
 
 function token(sessionId: string) {
   const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
-  return `${encode({ alg: "none", typ: "JWT" })}.${encode({ sid: sessionId, exp: 4_102_444_800 })}.test`;
+  return `${encode({ alg: "none", typ: "JWT" })}.${encode({ sid: sessionId, exp: TEST_TOKEN_EXPIRY_SECONDS })}.test`;
 }
 
 async function fulfill(route: Route, body: unknown, status = 200) {
@@ -15,7 +20,14 @@ async function fulfill(route: Route, body: unknown, status = 200) {
 }
 
 type MockState = {
+  auditPageGate?: Promise<void> | null;
+  auditPageStarted?: (() => void) | null;
+  auditItems?: unknown[];
   authoritativeUnauthorized: boolean;
+  clusterResponseGates?: Promise<void>[];
+  clusterRequestStarted?: (() => void) | null;
+  clusterUnavailable?: boolean;
+  clusterStatus?: unknown;
   lateTokenRequests: string[];
   logoutRequests: number;
   primaryUnavailable: boolean;
@@ -23,13 +35,35 @@ type MockState = {
   refreshRequests: number;
   refreshStarted: (() => void) | null;
   sourceRequest: Record<string, unknown> | null;
+  liveEventSource?: boolean;
+  loginRequest?: Record<string, unknown> | null;
+  pushPublicKeyStatus?: number;
+  pushSubscriptionRequest?: Record<string, unknown> | null;
 };
 
 async function installApi(page: Page, state: MockState) {
-  await page.addInitScript(() => {
-    Object.defineProperty(window, "EventSource", { configurable: true, value: undefined });
+  await page.addInitScript((liveEventSource) => {
+    if (liveEventSource) {
+      class TestEventSource {
+        onopen: (() => void) | null = null;
+        onmessage: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+
+        constructor() {
+          queueMicrotask(() => this.onopen?.());
+        }
+
+        close() {}
+      }
+      Object.defineProperty(window, "EventSource", {
+        configurable: true,
+        value: TestEventSource as unknown as typeof EventSource,
+      });
+    } else {
+      Object.defineProperty(window, "EventSource", { configurable: true, value: undefined });
+    }
     localStorage.setItem("alert-hub-api-endpoints", JSON.stringify(["https://evil.invalid"]));
-  });
+  }, state.liveEventSource ?? false);
 
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
@@ -67,11 +101,40 @@ async function installApi(page: Page, state: MockState) {
       return;
     }
     if (method === "POST" && path === "/auth/login") {
+      state.loginRequest = request.postDataJSON() as Record<string, unknown>;
       await fulfill(route, {
         access_token: token("session-two"),
         expires_in: 900,
         user: { username: "second-admin" },
       });
+      return;
+    }
+    if (method === "GET" && path === "/push/vapid-public-key") {
+      if (state.pushPublicKeyStatus && state.pushPublicKeyStatus !== 200) {
+        await fulfill(
+          route,
+          { detail: "Web Push sender key is unavailable" },
+          state.pushPublicKeyStatus,
+        );
+      } else {
+        await fulfill(route, {
+          public_key: TEST_VAPID_PUBLIC_KEY,
+          vapid_public_key: TEST_VAPID_PUBLIC_KEY,
+        });
+      }
+      return;
+    }
+    if (method === "POST" && path === "/push/subscriptions") {
+      state.pushSubscriptionRequest = request.postDataJSON() as Record<string, unknown>;
+      await fulfill(
+        route,
+        {
+          id: "push-subscription-current",
+          device_name: "MacIntel · browser",
+          disabled_at: null,
+        },
+        201,
+      );
       return;
     }
     if (method === "POST" && path === "/auth/logout") {
@@ -119,13 +182,21 @@ async function installApi(page: Page, state: MockState) {
       await fulfill(route, { detail: "temporarily unavailable" }, 503);
       return;
     }
-
     if (method === "GET" && path === "/incidents") {
       await fulfill(route, { incidents: [] });
       return;
     }
     if (method === "GET" && path === "/cluster/status") {
-      await fulfill(route, { nodes: [], cursor: {}, cluster_event_count: 0 });
+      const unavailable = state.clusterUnavailable;
+      const payload = state.clusterStatus ?? { nodes: [], cursor: {}, cluster_event_count: 0 };
+      const gate = state.clusterResponseGates?.shift();
+      state.clusterRequestStarted?.();
+      if (gate) await gate;
+      if (unavailable) {
+        await fulfill(route, { detail: "cluster telemetry unavailable" }, 503);
+        return;
+      }
+      await fulfill(route, payload);
       return;
     }
     if (method === "GET" && path === "/sources") {
@@ -162,7 +233,14 @@ async function installApi(page: Page, state: MockState) {
       return;
     }
     if (method === "GET" && path === "/audit") {
-      await fulfill(route, { items: [] });
+      const items = state.auditItems ?? [];
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      const limit = Number(url.searchParams.get("limit") ?? 100);
+      if (offset > 0 && state.auditPageGate) {
+        state.auditPageStarted?.();
+        await state.auditPageGate;
+      }
+      await fulfill(route, { items: items.slice(offset, offset + limit), total: items.length });
       return;
     }
     if (method === "GET" && path === "/metrics/reachability") {
@@ -238,6 +316,340 @@ async function installApi(page: Page, state: MockState) {
     await fulfill(route, { detail: `Unhandled test API ${method} ${path}` }, 404);
   });
 }
+
+async function installFakePushClient(
+  page: Page,
+  initialPermission: "default" | "denied" | "granted",
+  staleApplicationServerKey = false,
+  delaySubscription = false,
+) {
+  await page.addInitScript(
+    ({ delaySubscribe, permission, staleKey, publicKey }) => {
+      const decode = (value: string) => {
+        const padding = "=".repeat((4 - (value.length % 4)) % 4);
+        const decoded = atob((value + padding).replace(/-/g, "+").replace(/_/g, "/"));
+        return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+      };
+      const expectedKey = decode(publicKey);
+      const oldKey = expectedKey.slice();
+      if (staleKey) oldKey[oldKey.length - 1] ^= 1;
+      let releaseSubscription: () => void = () => undefined;
+      const subscriptionGate = delaySubscribe
+        ? new Promise<void>((resolve) => {
+            releaseSubscription = resolve;
+          })
+        : Promise.resolve();
+      const counters = {
+        permissionRequests: 0,
+        subscribeCalls: 0,
+        unsubscribeCalls: 0,
+        releaseSubscription: () => releaseSubscription(),
+      };
+      const exposedWindow = window as unknown as {
+        __pushTest: typeof counters;
+        Notification: typeof Notification;
+        PushManager: typeof PushManager;
+      };
+      exposedWindow.__pushTest = counters;
+
+      class TestNotification {
+        static permission: NotificationPermission = permission;
+
+        static async requestPermission() {
+          counters.permissionRequests += 1;
+          return TestNotification.permission;
+        }
+      }
+      Object.defineProperty(exposedWindow, "Notification", {
+        configurable: true,
+        value: TestNotification,
+      });
+      Object.defineProperty(exposedWindow, "PushManager", {
+        configurable: true,
+        value: class TestPushManager {},
+      });
+
+      type TestSubscription = {
+        endpoint: string;
+        options: { applicationServerKey: ArrayBuffer };
+        toJSON: () => PushSubscriptionJSON;
+        unsubscribe: () => Promise<boolean>;
+      };
+      let subscription: TestSubscription | null = null;
+      const makeSubscription = (applicationServerKey: ArrayBuffer): TestSubscription => ({
+        endpoint: "https://push.example.test/subscription/current",
+        options: { applicationServerKey },
+        toJSON: () => ({
+          endpoint: "https://push.example.test/subscription/current",
+          expirationTime: null,
+          keys: { auth: "AQIDBAUGBwgJCgsMDQ4PEA", p256dh: publicKey },
+        }),
+        unsubscribe: async () => {
+          counters.unsubscribeCalls += 1;
+          subscription = null;
+          return true;
+        },
+      });
+      subscription = delaySubscribe ? null : makeSubscription(oldKey.buffer);
+      const registration = {
+        active: { postMessage: () => undefined },
+        pushManager: {
+          getSubscription: async () => subscription,
+          subscribe: async (options: PushSubscriptionOptionsInit) => {
+            counters.subscribeCalls += 1;
+            await subscriptionGate;
+            const key = options.applicationServerKey;
+            if (typeof key === "string" || key == null || !ArrayBuffer.isView(key)) {
+              throw new Error("missing application server key");
+            }
+            const keyBytes = new Uint8Array(key.buffer, key.byteOffset, key.byteLength);
+            subscription = makeSubscription(keyBytes.slice().buffer);
+            return subscription;
+          },
+        },
+      };
+      const serviceWorker = {
+        controller: null,
+        getRegistration: async () => registration,
+        ready: Promise.resolve(registration),
+        register: async () => registration,
+      };
+      Object.defineProperty(navigator, "serviceWorker", {
+        configurable: true,
+        value: serviceWorker,
+      });
+    },
+    {
+      delaySubscribe: delaySubscription,
+      permission: initialPermission,
+      publicKey: TEST_VAPID_PUBLIC_KEY,
+      staleKey: staleApplicationServerKey,
+    },
+  );
+}
+
+async function signIn(page: Page) {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Sign in" }).first().click();
+  await page.getByLabel("Username").fill("second-admin");
+  await page.getByLabel("Password", { exact: true }).fill("second-password");
+  await page.getByRole("button", { name: "Sign in" }).last().click();
+  await expect(page.getByRole("heading", { name: "System overview" })).toBeVisible();
+}
+
+test("Web Push surfaces node errors, rotates stale keys, and binds the login device", async ({
+  page,
+}) => {
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    loginRequest: null,
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    pushPublicKeyStatus: 503,
+    pushSubscriptionRequest: null,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installFakePushClient(page, "granted", true);
+  await installApi(page, state);
+  await signIn(page);
+
+  await page.getByRole("button", { name: "Enable alerts" }).click();
+  const dialog = page.getByRole("dialog", { name: "Enable notifications" });
+  await dialog.getByRole("button", { name: "Verify subscription" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("Web Push sender key is unavailable");
+  await expect(dialog.locator(".permission-message--success")).toHaveCount(0);
+
+  state.pushPublicKeyStatus = 200;
+  await dialog.getByRole("button", { name: "Verify subscription" }).click();
+  await expect(dialog.getByRole("status")).toContainText("This device is subscribed");
+  expect(state.pushSubscriptionRequest).toMatchObject({
+    endpoint: "https://push.example.test/subscription/current",
+    keys: { auth: "AQIDBAUGBwgJCgsMDQ4PEA", p256dh: TEST_VAPID_PUBLIC_KEY },
+  });
+  expect(state.pushSubscriptionRequest?.device_name).toBe(state.loginRequest?.device_name);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __pushTest: { subscribeCalls: number; unsubscribeCalls: number };
+            }
+          ).__pushTest,
+      ),
+    )
+    .toMatchObject({ subscribeCalls: 1, unsubscribeCalls: 1 });
+});
+
+test("Web Push explains blocked permission without retrying the browser prompt", async ({
+  page,
+}) => {
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installFakePushClient(page, "denied");
+  await installApi(page, state);
+  await signIn(page);
+
+  await page.getByRole("button", { name: "Enable alerts" }).click();
+  const dialog = page.getByRole("dialog", { name: "Enable notifications" });
+  await expect(dialog.getByRole("alert")).toContainText("site's permissions");
+  await dialog.getByRole("button", { name: "Show recovery steps" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("site's permissions");
+  expect(
+    await page.evaluate(
+      () =>
+        (window as unknown as { __pushTest: { permissionRequests: number } }).__pushTest
+          .permissionRequests,
+    ),
+  ).toBe(0);
+});
+
+test("Web Push cancels a delayed browser subscription when the authenticated session changes", async ({
+  page,
+}) => {
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    pushSubscriptionRequest: null,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installFakePushClient(page, "granted", false, true);
+  await installApi(page, state);
+  await signIn(page);
+
+  await page.getByRole("button", { name: "Enable alerts" }).click();
+  const dialog = page.getByRole("dialog", { name: "Enable notifications" });
+  await dialog.getByRole("button", { name: "Verify subscription" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __pushTest: { subscribeCalls: number };
+            }
+          ).__pushTest.subscribeCalls,
+      ),
+    )
+    .toBe(1);
+  await expect(dialog.getByRole("button", { name: "Close" })).toBeDisabled();
+  await expect(dialog.getByRole("button", { name: "Maybe later" })).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeVisible();
+
+  await page.evaluate(() => window.dispatchEvent(new Event("alert-hub:session-expired")));
+  await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+  await page.getByLabel("Username").fill("second-admin");
+  await page.getByLabel("Password", { exact: true }).fill("second-password");
+  await page.getByRole("button", { name: "Sign in" }).last().click();
+  await expect(page.getByRole("heading", { name: "System overview" })).toBeVisible();
+
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __pushTest: { releaseSubscription: () => void };
+      }
+    ).__pushTest.releaseSubscription(),
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __pushTest: { unsubscribeCalls: number };
+            }
+          ).__pushTest.unsubscribeCalls,
+      ),
+    )
+    .toBe(1);
+  expect(state.pushSubscriptionRequest).toBeNull();
+});
+
+test("Web Push cancels a delayed subscription when silent refresh replaces the session id", async ({
+  page,
+}) => {
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    pushSubscriptionRequest: null,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installFakePushClient(page, "granted", false, true);
+  await installApi(page, state);
+  await signIn(page);
+
+  await page.getByRole("button", { name: "Enable alerts" }).click();
+  const dialog = page.getByRole("dialog", { name: "Enable notifications" });
+  await dialog.getByRole("button", { name: "Verify subscription" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __pushTest: { subscribeCalls: number };
+            }
+          ).__pushTest.subscribeCalls,
+      ),
+    )
+    .toBe(1);
+
+  const refreshRequestsBeforeSessionReplacement = state.refreshRequests;
+  state.authoritativeUnauthorized = true;
+  state.refreshGate = Promise.resolve();
+  await page
+    .getByRole("button", { name: "Refresh cluster data" })
+    .evaluate((button: HTMLButtonElement) => button.click());
+  await expect
+    .poll(() => state.refreshRequests)
+    .toBeGreaterThan(refreshRequestsBeforeSessionReplacement);
+  await expect.poll(() => state.lateTokenRequests.length).toBeGreaterThan(0);
+
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __pushTest: { releaseSubscription: () => void };
+      }
+    ).__pushTest.releaseSubscription(),
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __pushTest: { unsubscribeCalls: number };
+            }
+          ).__pushTest.unsubscribeCalls,
+      ),
+    )
+    .toBe(1);
+  await expect(dialog.getByRole("alert")).toContainText("authenticated session changed");
+  expect(state.pushSubscriptionRequest).toBeNull();
+});
 
 test("bootstrap, deep-link navigation, live source creation, failover trust, and logout isolation", async ({
   page,
@@ -391,6 +803,333 @@ test("logout waits for an in-flight refresh and rejects its stale token", async 
   await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
   expect(state.refreshRequests).toBe(refreshCount);
   expect(state.lateTokenRequests).toEqual([]);
+});
+
+test("renders live cluster telemetry and groups repeated historical audit failures", async ({
+  page,
+}) => {
+  const now = new Date().toISOString();
+  const repeatedFailures = ["audit-1", "audit-2", "audit-3"].map((id) => ({
+    id,
+    action: "Cluster Auth Failed",
+    action_code: "cluster_auth_failed",
+    detail: 'System operation · {"client_ip":"192.0.2.10"}',
+    actor: "system",
+    node_id: "ru",
+    occurred_at: now,
+    request_id: `request-${id}`,
+    tone: "danger",
+  }));
+  const otherAuditEvents = Array.from({ length: 100 }, (_, index) => ({
+    id: `audit-${index + 4}`,
+    action: "Login Succeeded",
+    action_code: "login_succeeded",
+    detail: `Session ${index + 1}`,
+    actor: "operator",
+    node_id: "ru",
+    occurred_at: now,
+    request_id: `request-${index + 4}`,
+    tone: "success",
+  }));
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+    liveEventSource: true,
+    clusterStatus: {
+      cluster_event_count: 28,
+      cursor: { ru: 10, nl: 9, de: 9 },
+      nodes: ["ru", "nl", "de"].map((id) => ({
+        id,
+        name: id.toUpperCase(),
+        region: id,
+        health: "healthy",
+        sync_lag_seconds: 0,
+        outbox_pending: id === "ru" ? 0 : null,
+        last_seen_at: now,
+        software_version: "v0.1.4",
+      })),
+    },
+    auditItems: [...repeatedFailures, ...otherAuditEvents],
+  };
+  await installApi(page, state);
+  await page.goto("/audit");
+  await page.getByLabel("Bootstrap token").fill("one-time-bootstrap-token");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
+  await page.getByLabel("Confirm password").fill("correct-horse-battery");
+  // Install the fake clock after the anonymous bootstrap probe has settled, but
+  // before authenticated data hooks create their polling intervals.
+  await page.clock.install({ time: new Date(now) });
+  await page.getByRole("button", { name: "Create administrator" }).click();
+
+  await expect(page.getByText(/Sync 0\.0s/)).toBeVisible();
+  await expect(page.getByText("3 healthy · 0 impaired · 0 unknown")).toBeVisible();
+  await expect(page.getByText("3/3 nodes healthy.")).toBeVisible();
+  await expect(page.getByText("Rejected cluster-auth attempt")).toHaveCount(1);
+  await expect(page.getByLabel("3 identical events in this burst")).toBeVisible();
+  await expect(page.getByText("100/103 loaded")).toBeVisible();
+
+  await page.getByRole("button", { name: "Load older events (100/103)" }).click();
+  await expect(page.getByText("103/103 loaded")).toBeVisible();
+  await expect(page.getByRole("button", { name: /Load older events/ })).toHaveCount(0);
+
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export loaded JSONL" }).click();
+  const download = await downloadPromise;
+  const downloadPath = await download.path();
+  expect(downloadPath).not.toBeNull();
+  const exported = await readFile(downloadPath!, "utf8");
+  const exportedRows = exported
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  expect(exportedRows).toHaveLength(103);
+  expect(exportedRows[0]).toMatchObject({ request_id: "request-audit-1" });
+
+  let releaseStaleCluster: () => void = () => undefined;
+  state.clusterResponseGates = [
+    new Promise<void>((resolve) => {
+      releaseStaleCluster = resolve;
+    }),
+  ];
+  const staleClusterStarted = new Promise<void>((resolve) => {
+    state.clusterRequestStarted = resolve;
+  });
+  await page.getByRole("button", { name: "Refresh cluster data" }).click();
+  await staleClusterStarted;
+
+  state.clusterUnavailable = true;
+  await page.clock.fastForward(30000);
+  await expect(page.getByText(/Sync telemetry unavailable/)).toBeVisible();
+  await expect(page.getByText("0/3 nodes healthy.")).toBeVisible();
+
+  state.clusterUnavailable = false;
+  releaseStaleCluster();
+  await expect(page.locator(".refresh-button")).not.toHaveClass(/is-spinning/);
+  await expect(page.getByText(/Sync telemetry unavailable/)).toBeVisible();
+  state.clusterRequestStarted = null;
+  state.clusterStatus = {
+    ...(state.clusterStatus as Record<string, unknown>),
+    nodes: ["ru", "nl", "de"].map((id) => ({
+      id,
+      name: id.toUpperCase(),
+      region: id,
+      health: id === "de" ? "degraded" : "healthy",
+      sync_lag_seconds: id === "de" ? null : 0,
+      last_seen_at: now,
+      software_version: "v0.1.4",
+    })),
+  };
+  await page.clock.fastForward(30000);
+  await expect(page.getByText(/Sync degraded/)).toBeVisible();
+  await expect(page.getByText("2 healthy · 1 impaired · 0 unknown")).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByLabel("Audit date range")).toBeVisible();
+});
+
+test("rebases pure audit prepends and safely resets for an interior insertion", async ({
+  page,
+}) => {
+  const now = new Date().toISOString();
+  const originalItems = Array.from({ length: 205 }, (_, index) => ({
+    id: `stable-audit-${index}`,
+    action: "Stable audit event",
+    action_code: "stable_audit_event",
+    detail: `Stable event ${index}`,
+    actor: "operator",
+    node_id: "ru",
+    occurred_at: now,
+    request_id: `stable-request-${index}`,
+    tone: "neutral",
+  }));
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+    auditItems: originalItems,
+  };
+  await installApi(page, state);
+  await page.goto("/audit");
+  await page.getByLabel("Bootstrap token").fill("one-time-bootstrap-token");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
+  await page.getByLabel("Confirm password").fill("correct-horse-battery");
+  await page.getByRole("button", { name: "Create administrator" }).click();
+  await expect(page.getByText("100/205 loaded")).toBeVisible();
+
+  const newestItems = Array.from({ length: 3 }, (_, index) => ({
+    id: `new-audit-${index}`,
+    action: "New audit event",
+    action_code: "new_audit_event",
+    detail: `New event ${index}`,
+    actor: "system",
+    node_id: "ru",
+    occurred_at: now,
+    request_id: `new-request-${index}`,
+    tone: "success",
+  }));
+  state.auditItems = [...newestItems, ...originalItems];
+
+  await page.getByRole("button", { name: "Load older events (100/205)" }).click();
+  await expect(page.getByText("200/208 loaded")).toBeVisible();
+  await expect(page.getByText("New audit event")).toHaveCount(3);
+  await page.getByRole("button", { name: "Load older events (200/208)" }).click();
+  await expect(page.getByText("208/208 loaded")).toBeVisible();
+  await expect(page.getByRole("button", { name: /Load older events/ })).toHaveCount(0);
+
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export loaded JSONL" }).click();
+  const download = await downloadPromise;
+  const downloadPath = await download.path();
+  expect(downloadPath).not.toBeNull();
+  const exported = await readFile(downloadPath!, "utf8");
+  const exportedRequestIds = exported
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line).request_id as string);
+  expect(exportedRequestIds).toHaveLength(208);
+  expect(exportedRequestIds.slice(0, 3)).toEqual([
+    "new-request-0",
+    "new-request-1",
+    "new-request-2",
+  ]);
+  expect(new Set(exportedRequestIds)).toEqual(
+    new Set([
+      ...newestItems.map((item) => item.request_id),
+      ...originalItems.map((item) => item.request_id),
+    ]),
+  );
+
+  const interiorItem = {
+    id: "interior-audit",
+    action: "Interior audit event",
+    action_code: "interior_audit_event",
+    detail: "A delayed record entered the already loaded ordering",
+    actor: "system",
+    node_id: "nl",
+    occurred_at: now,
+    request_id: "interior-request",
+    tone: "warning",
+  };
+  const reorderedItems = [...state.auditItems!];
+  reorderedItems.splice(50, 0, interiorItem);
+  state.auditItems = reorderedItems;
+
+  await page.getByRole("button", { name: "Refresh cluster data" }).click();
+  await expect(page.getByText("100/209 loaded")).toBeVisible();
+  await expect(page.getByText("Interior audit event")).toBeVisible();
+  await page.getByRole("button", { name: "Load older events (100/209)" }).click();
+  await expect(page.getByText("200/209 loaded")).toBeVisible();
+  await page.getByRole("button", { name: "Load older events (200/209)" }).click();
+  await expect(page.getByText("209/209 loaded")).toBeVisible();
+
+  const interiorDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export loaded JSONL" }).click();
+  const interiorDownload = await interiorDownloadPromise;
+  const interiorDownloadPath = await interiorDownload.path();
+  expect(interiorDownloadPath).not.toBeNull();
+  const interiorExport = await readFile(interiorDownloadPath!, "utf8");
+  const interiorRequestIds = interiorExport
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line).request_id as string);
+  expect(interiorRequestIds).toHaveLength(209);
+  expect(new Set(interiorRequestIds)).toEqual(new Set(["interior-request", ...exportedRequestIds]));
+});
+
+test("discards a delayed audit page after the authenticated session changes", async ({ page }) => {
+  const now = new Date().toISOString();
+  const oldSessionItems = Array.from({ length: 101 }, (_, index) => ({
+    id: `old-audit-${index}`,
+    action: "Old session event",
+    action_code: "old_session_event",
+    detail: index === 100 ? "old-session-private-marker" : `Old session ${index}`,
+    actor: "old-operator",
+    node_id: "ru",
+    occurred_at: now,
+    request_id: `old-request-${index}`,
+    tone: "neutral",
+  }));
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+    auditItems: oldSessionItems,
+  };
+  await installApi(page, state);
+  await page.goto("/audit");
+  await page.getByLabel("Bootstrap token").fill("one-time-bootstrap-token");
+  await page.getByLabel("Username").fill("admin");
+  await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
+  await page.getByLabel("Confirm password").fill("correct-horse-battery");
+  await page.getByRole("button", { name: "Create administrator" }).click();
+  await expect(page.getByText("100/101 loaded")).toBeVisible();
+
+  let releaseOldPage: () => void = () => undefined;
+  state.auditPageGate = new Promise<void>((resolve) => {
+    releaseOldPage = resolve;
+  });
+  const oldPageStarted = new Promise<void>((resolve) => {
+    state.auditPageStarted = resolve;
+  });
+  await page.getByRole("button", { name: "Load older events (100/101)" }).click();
+  await oldPageStarted;
+
+  await page.getByRole("button", { name: "Log out of Alert Hub" }).click();
+  await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+  state.auditItems = [
+    {
+      id: "new-session-audit",
+      action: "New session event",
+      action_code: "new_session_event",
+      detail: "new-session-only-marker",
+      actor: "new-operator",
+      node_id: "nl",
+      occurred_at: now,
+      request_id: "new-request",
+      tone: "success",
+    },
+  ];
+  await page.getByLabel("Username").fill("second-admin");
+  await page.getByLabel("Password", { exact: true }).fill("second-password");
+  await page.getByRole("button", { name: "Sign in" }).last().click();
+  await expect(page.getByText("New session event")).toBeVisible();
+  await expect(page.getByText("1/1 loaded")).toBeVisible();
+
+  releaseOldPage();
+  state.auditPageGate = null;
+  await expect(page.getByText("old-session-private-marker")).toHaveCount(0);
+  await expect(page.getByText("1/1 loaded")).toBeVisible();
+
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export loaded JSONL" }).click();
+  const download = await downloadPromise;
+  const downloadPath = await download.path();
+  expect(downloadPath).not.toBeNull();
+  const exported = await readFile(downloadPath!, "utf8");
+  expect(
+    exported
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line)),
+  ).toEqual([expect.objectContaining({ request_id: "new-request" })]);
 });
 
 test("demo shell is accessible and responsive on a phone viewport", async ({ page }) => {

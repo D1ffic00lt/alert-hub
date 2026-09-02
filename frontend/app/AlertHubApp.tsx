@@ -12,6 +12,15 @@ import {
 } from "react";
 import { useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
 
+import {
+  applicationServerKeyMatches,
+  blockedPermissionHelp,
+  currentPushClientEnvironment,
+  currentPushDeviceName,
+  decodeApplicationServerKey,
+  withPushTimeout,
+} from "./push";
+
 const API_BASE = "/api/v1";
 const AppNameContext = createContext("Alert Hub");
 let memoryAccessToken: string | null = null;
@@ -30,6 +39,13 @@ const SESSION_HINT_KEY = "alert-hub-session-partition-v1";
 const LOGOUT_TOMBSTONE_KEY = "alert-hub-local-logout-v1";
 const AUTH_BROADCAST_CHANNEL = "alert-hub-auth-v1";
 const SESSION_HINT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+class PushSetupCancelledError extends Error {
+  constructor() {
+    super("Push setup was cancelled because the active session changed.");
+    this.name = "PushSetupCancelledError";
+  }
+}
 
 type Severity = "critical" | "warning" | "info" | "unknown";
 type IncidentStatus = "open" | "acknowledged" | "resolved" | "silenced";
@@ -148,11 +164,18 @@ type Device = {
 type AuditItem = {
   id: string;
   action: string;
+  actionCode?: string;
   detail: string;
   actor: string;
   node: string;
   at: string;
   tone: "neutral" | "success" | "warning" | "danger";
+  raw?: Record<string, unknown>;
+};
+
+type AuditGroup = AuditItem & {
+  count: number;
+  oldestAt: string;
 };
 
 type ReachabilityCell = {
@@ -219,6 +242,10 @@ type HubData = {
   datasources: PrometheusDatasource[];
   devices: Device[];
   audit: AuditItem[];
+  // This is the exclusive offset consumed from one coherent server ordering.
+  // It must not be inferred from the de-duplicated client-side row count.
+  auditNextOffset: number;
+  auditTotal: number;
   reachability: ReachabilityCell[];
   reachabilityMeta: ReachabilityMeta;
   clusterMeta: ClusterMeta;
@@ -237,6 +264,8 @@ const EMPTY_DATA: HubData = {
   datasources: [],
   devices: [],
   audit: [],
+  auditNextOffset: 0,
+  auditTotal: 0,
   reachability: [],
   reachabilityMeta: { status: "unknown", detail: "", datasources: null, errors: [] },
   clusterMeta: { cursor: {}, eventCount: null },
@@ -681,6 +710,8 @@ const DEMO_DATA: HubData = {
       tone: "danger",
     },
   ],
+  auditNextOffset: 5,
+  auditTotal: 5,
   reachability: [
     {
       source: "Moscow",
@@ -1074,6 +1105,29 @@ function normalizeNode(item: unknown, index: number): ClusterNode {
   };
 }
 
+function unavailableNodeTelemetry(nodes: ClusterNode[]): ClusterNode[] {
+  return nodes.map((node) => ({ ...node, health: "unknown", syncLag: null }));
+}
+
+function normalizeClusterSnapshot(payload: unknown, telemetryFresh: boolean) {
+  const cluster = asRecord(payload);
+  const rawNodes = listFrom(cluster, "nodes");
+  const normalizedNodes = rawNodes.map(normalizeNode);
+  return {
+    rawNodes,
+    nodes: telemetryFresh ? normalizedNodes : unavailableNodeTelemetry(normalizedNodes),
+    meta: {
+      cursor: Object.fromEntries(
+        Object.entries(asRecord(cluster.cursor)).flatMap(([origin, value]) => {
+          const sequence = asFiniteNumber(value);
+          return sequence == null ? [] : [[origin, sequence]];
+        }),
+      ),
+      eventCount: asFiniteNumber(cluster.cluster_event_count),
+    } satisfies ClusterMeta,
+  };
+}
+
 function normalizeSource(item: unknown, index: number): Source {
   const row = asRecord(item);
   const kind = String(row.kind ?? "generic_json") as Source["kind"];
@@ -1159,6 +1213,7 @@ function normalizeAudit(item: unknown, index: number): AuditItem {
   return {
     id: String(row.id ?? `audit-${index}`),
     action: String(row.action ?? titleCase(actionCode)),
+    actionCode,
     detail: String(row.detail ?? row.description ?? "System operation"),
     actor: String(row.actor ?? row.username ?? "system"),
     node: String(row.node_id ?? row.node ?? "local-node"),
@@ -1166,7 +1221,163 @@ function normalizeAudit(item: unknown, index: number): AuditItem {
     tone: (["neutral", "success", "warning", "danger"].includes(tone)
       ? tone
       : "neutral") as AuditItem["tone"],
+    raw: row,
   };
+}
+
+const AUDIT_PAGE_SIZE = 100;
+
+type AuditWindow = Pick<HubData, "audit" | "auditNextOffset" | "auditTotal">;
+
+function auditIdsMatch(left: AuditItem[], right: AuditItem[]): boolean {
+  return left.length === right.length && left.every((item, index) => item.id === right[index]?.id);
+}
+
+function auditWindowFromHead(head: AuditItem[], reportedTotal: number | null): AuditWindow {
+  const auditNextOffset = head.length;
+  return {
+    audit: head,
+    auditNextOffset,
+    auditTotal: Math.max(reportedTotal ?? 0, auditNextOffset),
+  };
+}
+
+function rebaseAuditHead(
+  current: AuditWindow,
+  head: AuditItem[],
+  reportedTotal: number | null,
+): AuditWindow {
+  if (
+    !current.audit.length ||
+    current.auditNextOffset !== current.audit.length ||
+    reportedTotal == null
+  ) {
+    return auditWindowFromHead(head, reportedTotal);
+  }
+  const addedRows = reportedTotal - current.auditTotal;
+  const previousFirstIndex = head.findIndex((item) => item.id === current.audit[0]?.id);
+  const overlap = previousFirstIndex < 0 ? [] : head.slice(previousFirstIndex);
+  if (
+    addedRows < 0 ||
+    previousFirstIndex !== addedRows ||
+    !auditIdsMatch(overlap, current.audit.slice(0, overlap.length))
+  ) {
+    // Offset pagination remains contiguous only when every new row is a pure
+    // prepend. A late/out-of-order insertion, deletion, or different
+    // authoritative ordering must restart from a known page-zero prefix.
+    return auditWindowFromHead(head, reportedTotal);
+  }
+  const headIds = new Set(head.map((item) => item.id));
+  const audit = [...head, ...current.audit.filter((item) => !headIds.has(item.id))];
+  const auditNextOffset = current.auditNextOffset + addedRows;
+  return {
+    audit,
+    auditNextOffset,
+    auditTotal: Math.max(reportedTotal ?? 0, auditNextOffset, audit.length),
+  };
+}
+
+function mergeAuditPageWithFreshHead(
+  current: AuditWindow,
+  page: AuditItem[],
+  requestOffset: number,
+  pageTotal: number | null,
+  head: AuditItem[],
+  headTotal: number | null,
+): AuditWindow {
+  const boundaryId = current.audit.at(-1)?.id;
+  const previousFirstId = current.audit[0]?.id;
+  if (
+    !boundaryId ||
+    !previousFirstId ||
+    current.auditNextOffset !== current.audit.length ||
+    requestOffset !== Math.max(0, current.auditNextOffset - 1) ||
+    pageTotal == null ||
+    headTotal == null
+  ) {
+    return auditWindowFromHead(head, headTotal);
+  }
+
+  const boundaryIndex = page.findIndex((item) => item.id === boundaryId);
+  const previousFirstIndex = head.findIndex((item) => item.id === previousFirstId);
+  const addedBeforePage = pageTotal - current.auditTotal;
+  const addedBeforeHead = headTotal - current.auditTotal;
+  const expectedBeforeBoundary =
+    boundaryIndex < 0
+      ? []
+      : current.audit.slice(current.audit.length - boundaryIndex - 1, current.audit.length - 1);
+  const headOverlap = previousFirstIndex < 0 ? [] : head.slice(previousFirstIndex);
+  if (
+    addedBeforePage < 0 ||
+    addedBeforeHead < addedBeforePage ||
+    boundaryIndex !== addedBeforePage ||
+    previousFirstIndex !== addedBeforeHead ||
+    !auditIdsMatch(page.slice(0, Math.max(0, boundaryIndex)), expectedBeforeBoundary) ||
+    !auditIdsMatch(headOverlap, current.audit.slice(0, headOverlap.length))
+  ) {
+    // The overlap no longer proves continuity. Keeping older rows while
+    // guessing an offset could skip an unseen range, so restart at page zero.
+    return auditWindowFromHead(head, headTotal);
+  }
+
+  const knownIds = new Set(current.audit.map((item) => item.id));
+  const olderRows = page.slice(boundaryIndex + 1).filter((item) => !knownIds.has(item.id));
+  const extended = [...current.audit, ...olderRows];
+  const headIds = new Set(head.map((item) => item.id));
+  const audit = [...head, ...extended.filter((item) => !headIds.has(item.id))];
+
+  // `requestOffset + page.length` is the server-consumed offset for the older
+  // response. Exact totals prove how many pure prepends arrived before the
+  // second head read; any other insertion shape reset above.
+  const auditNextOffset = requestOffset + page.length + (headTotal - pageTotal);
+  if (auditNextOffset !== audit.length) return auditWindowFromHead(head, headTotal);
+  return {
+    audit,
+    auditNextOffset,
+    auditTotal: Math.max(headTotal, auditNextOffset, audit.length),
+  };
+}
+
+const AUDIT_BURST_WINDOW_MS = 10 * 60 * 1000;
+
+function groupAuditBursts(items: AuditItem[]): AuditGroup[] {
+  const groups: AuditGroup[] = [];
+  const latestByFingerprint = new Map<string, AuditGroup>();
+  for (const item of items) {
+    const itemTime = Date.parse(item.at);
+    const fingerprint = JSON.stringify([
+      item.actionCode,
+      item.action,
+      item.detail,
+      item.actor,
+      item.node,
+      item.tone,
+    ]);
+    const matching = latestByFingerprint.get(fingerprint);
+    const newestTime = matching ? Date.parse(matching.at) : Number.NaN;
+    if (
+      matching &&
+      Number.isFinite(itemTime) &&
+      Number.isFinite(newestTime) &&
+      Math.abs(newestTime - itemTime) <= AUDIT_BURST_WINDOW_MS
+    ) {
+      matching.count += 1;
+      matching.oldestAt = item.at;
+    } else {
+      const group = { ...item, count: 1, oldestAt: item.at };
+      groups.push(group);
+      latestByFingerprint.set(fingerprint, group);
+    }
+  }
+  return groups;
+}
+
+function aggregateNodeHealth(nodes: ClusterNode[]): Health {
+  if (!nodes.length) return "unknown";
+  if (nodes.some((node) => node.health === "offline")) return "offline";
+  if (nodes.some((node) => node.health === "degraded")) return "degraded";
+  if (nodes.some((node) => node.health === "unknown")) return "unknown";
+  return nodes.every((node) => node.health === "paused") ? "paused" : "healthy";
 }
 
 function normalizeReachability(item: unknown): ReachabilityCell {
@@ -1415,7 +1626,21 @@ async function refreshAccessToken(): Promise<boolean> {
   }
 }
 
-async function apiFetch(path: string, init: RequestInit = {}) {
+async function apiFetch(
+  path: string,
+  init: RequestInit = {},
+  expectedAuthGeneration?: number,
+  expectedSessionId?: string | null,
+) {
+  const assertExpectedAuthContext = () => {
+    if (
+      (expectedAuthGeneration !== undefined && expectedAuthGeneration !== authGeneration) ||
+      (expectedSessionId !== undefined && expectedSessionId !== memorySessionId)
+    ) {
+      throw new PushSetupCancelledError();
+    }
+  };
+  assertExpectedAuthContext();
   const method = (init.method ?? "GET").toUpperCase();
   if (demoModeActive && method !== "GET" && method !== "HEAD") {
     throw new Error("Live mutations are disabled in demo mode.");
@@ -1437,19 +1662,23 @@ async function apiFetch(path: string, init: RequestInit = {}) {
   let primaryError: unknown = null;
   try {
     primary = await fetch(`${API_BASE}${path}`, requestInit);
+    assertExpectedAuthContext();
     if (primary.status === 401 && !path.startsWith("/auth/")) {
       const refreshed =
         Boolean(memoryAccessToken && memoryAccessToken !== attemptedToken) ||
         (await refreshAccessToken());
+      assertExpectedAuthContext();
       if (refreshed && memoryAccessToken) {
         headers.set("Authorization", `Bearer ${memoryAccessToken}`);
         if (memorySessionId) headers.set("X-Alert-Hub-Cache-Partition", memorySessionId);
         primary = await fetch(`${API_BASE}${path}`, requestInit);
+        assertExpectedAuthContext();
       }
     }
   } catch (error) {
     primaryError = error;
   }
+  assertExpectedAuthContext();
   const failoverEnabled =
     typeof localStorage === "undefined" ||
     localStorage.getItem("alert-hub-auto-failover") !== "false";
@@ -1466,6 +1695,7 @@ async function apiFetch(path: string, init: RequestInit = {}) {
     }
     for (const value of Array.isArray(saved) ? saved.slice(0, 8) : []) {
       try {
+        assertExpectedAuthContext();
         const normalized = normalizePeerBase(value);
         if (!normalized || !verifiedPeerBases.has(normalized)) continue;
         const base = new URL(normalized);
@@ -1473,8 +1703,10 @@ async function apiFetch(path: string, init: RequestInit = {}) {
           `${base.href.replace(/\/$/, "")}${API_BASE}${path}`,
           requestInit,
         );
+        assertExpectedAuthContext();
         if (response.ok) return response;
       } catch {
+        assertExpectedAuthContext();
         // Move to the next saved peer without hiding the original response.
       }
     }
@@ -1721,9 +1953,15 @@ function useHubData(enabled: boolean, demo: boolean) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [liveUpdates, setLiveUpdates] = useState(false);
+  const [auditLoadingMore, setAuditLoadingMore] = useState(false);
+  const [auditLoadError, setAuditLoadError] = useState<string | null>(null);
   const mounted = useRef(true);
   const verifiedData = useRef<HubData | null>(null);
   const verifiedPartition = useRef<string | null>(null);
+  const fullRefreshEpoch = useRef(0);
+  const clusterRequestEpoch = useRef(0);
+  const auditDataEpoch = useRef(0);
+  const auditLoadController = useRef<AbortController | null>(null);
 
   const refresh = useCallback(
     async (quiet = false) => {
@@ -1732,6 +1970,16 @@ function useHubData(enabled: boolean, demo: boolean) {
         return;
       }
       if (!quiet) setRefreshing(true);
+      const refreshEpoch = ++fullRefreshEpoch.current;
+      const clusterEpoch = ++clusterRequestEpoch.current;
+      const sessionGeneration = authGeneration;
+      const sessionPartition = memorySessionId;
+      const isCurrentRequest = () =>
+        mounted.current &&
+        refreshEpoch === fullRefreshEpoch.current &&
+        authGeneration === sessionGeneration &&
+        memorySessionId === sessionPartition &&
+        verifiedPartition.current === sessionPartition;
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), 6500);
       try {
@@ -1755,12 +2003,13 @@ function useHubData(enabled: boolean, demo: boolean) {
             ]),
           staleTime: 0,
         });
-        if (!mounted.current) return;
+        if (!isCurrentRequest()) return;
         const successful = requests.filter((result) => result.status === "fulfilled").length;
         if (successful === 0) throw new Error("No API node responded");
         const cachedResponses = requests.filter(
           (result) => result.status === "fulfilled" && result.value.cached,
         ).length;
+        if (requests[7]?.status === "fulfilled") setAuditLoadError(null);
 
         setData(() => {
           const next: HubData = { ...(verifiedData.current ?? EMPTY_DATA) };
@@ -1782,43 +2031,40 @@ function useHubData(enabled: boolean, demo: boolean) {
           if (incidents.status === "fulfilled") {
             next.incidents = listFrom(incidents.value.payload, "incidents").map(normalizeIncident);
           }
-          if (nodes.status === "fulfilled") {
-            const rawNodes = listFrom(nodes.value.payload, "nodes");
-            next.nodes = rawNodes.map(normalizeNode);
-            const cluster = asRecord(nodes.value.payload);
-            next.clusterMeta = {
-              cursor: Object.fromEntries(
-                Object.entries(asRecord(cluster.cursor)).flatMap(([origin, value]) => {
-                  const sequence = asFiniteNumber(value);
-                  return sequence == null ? [] : [[origin, sequence]];
-                }),
-              ),
-              eventCount: asFiniteNumber(cluster.cluster_event_count),
-            };
-            const discovered = rawNodes
-              .map((item) => rememberVerifiedPeerBase(asRecord(item).public_api_url))
-              .filter((item): item is string => Boolean(item));
-            if (discovered.length) {
-              try {
-                const current = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
-                const disabled = JSON.parse(
-                  localStorage.getItem("alert-hub-disabled-api-endpoints") ?? "[]",
-                );
-                const disabledSet = new Set(Array.isArray(disabled) ? disabled : []);
-                localStorage.setItem(
-                  "alert-hub-api-endpoints",
-                  JSON.stringify(
-                    [
-                      ...new Set([
-                        ...(Array.isArray(current) ? current : []),
-                        ...discovered.filter((item) => !disabledSet.has(item)),
-                      ]),
-                    ].slice(0, 8),
-                  ),
-                );
-              } catch {
-                // Endpoint discovery is a device-local optimization only.
+          if (clusterEpoch === clusterRequestEpoch.current) {
+            if (nodes.status === "fulfilled") {
+              const cluster = normalizeClusterSnapshot(nodes.value.payload, !nodes.value.cached);
+              next.nodes = cluster.nodes;
+              next.clusterMeta = cluster.meta;
+              const discovered = cluster.rawNodes
+                .map((item) => rememberVerifiedPeerBase(asRecord(item).public_api_url))
+                .filter((item): item is string => Boolean(item));
+              if (discovered.length) {
+                try {
+                  const current = JSON.parse(
+                    localStorage.getItem("alert-hub-api-endpoints") ?? "[]",
+                  );
+                  const disabled = JSON.parse(
+                    localStorage.getItem("alert-hub-disabled-api-endpoints") ?? "[]",
+                  );
+                  const disabledSet = new Set(Array.isArray(disabled) ? disabled : []);
+                  localStorage.setItem(
+                    "alert-hub-api-endpoints",
+                    JSON.stringify(
+                      [
+                        ...new Set([
+                          ...(Array.isArray(current) ? current : []),
+                          ...discovered.filter((item) => !disabledSet.has(item)),
+                        ]),
+                      ].slice(0, 8),
+                    ),
+                  );
+                } catch {
+                  // Endpoint discovery is a device-local optimization only.
+                }
               }
+            } else {
+              next.nodes = unavailableNodeTelemetry(next.nodes);
             }
           }
           if (sources.status === "fulfilled") {
@@ -1850,7 +2096,10 @@ function useHubData(enabled: boolean, demo: boolean) {
             });
           }
           if (audit.status === "fulfilled") {
-            next.audit = listFrom(audit.value.payload, "items").map(normalizeAudit);
+            const auditBody = asRecord(audit.value.payload);
+            const firstPage = listFrom(auditBody, "items").map(normalizeAudit);
+            Object.assign(next, rebaseAuditHead(next, firstPage, asFiniteNumber(auditBody.total)));
+            auditDataEpoch.current += 1;
           }
           if (reachability.status === "fulfilled") {
             const reachabilityBody = asRecord(reachability.value.payload);
@@ -1955,9 +2204,19 @@ function useHubData(enabled: boolean, demo: boolean) {
           );
         }
       } catch {
-        if (!mounted.current) return;
+        if (!isCurrentRequest()) return;
         const snapshot = verifiedData.current;
-        setData(snapshot ?? EMPTY_DATA);
+        const unavailableSnapshot = snapshot
+          ? {
+              ...snapshot,
+              nodes:
+                clusterEpoch === clusterRequestEpoch.current
+                  ? unavailableNodeTelemetry(snapshot.nodes)
+                  : snapshot.nodes,
+            }
+          : null;
+        verifiedData.current = unavailableSnapshot;
+        setData(unavailableSnapshot ?? EMPTY_DATA);
         setMode("cached");
         if (snapshot) {
           setError(
@@ -1974,15 +2233,120 @@ function useHubData(enabled: boolean, demo: boolean) {
         }
       } finally {
         window.clearTimeout(timer);
-        if (mounted.current) setRefreshing(false);
+        if (isCurrentRequest()) setRefreshing(false);
       }
     },
     [demo, enabled, queryClient],
   );
 
+  const refreshClusterTelemetry = useCallback(async () => {
+    if (!enabled || demo) return;
+    const requestEpoch = ++clusterRequestEpoch.current;
+    const sessionGeneration = authGeneration;
+    const sessionPartition = memorySessionId;
+    const isCurrentRequest = () =>
+      mounted.current &&
+      requestEpoch === clusterRequestEpoch.current &&
+      authGeneration === sessionGeneration &&
+      memorySessionId === sessionPartition &&
+      verifiedPartition.current === sessionPartition;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 6500);
+    try {
+      const response = await getJson("/cluster/status", controller.signal);
+      if (!isCurrentRequest()) return;
+      const cluster = normalizeClusterSnapshot(response.payload, !response.cached);
+      setData((current) => {
+        const next = { ...current, nodes: cluster.nodes, clusterMeta: cluster.meta };
+        verifiedData.current = next;
+        return next;
+      });
+    } catch {
+      if (!isCurrentRequest()) return;
+      setData((current) => {
+        const next = { ...current, nodes: unavailableNodeTelemetry(current.nodes) };
+        verifiedData.current = next;
+        return next;
+      });
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }, [demo, enabled]);
+
+  const loadMoreAudit = useCallback(async () => {
+    if (!enabled || demo || auditLoadingMore) return;
+    const snapshot = verifiedData.current;
+    const offset = snapshot?.auditNextOffset ?? 0;
+    if (snapshot && offset >= snapshot.auditTotal) return;
+    if (!snapshot?.audit.length) return;
+    setAuditLoadingMore(true);
+    setAuditLoadError(null);
+    const controller = new AbortController();
+    auditLoadController.current?.abort();
+    auditLoadController.current = controller;
+    const sessionGeneration = authGeneration;
+    const sessionPartition = memorySessionId;
+    const dataEpoch = auditDataEpoch.current;
+    const isCurrentRequest = () =>
+      mounted.current &&
+      auditLoadController.current === controller &&
+      authGeneration === sessionGeneration &&
+      memorySessionId === sessionPartition &&
+      verifiedPartition.current === sessionPartition;
+    const timer = window.setTimeout(() => controller.abort(), 6500);
+    try {
+      const requestOffset = Math.max(0, offset - 1);
+      const response = await getJson(
+        `/audit?limit=${AUDIT_PAGE_SIZE + 1}&offset=${requestOffset}`,
+        controller.signal,
+      );
+      if (!isCurrentRequest()) return;
+      const body = asRecord(response.payload);
+      const page = listFrom(body, "items").map(normalizeAudit);
+      const headResponse = await getJson(`/audit?limit=${AUDIT_PAGE_SIZE}`, controller.signal);
+      if (!isCurrentRequest() || auditDataEpoch.current !== dataEpoch) return;
+      const headBody = asRecord(headResponse.payload);
+      const head = listFrom(headBody, "items").map(normalizeAudit);
+      const auditWindow = mergeAuditPageWithFreshHead(
+        snapshot,
+        page,
+        requestOffset,
+        asFiniteNumber(body.total),
+        head,
+        asFiniteNumber(headBody.total),
+      );
+      setData((current) => {
+        if (
+          auditDataEpoch.current !== dataEpoch ||
+          authGeneration !== sessionGeneration ||
+          memorySessionId !== sessionPartition ||
+          verifiedPartition.current !== sessionPartition
+        ) {
+          return current;
+        }
+        const next = { ...current, ...auditWindow };
+        auditDataEpoch.current += 1;
+        verifiedData.current = next;
+        return next;
+      });
+    } catch {
+      if (isCurrentRequest()) setAuditLoadError("Could not load older audit events. Try again.");
+    } finally {
+      window.clearTimeout(timer);
+      if (isCurrentRequest()) {
+        auditLoadController.current = null;
+        setAuditLoadingMore(false);
+      }
+    }
+  }, [auditLoadingMore, demo, enabled]);
+
   useEffect(() => {
     mounted.current = true;
     if (demo) {
+      fullRefreshEpoch.current += 1;
+      clusterRequestEpoch.current += 1;
+      auditLoadController.current?.abort();
+      auditLoadController.current = null;
       verifiedData.current = null;
       verifiedPartition.current = null;
       const transition = window.setTimeout(() => {
@@ -1990,13 +2354,23 @@ function useHubData(enabled: boolean, demo: boolean) {
         setMode("demo");
         setError("Preview data only. No live API session is active.");
         setRefreshing(false);
+        setAuditLoadingMore(false);
+        setAuditLoadError(null);
       }, 0);
       return () => {
         mounted.current = false;
+        fullRefreshEpoch.current += 1;
+        clusterRequestEpoch.current += 1;
+        auditLoadController.current?.abort();
+        auditLoadController.current = null;
         window.clearTimeout(transition);
       };
     }
     if (!enabled) {
+      fullRefreshEpoch.current += 1;
+      clusterRequestEpoch.current += 1;
+      auditLoadController.current?.abort();
+      auditLoadController.current = null;
       verifiedData.current = null;
       verifiedPartition.current = null;
       const transition = window.setTimeout(() => {
@@ -2004,15 +2378,27 @@ function useHubData(enabled: boolean, demo: boolean) {
         setMode("live");
         setError(null);
         setRefreshing(false);
+        setAuditLoadingMore(false);
+        setAuditLoadError(null);
       }, 0);
       return () => {
         mounted.current = false;
+        fullRefreshEpoch.current += 1;
+        clusterRequestEpoch.current += 1;
+        auditLoadController.current?.abort();
+        auditLoadController.current = null;
         window.clearTimeout(transition);
       };
     }
     if (verifiedPartition.current !== memorySessionId) {
+      fullRefreshEpoch.current += 1;
+      clusterRequestEpoch.current += 1;
+      auditLoadController.current?.abort();
+      auditLoadController.current = null;
       verifiedData.current = null;
       verifiedPartition.current = memorySessionId;
+      setAuditLoadingMore(false);
+      setAuditLoadError(null);
     }
     const initialRefresh = window.setTimeout(() => void refresh(), 0);
     const onOnline = () => {
@@ -2020,8 +2406,16 @@ function useHubData(enabled: boolean, demo: boolean) {
       void refresh();
     };
     const onOffline = () => {
+      fullRefreshEpoch.current += 1;
+      clusterRequestEpoch.current += 1;
       setOnline(false);
+      setRefreshing(false);
       setMode("cached");
+      setData((current) => {
+        const next = { ...current, nodes: unavailableNodeTelemetry(current.nodes) };
+        verifiedData.current = next;
+        return next;
+      });
       setError(
         verifiedData.current
           ? "You are offline. Showing the last verified on-device snapshot."
@@ -2032,6 +2426,10 @@ function useHubData(enabled: boolean, demo: boolean) {
     window.addEventListener("offline", onOffline);
     return () => {
       mounted.current = false;
+      fullRefreshEpoch.current += 1;
+      clusterRequestEpoch.current += 1;
+      auditLoadController.current?.abort();
+      auditLoadController.current = null;
       window.clearTimeout(initialRefresh);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
@@ -2039,8 +2437,17 @@ function useHubData(enabled: boolean, demo: boolean) {
   }, [demo, enabled, refresh]);
 
   useEffect(() => {
-    if (!enabled || demo || !online || mode !== "live" || typeof EventSource === "undefined")
-      return;
+    if (!enabled || demo || !online) return;
+    const telemetryPoller = window.setInterval(() => void refreshClusterTelemetry(), 30000);
+    return () => window.clearInterval(telemetryPoller);
+  }, [demo, enabled, online, refreshClusterTelemetry]);
+
+  useEffect(() => {
+    if (!enabled || demo || !online || mode !== "live") return;
+    if (typeof EventSource === "undefined") {
+      const fallbackPoller = window.setInterval(() => void refresh(true), 30000);
+      return () => window.clearInterval(fallbackPoller);
+    }
     let stopped = false;
     let poller: number | undefined;
     let retryTimer: number | undefined;
@@ -2121,7 +2528,19 @@ function useHubData(enabled: boolean, demo: boolean) {
     };
   }, [demo, enabled, mode, online, refresh]);
 
-  return { data, mode, online, refreshing, error, liveUpdates, refresh, setData };
+  return {
+    data,
+    mode,
+    online,
+    refreshing,
+    error,
+    liveUpdates,
+    auditLoadingMore,
+    auditLoadError,
+    loadMoreAudit,
+    refresh,
+    setData,
+  };
 }
 
 function getRoute(pathname: string): { id: RouteId; incidentId?: string } {
@@ -2307,8 +2726,13 @@ function AuthGate({
         method: "POST",
         body: JSON.stringify(
           mode === "login"
-            ? { username, password }
-            : { bootstrap_token: bootstrapToken, username, password },
+            ? { username, password, device_name: currentPushDeviceName() }
+            : {
+                bootstrap_token: bootstrapToken,
+                username,
+                password,
+                device_name: currentPushDeviceName(),
+              },
         ),
       });
       const payload = await response.json().catch(() => ({}));
@@ -2730,8 +3154,23 @@ function AppHeader({
   onLogout: () => void;
   logoutBusy: boolean;
 }) {
+  const clusterHealth = aggregateNodeHealth(nodes);
   const reportedLags = nodes.flatMap((node) => node.syncLag ?? []);
   const worstLag = reportedLags.length ? Math.max(...reportedLags) : null;
+  const completeLagTelemetry = nodes.length > 0 && nodes.every((node) => node.syncLag != null);
+  const syncHealth: Health = !online
+    ? "offline"
+    : clusterHealth === "healthy" && completeLagTelemetry
+      ? worstLag != null && worstLag > 10
+        ? "degraded"
+        : "healthy"
+      : clusterHealth;
+  const syncLabel =
+    syncHealth === "healthy" && worstLag != null
+      ? `${worstLag.toFixed(1)}s`
+      : syncHealth === "unknown"
+        ? "telemetry unavailable"
+        : syncHealth;
   return (
     <header className="app-header">
       <div className="app-header__mobile-brand">
@@ -2741,7 +3180,7 @@ function AppHeader({
         <Brand />
       </div>
       <div className="node-chip" title="Latest cluster inventory">
-        <StatusDot health={online ? (nodes.length ? "unknown" : "paused") : "offline"} />
+        <StatusDot health={online ? (nodes.length ? clusterHealth : "paused") : "offline"} />
         <span>
           <small>Cluster inventory</small>
           <b>{nodes.length ? `${nodes.length} known node(s)` : "No node records"}</b>
@@ -2749,11 +3188,9 @@ function AppHeader({
       </div>
       <div className="app-header__status">
         <span className="header-signal">
-          <StatusDot
-            health={worstLag == null ? "unknown" : worstLag > 10 ? "degraded" : "healthy"}
-          />
+          <StatusDot health={syncHealth} />
           <span>
-            Sync <b>{worstLag == null ? "unknown" : `${worstLag.toFixed(1)}s`}</b>
+            Sync <b>{syncLabel}</b>
           </span>
         </span>
         <span className="header-signal">
@@ -2805,7 +3242,19 @@ export function AlertHubApp({ appName = "Alert Hub" }: { appName?: string }) {
 function AlertHubRuntime() {
   const queryClient = useQueryClient();
   const auth = useAuthSession();
-  const { data, mode, online, refreshing, error, liveUpdates, refresh, setData } = useHubData(
+  const {
+    data,
+    mode,
+    online,
+    refreshing,
+    error,
+    liveUpdates,
+    auditLoadingMore,
+    auditLoadError,
+    loadMoreAudit,
+    refresh,
+    setData,
+  } = useHubData(
     auth.state.status === "authenticated" || auth.state.status === "offline",
     auth.state.status === "demo",
   );
@@ -2924,7 +3373,18 @@ function AlertHubRuntime() {
           />
         );
       case "audit":
-        return <AuditPage items={data.audit} />;
+        return (
+          <AuditPage
+            items={data.audit}
+            nextOffset={data.auditNextOffset}
+            total={data.auditTotal}
+            nodes={data.nodes}
+            loadingMore={auditLoadingMore}
+            loadError={auditLoadError}
+            onLoadMore={() => void loadMoreAudit()}
+            readOnly={readOnly}
+          />
+        );
       case "settings":
         return <SettingsPage nodes={data.nodes} readOnly={readOnly} />;
       default:
@@ -2997,7 +3457,12 @@ function AlertHubRuntime() {
           }}
         />
       )}
-      {notificationModal && <NotificationOnboarding onClose={() => setNotificationModal(false)} />}
+      {notificationModal && (
+        <NotificationOnboarding
+          onClose={() => setNotificationModal(false)}
+          onSubscribed={() => void refresh()}
+        />
+      )}
     </div>
   );
 }
@@ -4721,7 +5186,19 @@ function ChannelsPage({
       );
       const statusValue = String(body.status ?? "completed");
       const detail = String(body.detail ?? "Provider test completed.");
-      if (body.ok !== true) throw new Error(`${statusValue}: ${detail}`);
+      if (body.ok !== true) {
+        const diagnostics = listFrom(body.outcomes, "outcomes")
+          .map(asRecord)
+          .filter((item) => item.outcome !== "succeeded")
+          .map((item) =>
+            String(item.error_code ?? item.provider_status ?? item.outcome ?? "failed"),
+          )
+          .filter(Boolean);
+        const reasons = [...new Set(diagnostics)].slice(0, 4);
+        throw new Error(
+          `${statusValue}: ${detail}${reasons.length ? ` · ${reasons.join(", ")}` : ""}`,
+        );
+      }
       setOutcome(`${channel.name}: ${statusValue} · ${detail}`);
     } catch (reason) {
       setActionError(reason instanceof Error ? reason.message : "Channel test failed.");
@@ -5409,20 +5886,57 @@ function ClusterPage({
   );
 }
 
-function AuditPage({ items }: { items: AuditItem[] }) {
+function AuditPage({
+  items,
+  nextOffset,
+  total,
+  nodes,
+  loadingMore,
+  loadError,
+  onLoadMore,
+  readOnly,
+}: {
+  items: AuditItem[];
+  nextOffset: number;
+  total: number;
+  nodes: ClusterNode[];
+  loadingMore: boolean;
+  loadError: string | null;
+  onLoadMore: () => void;
+  readOnly: boolean;
+}) {
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState("all");
-  const filtered = items.filter(
-    (item) =>
-      `${item.action} ${item.detail} ${item.actor} ${item.node}`
-        .toLowerCase()
-        .includes(query.toLowerCase()) &&
-      (scope === "all" || (scope === "system" ? item.actor === "system" : item.actor !== "system")),
+  const [range, setRange] = useState("7d");
+  const [rangeAnchor] = useState(() => Date.now());
+  const rangeDays = range === "7d" ? 7 : range === "30d" ? 30 : null;
+  const cutoff = rangeDays == null ? null : rangeAnchor - rangeDays * 24 * 60 * 60 * 1000;
+  const filtered = useMemo(
+    () =>
+      items.filter(
+        (item) =>
+          `${item.action} ${item.detail} ${item.actor} ${item.node}`
+            .toLowerCase()
+            .includes(query.toLowerCase()) &&
+          (scope === "all" ||
+            (scope === "system" ? item.actor === "system" : item.actor !== "system")) &&
+          (cutoff == null ||
+            (Number.isFinite(Date.parse(item.at)) && Date.parse(item.at) >= cutoff)),
+      ),
+    [cutoff, items, query, scope],
   );
+  const grouped = useMemo(() => groupAuditBursts(filtered), [filtered]);
+  const clusterHealth = aggregateNodeHealth(nodes);
+  const healthyNodes = nodes.filter((node) => node.health === "healthy").length;
+  const knownTotal = Math.max(total, items.length);
+  const canLoadMore = nextOffset < knownTotal;
   const exportLoaded = () => {
-    const blob = new Blob([items.map((item) => JSON.stringify(item)).join("\n") + "\n"], {
-      type: "application/x-ndjson",
-    });
+    const blob = new Blob(
+      [items.map((item) => JSON.stringify(item.raw ?? item)).join("\n") + "\n"],
+      {
+        type: "application/x-ndjson",
+      },
+    );
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -5435,7 +5949,7 @@ function AuditPage({ items }: { items: AuditItem[] }) {
       <PageHeading
         eyebrow="Immutable operations trail"
         title="Audit log"
-        description="Authentication, configuration, incident actions, and cluster decisions across every peer."
+        description="Authentication, configuration, and incident actions recorded by the API node serving this session."
         actions={
           <button className="button button--quiet" onClick={exportLoaded} disabled={!items.length}>
             <Icon symbol="⇩" />
@@ -5443,6 +5957,17 @@ function AuditPage({ items }: { items: AuditItem[] }) {
           </button>
         }
       />
+      <div className={`audit-current-health audit-current-health--${clusterHealth}`}>
+        <StatusDot health={clusterHealth} />
+        <span>
+          <b>Current cluster status</b>
+          <small>
+            {nodes.length
+              ? `${healthyNodes}/${nodes.length} nodes healthy. Audit failures below are historical events, not active alarms.`
+              : "Live cluster telemetry is not available."}
+          </small>
+        </span>
+      </div>
       <Panel className="audit-panel">
         <div className="filter-bar">
           <label className="search-field">
@@ -5473,20 +5998,24 @@ function AuditPage({ items }: { items: AuditItem[] }) {
           </div>
           <label className="compact-select">
             <span className="sr-only">Audit date range</span>
-            <select>
-              <option>Last 7 days</option>
-              <option>Last 30 days</option>
-              <option>All history</option>
+            <select value={range} onChange={(event) => setRange(event.target.value)}>
+              <option value="7d">Last 7 days</option>
+              <option value="30d">Last 30 days</option>
+              <option value="all">All loaded history</option>
             </select>
           </label>
         </div>
         <div className="audit-date-row">
-          <span>{filtered[0] ? formatDay(filtered[0].at) : "Audit trail"}</span>
+          <span>
+            {filtered[0]
+              ? `${formatDay(filtered[0].at)} · ${filtered.length} event${filtered.length === 1 ? "" : "s"}`
+              : "Audit trail"}
+          </span>
           <i />
         </div>
-        {filtered.length ? (
+        {grouped.length ? (
           <div className="audit-list">
-            {filtered.map((item) => (
+            {grouped.map((item) => (
               <div className="audit-item" key={item.id}>
                 <span className={`audit-item__icon audit-item__icon--${item.tone}`}>
                   <Icon
@@ -5502,7 +6031,11 @@ function AuditPage({ items }: { items: AuditItem[] }) {
                   />
                 </span>
                 <span className="audit-item__body">
-                  <b>{item.action}</b>
+                  <b>
+                    {item.actionCode === "cluster_auth_failed"
+                      ? "Rejected cluster-auth attempt"
+                      : item.action}
+                  </b>
                   <p>{item.detail}</p>
                   <small>
                     <span className="avatar avatar--tiny">
@@ -5512,6 +6045,17 @@ function AuditPage({ items }: { items: AuditItem[] }) {
                   </small>
                 </span>
                 <time>{formatDate(item.at)}</time>
+                {item.count > 1 ? (
+                  <span
+                    className="audit-item__count"
+                    title={`${item.count} identical events from ${formatDate(item.oldestAt)} through ${formatDate(item.at)}`}
+                    aria-label={`${item.count} identical events in this burst`}
+                  >
+                    ×{item.count}
+                  </span>
+                ) : (
+                  <span />
+                )}
               </div>
             ))}
           </div>
@@ -5522,18 +6066,38 @@ function AuditPage({ items }: { items: AuditItem[] }) {
             message="Try another actor or search term."
           />
         )}
+        {canLoadMore && (
+          <div className="audit-load-more">
+            <button
+              className="button button--quiet"
+              type="button"
+              onClick={onLoadMore}
+              disabled={loadingMore || readOnly}
+            >
+              {loadingMore
+                ? "Loading older events…"
+                : `Load older events (${items.length}/${knownTotal})`}
+            </button>
+          </div>
+        )}
+        {loadError && (
+          <p className="audit-load-error" role="alert">
+            {loadError}
+          </p>
+        )}
         <div className="audit-integrity">
           <Icon symbol="◇" />
           <span>
             <b>Audit storage policy</b>
             <small>
-              Entries are replicated as append-only cluster events. Secrets and authorization
-              headers are never recorded.
+              Entries are append-only on this node. Burst grouping changes only this view; export
+              retains every field returned by the API for every loaded event. Secrets and
+              authorization headers are never recorded.
             </small>
           </span>
           <span>
             <StatusDot health="unknown" />
-            Not independently verified
+            {items.length}/{knownTotal} loaded
           </span>
         </div>
       </Panel>
@@ -6850,89 +7414,285 @@ function DatasourceWizard({
   );
 }
 
-function base64ToUint8Array(value: string) {
-  const padding = "=".repeat((4 - (value.length % 4)) % 4);
-  const decoded = atob((value + padding).replace(/-/g, "+").replace(/_/g, "/"));
-  return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+type PushSetupMessage = { tone: "success" | "warning"; text: string };
+
+async function pushApiRequest(
+  path: string,
+  init: RequestInit,
+  timeoutMessage: string,
+  signal: AbortSignal,
+  expectedAuthGeneration: number,
+  expectedSessionId: string | null,
+) {
+  if (signal.aborted) throw new PushSetupCancelledError();
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  signal.addEventListener("abort", cancel, { once: true });
+  const timer = window.setTimeout(() => controller.abort(), 10_000);
+  try {
+    return await apiFetch(
+      path,
+      { ...init, signal: controller.signal },
+      expectedAuthGeneration,
+      expectedSessionId,
+    );
+  } catch (reason) {
+    if (signal.aborted || reason instanceof PushSetupCancelledError) {
+      throw new PushSetupCancelledError();
+    }
+    if (controller.signal.aborted) throw new Error(timeoutMessage, { cause: reason });
+    throw reason;
+  } finally {
+    window.clearTimeout(timer);
+    signal.removeEventListener("abort", cancel);
+  }
 }
 
-function NotificationOnboarding({ onClose }: { onClose: () => void }) {
+function NotificationOnboarding({
+  onClose,
+  onSubscribed,
+}: {
+  onClose: () => void;
+  onSubscribed: () => void;
+}) {
   const appName = useContext(AppNameContext);
+  const environment = useMemo(() => currentPushClientEnvironment(), []);
   const [permission, setPermission] = useState<NotificationPermission | "unsupported">(() =>
     typeof Notification === "undefined" ? "unsupported" : Notification.permission,
   );
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<PushSetupMessage | null>(() =>
+    typeof Notification !== "undefined" && Notification.permission === "denied"
+      ? { tone: "warning", text: blockedPermissionHelp(environment) }
+      : null,
+  );
+  const mounted = useRef(true);
+  const activeOperation = useRef<AbortController | null>(null);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      activeOperation.current?.abort();
+      activeOperation.current = null;
+    };
+  }, []);
+  const requestClose = () => {
+    if (busy) return;
+    activeOperation.current?.abort();
+    activeOperation.current = null;
+    onClose();
+  };
   const enable = async () => {
-    if (typeof Notification === "undefined" || !("serviceWorker" in navigator)) {
+    if (
+      typeof Notification === "undefined" ||
+      !("serviceWorker" in navigator) ||
+      typeof PushManager === "undefined"
+    ) {
       setPermission("unsupported");
+      setMessage({
+        tone: "warning",
+        text: "This browser does not expose the Notifications, Service Worker, and Push APIs required for Web Push.",
+      });
       return;
     }
+    if (!window.isSecureContext) {
+      setMessage({
+        tone: "warning",
+        text: "Web Push requires a secure HTTPS context. Reopen Alert Hub through its HTTPS address.",
+      });
+      return;
+    }
+    if (environment.ios && !environment.standalone) {
+      setMessage({
+        tone: "warning",
+        text: "On iPhone and iPad, install Alert Hub with Share → Add to Home Screen, open that installed app, sign in, and enable notifications there.",
+      });
+      return;
+    }
+    if (Notification.permission === "denied") {
+      setPermission("denied");
+      setMessage({ tone: "warning", text: blockedPermissionHelp(environment) });
+      return;
+    }
+    const operationGeneration = authGeneration;
+    const operationSessionId = memorySessionId;
+    const controller = new AbortController();
+    activeOperation.current?.abort();
+    activeOperation.current = controller;
+    let createdSubscription: PushSubscription | null = null;
+    let registrationStarted = false;
+    let subscriptionSaved = false;
+    const assertActive = () => {
+      if (
+        controller.signal.aborted ||
+        !mounted.current ||
+        activeOperation.current !== controller ||
+        authGeneration !== operationGeneration ||
+        memorySessionId !== operationSessionId
+      ) {
+        throw new PushSetupCancelledError();
+      }
+    };
     setBusy(true);
     setMessage(null);
     try {
-      const result = await Notification.requestPermission();
+      const result =
+        Notification.permission === "granted" ? "granted" : await Notification.requestPermission();
+      assertActive();
       setPermission(result);
       if (result !== "granted") {
-        setMessage(
-          result === "denied"
-            ? "Permission is blocked. Enable notifications in browser settings and try again."
-            : "Permission was not granted.",
+        setMessage({
+          tone: "warning",
+          text:
+            result === "denied"
+              ? blockedPermissionHelp(environment)
+              : "Notification permission was not granted. Try again when you are ready to accept the browser prompt.",
+        });
+        return;
+      }
+      const registration = await withPushTimeout(
+        (async () => {
+          const current = await navigator.serviceWorker.getRegistration("/");
+          if (!current) await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+          return navigator.serviceWorker.ready;
+        })(),
+        10_000,
+        "Service worker registration timed out. Reload the page and try again.",
+      );
+      assertActive();
+      const keyResponse = await pushApiRequest(
+        "/push/vapid-public-key",
+        {},
+        "The API did not return its Web Push key in time.",
+        controller.signal,
+        operationGeneration,
+        operationSessionId,
+      );
+      assertActive();
+      if (!keyResponse.ok) {
+        const detail = await apiError(
+          keyResponse,
+          `This API node cannot publish a Web Push key (${keyResponse.status}).`,
         );
-        return;
+        assertActive();
+        throw new Error(detail);
       }
-      const registration = await navigator.serviceWorker.ready;
-      let vapidKey = "";
-      try {
-        const keyResponse = await getJson("/push/vapid-public-key");
-        const keyBody = asRecord(keyResponse.payload);
-        vapidKey = String(keyBody.public_key ?? keyBody.vapid_public_key ?? "");
-      } catch {
-        setMessage("Permission granted. This API node has not published a VAPID key yet.");
-        return;
-      }
-      if (!vapidKey || !("pushManager" in registration)) {
-        setMessage(
-          "Permission granted. Push subscription is not available on this device or node.",
+      const keyBody = asRecord(await keyResponse.json().catch(() => ({})));
+      assertActive();
+      const vapidKey = String(keyBody.public_key ?? keyBody.vapid_public_key ?? "");
+      const applicationServerKey = decodeApplicationServerKey(vapidKey);
+      let subscription = await withPushTimeout(
+        registration.pushManager.getSubscription(),
+        10_000,
+        "The browser did not return its current Push subscription in time.",
+      );
+      assertActive();
+      if (
+        subscription &&
+        !applicationServerKeyMatches(
+          subscription.options.applicationServerKey,
+          applicationServerKey,
+        )
+      ) {
+        const removed = await withPushTimeout(
+          subscription.unsubscribe(),
+          10_000,
+          "The browser could not replace its outdated Push subscription in time.",
         );
-        return;
+        assertActive();
+        if (!removed) throw new Error("The browser refused to replace its outdated Push key.");
+        subscription = null;
       }
-      const existing = await registration.pushManager.getSubscription();
-      const subscription =
-        existing ??
-        (await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: base64ToUint8Array(vapidKey),
-        }));
+      if (!subscription) {
+        createdSubscription = await withPushTimeout(
+          registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey,
+          }),
+          15_000,
+          "The browser Push service did not create a subscription in time.",
+        );
+        subscription = createdSubscription;
+        assertActive();
+      }
       const body = subscription.toJSON();
-      const response = await apiFetch("/push/subscriptions", {
-        method: "POST",
-        body: JSON.stringify({
-          ...body,
-          device_name: navigator.platform || "Installed PWA",
-          user_agent: navigator.userAgent,
-        }),
+      if (!body.endpoint || !body.keys?.p256dh || !body.keys.auth) {
+        throw new Error("The browser returned an incomplete Push subscription.");
+      }
+      assertActive();
+      registrationStarted = true;
+      const response = await pushApiRequest(
+        "/push/subscriptions",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            ...body,
+            device_name: currentPushDeviceName(),
+            user_agent: navigator.userAgent,
+          }),
+        },
+        "The API did not save this Push subscription in time.",
+        controller.signal,
+        operationGeneration,
+        operationSessionId,
+      );
+      assertActive();
+      if (!response.ok) {
+        const detail = await apiError(
+          response,
+          `The API rejected this Push subscription (${response.status}).`,
+        );
+        assertActive();
+        throw new Error(detail);
+      }
+      subscriptionSaved = true;
+      assertActive();
+      setMessage({
+        tone: "success",
+        text: "This device is subscribed. Use Channels → Send test to verify visible delivery.",
       });
-      if (!response.ok) throw new Error("subscription rejected");
-      setMessage(
-        "This device is subscribed. Send a test notification from Channels to verify delivery.",
-      );
-    } catch {
-      setMessage(
-        "Permission is enabled, but the cluster subscription could not be completed. Try another healthy node.",
-      );
+      assertActive();
+      onSubscribed();
+    } catch (reason) {
+      if (reason instanceof PushSetupCancelledError || !mounted.current) {
+        if (createdSubscription && !registrationStarted && !subscriptionSaved) {
+          await withPushTimeout(
+            createdSubscription.unsubscribe(),
+            2_000,
+            "Push subscription cleanup timed out.",
+          ).catch(() => undefined);
+        }
+        if (
+          mounted.current &&
+          (authGeneration !== operationGeneration || memorySessionId !== operationSessionId)
+        ) {
+          setMessage({
+            tone: "warning",
+            text: "Your authenticated session changed while notifications were being configured. Reload the page and try again.",
+          });
+        }
+        return;
+      }
+      const detail =
+        reason instanceof DOMException && reason.name === "NotAllowedError"
+          ? blockedPermissionHelp(environment)
+          : reason instanceof Error && reason.message
+            ? reason.message
+            : "The browser or API could not complete the Push subscription.";
+      setMessage({ tone: "warning", text: detail });
     } finally {
-      setBusy(false);
+      if (activeOperation.current === controller) activeOperation.current = null;
+      if (mounted.current) setBusy(false);
     }
   };
   return (
-    <Modal onClose={onClose} label="Enable notifications">
+    <Modal onClose={requestClose} label="Enable notifications">
       <div className="modal-head">
         <div>
           <span className="eyebrow">Web Push onboarding</span>
           <h2>Never miss a cluster alert</h2>
         </div>
-        <button className="icon-button" onClick={onClose} aria-label="Close">
+        <button className="icon-button" onClick={requestClose} aria-label="Close" disabled={busy}>
           <Icon symbol="×" />
         </button>
       </div>
@@ -6956,31 +7716,62 @@ function NotificationOnboarding({ onClose }: { onClose: () => void }) {
       </div>
       <div className="notification-body">
         <p>
-          On iPhone and iPad, Web Push works from the installed Home Screen app. Permission is
-          requested only after you press the button below.
+          {environment.ios
+            ? environment.standalone
+              ? "This installed Home Screen app can request Web Push after the action below."
+              : "On iPhone and iPad, Web Push works only from the installed Home Screen app."
+            : "Permission is requested only after the action below. Alert Hub then registers this browser with the cluster."}
         </p>
         <ol className="onboarding-steps">
-          <li>
-            <span>1</span>
-            <p>
-              <b>Open in Safari</b>
-              <small>Use the Share menu for this site.</small>
-            </p>
-          </li>
-          <li>
-            <span>2</span>
-            <p>
-              <b>Add to Home Screen</b>
-              <small>Launch {appName} from its new icon.</small>
-            </p>
-          </li>
-          <li>
-            <span>3</span>
-            <p>
-              <b>Enable notifications</b>
-              <small>Approve the system prompt after this click.</small>
-            </p>
-          </li>
+          {environment.ios && !environment.standalone ? (
+            <>
+              <li>
+                <span>1</span>
+                <p>
+                  <b>Open in Safari</b>
+                  <small>Use the Share menu for this site.</small>
+                </p>
+              </li>
+              <li>
+                <span>2</span>
+                <p>
+                  <b>Add to Home Screen</b>
+                  <small>Launch {appName} from its new icon and sign in.</small>
+                </p>
+              </li>
+              <li>
+                <span>3</span>
+                <p>
+                  <b>Enable notifications</b>
+                  <small>Approve the system prompt from the installed app.</small>
+                </p>
+              </li>
+            </>
+          ) : (
+            <>
+              <li>
+                <span>1</span>
+                <p>
+                  <b>Allow notifications</b>
+                  <small>Approve the browser or system prompt.</small>
+                </p>
+              </li>
+              <li>
+                <span>2</span>
+                <p>
+                  <b>Register this device</b>
+                  <small>The subscription is encrypted and stored by the cluster.</small>
+                </p>
+              </li>
+              <li>
+                <span>3</span>
+                <p>
+                  <b>Send a test</b>
+                  <small>Verify delivery from the Web Push channel.</small>
+                </p>
+              </li>
+            </>
+          )}
         </ol>
         {permission === "unsupported" && (
           <div className="permission-message permission-message--warning">
@@ -6990,15 +7781,16 @@ function NotificationOnboarding({ onClose }: { onClose: () => void }) {
         )}
         {message && (
           <div
-            className={`permission-message ${permission === "granted" ? "permission-message--success" : "permission-message--warning"}`}
+            className={`permission-message permission-message--${message.tone}`}
+            role={message.tone === "warning" ? "alert" : "status"}
           >
-            <Icon symbol={permission === "granted" ? "✓" : "!"} />
-            {message}
+            <Icon symbol={message.tone === "success" ? "✓" : "!"} />
+            {message.text}
           </div>
         )}
       </div>
       <div className="modal-foot modal-foot--stack-mobile">
-        <button className="text-button" onClick={onClose}>
+        <button className="text-button" onClick={requestClose} disabled={busy}>
           Maybe later
         </button>
         <button
@@ -7009,9 +7801,11 @@ function NotificationOnboarding({ onClose }: { onClose: () => void }) {
           <Icon symbol="◉" />
           {busy
             ? "Connecting…"
-            : permission === "granted"
-              ? "Check subscription"
-              : "Enable notifications"}
+            : message?.tone === "success" || permission === "granted"
+              ? "Verify subscription"
+              : permission === "denied"
+                ? "Show recovery steps"
+                : "Enable notifications"}
         </button>
       </div>
     </Modal>

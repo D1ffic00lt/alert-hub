@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import socket
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -27,7 +28,7 @@ from alert_hub.application.notifications import (
     NotificationMessage,
 )
 from alert_hub.infrastructure.db.base import utc_now
-from alert_hub.infrastructure.db.models import ClusterEvent
+from alert_hub.infrastructure.db.models import ClusterEvent, PushSubscription
 from alert_hub.infrastructure.db.models import Session as AuthSession
 from alert_hub.infrastructure.notifications import http as http_module
 from alert_hub.infrastructure.notifications import web_push as web_push_module
@@ -67,7 +68,7 @@ def _message(*, event_type: str = "firing") -> NotificationMessage:
 
 def _subscription_target(
     *,
-    endpoint: str = "https://push.example.test/device",
+    endpoint: str = "https://1.1.1.1/push/device",
     p256dh: str = "public-key",
     auth: str = "auth-secret",
 ) -> DeliveryTarget:
@@ -80,6 +81,14 @@ def _subscription_target(
         p256dh=p256dh,
         auth=auth,
     )
+
+
+def _public_key(private_key: ec.EllipticCurvePrivateKey) -> str:
+    encoded = private_key.public_key().public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode()
 
 
 class _RecordingWebPushTransport:
@@ -114,15 +123,17 @@ def test_vapid_public_key_sources_and_key_type_validation(
     settings: Settings,
     tmp_path: Path,
 ) -> None:
-    direct = settings.model_copy(update={"vapid_public_key": "  direct-public-key  "})
-    assert vapid_public_key(direct) == "direct-public-key"
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_key = _public_key(private_key)
+    direct = settings.model_copy(update={"vapid_public_key": f"  {public_key}  "})
+    assert vapid_public_key(direct) == public_key
 
     public_path = tmp_path / "vapid-public.key"
-    public_path.write_text("  file-public-key\n", encoding="utf-8")
+    public_path.write_text(f"  {public_key}\n", encoding="utf-8")
     from_file = settings.model_copy(
         update={"vapid_public_key": None, "vapid_public_key_file": public_path}
     )
-    assert vapid_public_key(from_file) == "file-public-key"
+    assert vapid_public_key(from_file) == public_key
 
     public_path.write_text(" \n", encoding="utf-8")
     with pytest.raises(VapidConfigurationError, match="public key file is empty"):
@@ -143,6 +154,41 @@ def test_vapid_public_key_sources_and_key_type_validation(
     )
     with pytest.raises(VapidConfigurationError, match="VAPID key is not configured"):
         vapid_public_key(missing)
+
+
+def test_explicit_vapid_public_key_is_valid_and_matches_private_key(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    private_path = tmp_path / "vapid-private.pem"
+    private_path.write_bytes(
+        private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    public_key = _public_key(private_key)
+    matching = settings.model_copy(
+        update={"vapid_public_key": public_key, "vapid_private_key_file": private_path}
+    )
+    assert vapid_public_key(matching) == public_key
+
+    mismatched = matching.model_copy(
+        update={"vapid_public_key": _public_key(ec.generate_private_key(ec.SECP256R1()))}
+    )
+    with pytest.raises(VapidConfigurationError, match="public and private keys do not match"):
+        vapid_public_key(mismatched)
+
+    malformed = settings.model_copy(update={"vapid_public_key": "not+canonical/base64=="})
+    with pytest.raises(VapidConfigurationError, match="canonical unpadded base64url"):
+        vapid_public_key(malformed)
+
+    invalid_point = base64.urlsafe_b64encode(b"\x04" + (b"\x00" * 64)).rstrip(b"=").decode()
+    invalid = settings.model_copy(update={"vapid_public_key": invalid_point})
+    with pytest.raises(VapidConfigurationError, match="uncompressed P-256 point"):
+        vapid_public_key(invalid)
 
 
 @pytest.mark.parametrize("key_kind", ["malformed", "rsa", "wrong_curve"])
@@ -233,6 +279,7 @@ def test_pywebpush_transport_maps_library_failures_without_exposing_details(
             subject="mailto:operator@example.invalid",
             ttl_seconds=120,
             timeout_seconds=2.5,
+            pinned_addresses=("1.1.1.1",),
         )
     )
     assert response == WebPushResponse(202)
@@ -240,6 +287,9 @@ def test_pywebpush_transport_maps_library_failures_without_exposing_details(
     assert captured["vapid_claims"] == {"sub": "mailto:operator@example.invalid"}
     assert captured["ttl"] == 120
     assert captured["timeout"] == 2.5
+    pinned_session = captured["requests_session"]
+    assert pinned_session.trust_env is False
+    assert pinned_session.max_redirects == 0
 
     def gone(**kwargs: Any) -> object:
         del kwargs
@@ -382,6 +432,7 @@ def test_web_push_provider_payload_safety_and_transport_failures(tmp_path: Path)
         "subject": "mailto:test@example.invalid",
         "ttl_seconds": 90,
         "timeout_seconds": 1.5,
+        "pinned_addresses": ("1.1.1.1",),
     }
 
     for error, expected in [
@@ -415,6 +466,92 @@ def test_web_push_provider_payload_safety_and_transport_failures(tmp_path: Path)
     assert asyncio.run(unconfigured.send(message, _subscription_target())) == DeliveryResult(
         "permanent", "not_configured", "missing_vapid_key"
     )
+
+
+def test_web_push_provider_revalidates_endpoint_before_transport(tmp_path: Path) -> None:
+    def private_resolver(*args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        del args, kwargs
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.4", 443))]
+
+    transport = _RecordingWebPushTransport()
+    provider = WebPushProvider(
+        transport,
+        private_key_path=tmp_path / "unused-vapid.pem",
+        subject="mailto:test@example.invalid",
+        ttl_seconds=60,
+        timeout_seconds=1,
+        resolver=private_resolver,
+    )
+
+    result = asyncio.run(
+        provider.send(
+            _message(),
+            _subscription_target(endpoint="https://push.example.test/device"),
+        )
+    )
+
+    assert result == DeliveryResult("permanent", "rejected", "unsafe_destination")
+    assert transport.calls == []
+
+
+def test_web_push_provider_pins_the_validated_dns_answers(tmp_path: Path) -> None:
+    resolver_calls = 0
+
+    def public_resolver(*args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        nonlocal resolver_calls
+        del args, kwargs
+        resolver_calls += 1
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443)),
+        ]
+
+    transport = _RecordingWebPushTransport()
+    provider = WebPushProvider(
+        transport,
+        private_key_path=tmp_path / "unused-vapid.pem",
+        subject="mailto:test@example.invalid",
+        ttl_seconds=60,
+        timeout_seconds=1,
+        resolver=public_resolver,
+    )
+
+    result = asyncio.run(
+        provider.send(
+            _message(),
+            _subscription_target(endpoint="https://push.example.test/device"),
+        )
+    )
+
+    assert result == DeliveryResult("succeeded", "http_201")
+    assert resolver_calls == 1
+    assert transport.calls[0]["kwargs"]["pinned_addresses"] == ("1.1.1.1", "8.8.8.8")
+
+
+def test_pinned_web_push_connection_never_resolves_the_original_hostname(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connected_to: list[tuple[str, int]] = []
+    returned_socket = socket.socket()
+
+    def connect(address: tuple[str, int], *args: Any, **kwargs: Any) -> socket.socket:
+        del args, kwargs
+        connected_to.append(address)
+        return returned_socket
+
+    monkeypatch.setattr(web_push_module.urllib3_connection, "create_connection", connect)
+    connection = web_push_module._PinnedHTTPSConnection(
+        host="push.example.test",
+        port=443,
+        timeout=1,
+        pinned_addresses=("1.1.1.1",),
+    )
+    try:
+        assert connection._new_conn() is returned_socket
+        assert connection.host == "push.example.test"
+        assert connected_to == [("1.1.1.1", 443)]
+    finally:
+        returned_socket.close()
 
 
 @dataclass
@@ -536,6 +673,19 @@ def test_refresh_expiry_and_revocation_are_fail_closed_and_idempotent(
 ) -> None:
     raw_refresh = client.cookies.get(settings.refresh_cookie_name)
     assert raw_refresh is not None
+    push_response = client.post(
+        "/api/v1/push/subscriptions",
+        headers=auth,
+        json={
+            "endpoint": f"https://1.1.1.1/push/{session_state}",
+            "keys": {
+                "p256dh": _public_key(ec.generate_private_key(ec.SECP256R1())),
+                "auth": base64.urlsafe_b64encode(b"a" * 16).rstrip(b"=").decode(),
+            },
+            "device_name": "expiring browser",
+        },
+    )
+    assert push_response.status_code == 201, push_response.text
     now = utc_now()
     with app.state.session_factory.begin() as db:
         auth_session = db.scalar(select(AuthSession))
@@ -570,7 +720,18 @@ def test_refresh_expiry_and_revocation_are_fail_closed_and_idempotent(
                 ClusterEvent.operation == "revoke",
             )
         )
+        push_subscription = db.get(PushSubscription, push_response.json()["id"])
+        assert push_subscription is not None
+        assert push_subscription.disabled_at is not None
+        push_tombstone_count = db.scalar(
+            select(func.count(ClusterEvent.event_id)).where(
+                ClusterEvent.entity_type == "push_subscription",
+                ClusterEvent.entity_id == push_subscription.id,
+                ClusterEvent.operation == "tombstone",
+            )
+        )
     assert revoke_count == expected_revoke_events
+    assert push_tombstone_count == 1
 
 
 def _stream_request(

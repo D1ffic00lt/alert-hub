@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -14,7 +14,7 @@ from alert_hub.application.sync import (
     apply_cluster_events,
     cluster_cursor,
 )
-from alert_hub.infrastructure.db.models import ClusterEvent, Node, User
+from alert_hub.infrastructure.db.models import ClusterEvent, Node, Outbox, User
 from alert_hub.metrics import SYNC_EVENTS
 from alert_hub.settings import Settings
 
@@ -128,8 +128,40 @@ def internal_node_health(
     }
 
 
-def _node_response(node: Node) -> dict[str, Any]:
-    return {
+PEER_OFFLINE_FAILURE_THRESHOLD = 3
+
+
+def _node_response(
+    node: Node,
+    *,
+    local_node_id: str | None = None,
+    local_outbox_pending: int | None = None,
+    peer_snapshot: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    health = "unknown"
+    sync_lag_seconds: float | None = None
+    last_sync_success_at = None
+    peer_failures = 0
+    if local_node_id is not None and node.id == local_node_id:
+        health = "healthy"
+        sync_lag_seconds = 0.0
+    elif peer_snapshot is not None:
+        # A successful handshake assigns PeerState.node_id before the worker marks
+        # the attempt successful. Never infer node identity from a configured URL:
+        # a reprovisioned or duplicated URL must remain unknown until it proves ID.
+        runtime = peer_snapshot.get(node.id)
+        if runtime is not None:
+            last_sync_success_at = runtime.get("last_success_at")
+            peer_failures = int(runtime.get("failures") or 0)
+            if bool(runtime.get("up")):
+                health = "healthy"
+                sync_lag_seconds = float(runtime.get("lag_seconds") or 0.0)
+            elif peer_failures >= PEER_OFFLINE_FAILURE_THRESHOLD:
+                health = "offline"
+            elif peer_failures:
+                health = "degraded"
+
+    response = {
         "id": node.id,
         "name": node.name,
         "region": node.region,
@@ -139,7 +171,13 @@ def _node_response(node: Node) -> dict[str, Any]:
         "created_at": node.created_at,
         "last_seen_at": node.last_seen_at,
         "software_version": node.software_version,
+        "health": health,
+        "sync_lag_seconds": sync_lag_seconds,
+        "last_sync_success_at": last_sync_success_at,
+        "peer_failures": peer_failures,
+        "outbox_pending": local_outbox_pending if node.id == local_node_id else None,
     }
+    return response
 
 
 @public_router.get("/nodes")
@@ -153,13 +191,28 @@ def cluster_nodes(
 
 @public_router.get("/status")
 def cluster_status(
+    request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
+    settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
     del user
     nodes = db.scalars(select(Node).order_by(Node.id)).all()
+    sync_worker = getattr(request.app.state, "peer_sync_worker", None)
+    peer_snapshot = sync_worker.status_snapshot() if sync_worker is not None else {}
+    local_outbox_pending = int(
+        db.scalar(select(func.count(Outbox.id)).where(Outbox.completed_at.is_(None))) or 0
+    )
     return {
-        "nodes": [_node_response(node) for node in nodes],
+        "nodes": [
+            _node_response(
+                node,
+                local_node_id=settings.node_id,
+                local_outbox_pending=local_outbox_pending,
+                peer_snapshot=peer_snapshot,
+            )
+            for node in nodes
+        ],
         "cursor": _cursor_map(db),
         "cluster_event_count": int(db.scalar(select(func.count(ClusterEvent.event_id))) or 0),
     }

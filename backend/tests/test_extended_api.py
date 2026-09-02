@@ -9,6 +9,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from starlette.requests import Request
 
 from alert_hub.api.stream import stream as stream_endpoint
@@ -18,7 +19,8 @@ from alert_hub.application.notifications import (
     NotificationMessage,
     ProviderRegistry,
 )
-from alert_hub.infrastructure.db.models import NotificationChannel, PushSubscription
+from alert_hub.infrastructure.db.models import ClusterEvent, NotificationChannel, PushSubscription
+from alert_hub.infrastructure.db.models import Session as AuthSession
 from alert_hub.main import create_app
 from alert_hub.settings import Settings
 
@@ -39,6 +41,25 @@ class _SuccessfulProvider:
 
 def _b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+
+
+def _browser_p256dh() -> str:
+    public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
+    return _b64url(
+        public_key.public_bytes(
+            serialization.Encoding.X962,
+            serialization.PublicFormat.UncompressedPoint,
+        )
+    )
+
+
+def _push_payload(endpoint: str, *, device_name: str) -> dict[str, object]:
+    return {
+        "endpoint": endpoint,
+        "keys": {"p256dh": _browser_p256dh(), "auth": _b64url(os.urandom(16))},
+        "device_name": device_name,
+        "user_agent": f"{device_name} user agent",
+    }
 
 
 def test_channel_crud_encrypts_and_redacts_secrets(
@@ -233,7 +254,7 @@ def test_push_subscription_vapid_devices_and_tombstone(
     endpoint = "https://1.1.1.1/push/device?credential=never-return-this"
     payload = {
         "endpoint": endpoint,
-        "keys": {"p256dh": _b64url(os.urandom(65)), "auth": _b64url(os.urandom(16))},
+        "keys": {"p256dh": _browser_p256dh(), "auth": _b64url(os.urandom(16))},
         "device_name": "pytest",
         "user_agent": "pytest browser",
     }
@@ -248,6 +269,11 @@ def test_push_subscription_vapid_devices_and_tombstone(
         subscriptions = db.query(PushSubscription).all()
         assert len(subscriptions) == 1
         assert endpoint.encode() not in subscriptions[0].endpoint
+        session = db.scalar(select(AuthSession))
+        assert session is not None
+        assert subscriptions[0].session_id == session.id
+
+    assert first.json()["session_id"] == subscriptions[0].session_id
 
     devices = client.get("/api/v1/devices", headers=auth)
     assert devices.status_code == 200
@@ -259,6 +285,285 @@ def test_push_subscription_vapid_devices_and_tombstone(
     assert removed.status_code == 204
     subscriptions = client.get("/api/v1/push/subscriptions", headers=auth).json()
     assert subscriptions[0]["enabled"] is False
+
+
+def test_duplicate_device_names_keep_push_bound_to_the_correct_session(
+    client: TestClient,
+    auth: dict[str, str],
+    app,
+) -> None:
+    first = client.post(
+        "/api/v1/push/subscriptions",
+        headers=auth,
+        json=_push_payload("https://1.1.1.1/push/first-session", device_name="first platform"),
+    )
+    assert first.status_code == 201, first.text
+
+    second_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "username": "admin",
+            "password": "a-strong-test-password",
+            "device_name": "pytest",
+        },
+    )
+    assert second_login.status_code == 200, second_login.text
+    second_body = second_login.json()
+    second_auth = {
+        "Authorization": f"Bearer {second_body['access_token']}",
+        "X-CSRF-Token": second_body["csrf_token"],
+    }
+    second = client.post(
+        "/api/v1/push/subscriptions",
+        headers=second_auth,
+        json=_push_payload("https://1.1.1.1/push/second-session", device_name="second platform"),
+    )
+    assert second.status_code == 201, second.text
+
+    first_view = client.get("/api/v1/devices", headers=auth)
+    second_view = client.get("/api/v1/devices", headers=second_auth)
+    assert first_view.status_code == second_view.status_code == 200
+    first_current = next(item for item in first_view.json() if item["current"])
+    second_current = next(item for item in second_view.json() if item["current"])
+    assert first_current["push_subscription_id"] == first.json()["id"]
+    assert second_current["push_subscription_id"] == second.json()["id"]
+    assert first_current["id"] != second_current["id"]
+
+    revoked = client.delete(
+        f"/api/v1/devices/{second_current['id']}/sessions",
+        headers=auth,
+    )
+    assert revoked.status_code == 204, revoked.text
+    with app.state.session_factory() as db:
+        first_subscription = db.get(PushSubscription, first.json()["id"])
+        second_subscription = db.get(PushSubscription, second.json()["id"])
+        second_session = db.get(AuthSession, second_current["id"])
+        assert first_subscription is not None and first_subscription.disabled_at is None
+        assert second_subscription is not None and second_subscription.disabled_at is not None
+        assert second_session is not None and second_session.revoked_at is not None
+        tombstone = db.scalar(
+            select(ClusterEvent).where(
+                ClusterEvent.entity_type == "push_subscription",
+                ClusterEvent.entity_id == second_subscription.id,
+                ClusterEvent.operation == "tombstone",
+            )
+        )
+        assert tombstone is not None
+        assert tombstone.payload_json["session_id"] == second_session.id
+
+
+def test_changed_keys_for_an_active_endpoint_create_a_new_subscription_generation(
+    client: TestClient,
+    auth: dict[str, str],
+    app,
+) -> None:
+    endpoint = "https://1.1.1.1/push/key-rotation"
+    first = client.post(
+        "/api/v1/push/subscriptions",
+        headers=auth,
+        json=_push_payload(endpoint, device_name="before key rotation"),
+    )
+    second = client.post(
+        "/api/v1/push/subscriptions",
+        headers=auth,
+        json=_push_payload(endpoint, device_name="after key rotation"),
+    )
+    assert first.status_code == second.status_code == 201
+    assert first.json()["id"] != second.json()["id"]
+    assert first.json()["session_id"] == second.json()["session_id"]
+
+    with app.state.session_factory() as db:
+        old_generation = db.get(PushSubscription, first.json()["id"])
+        new_generation = db.get(PushSubscription, second.json()["id"])
+        assert old_generation is not None and old_generation.disabled_at is not None
+        assert new_generation is not None and new_generation.disabled_at is None
+        tombstone = db.scalar(
+            select(ClusterEvent).where(
+                ClusterEvent.entity_type == "push_subscription",
+                ClusterEvent.entity_id == old_generation.id,
+                ClusterEvent.operation == "tombstone",
+            )
+        )
+        assert tombstone is not None
+
+
+def test_logout_disables_every_push_subscription_linked_to_the_session(
+    client: TestClient,
+    auth: dict[str, str],
+    app,
+) -> None:
+    subscription_ids: list[str] = []
+    for suffix in ("primary", "rotated"):
+        response = client.post(
+            "/api/v1/push/subscriptions",
+            headers=auth,
+            json=_push_payload(
+                f"https://1.1.1.1/push/logout-{suffix}",
+                device_name=f"{suffix} endpoint",
+            ),
+        )
+        assert response.status_code == 201, response.text
+        subscription_ids.append(response.json()["id"])
+
+    logged_out = client.post(
+        "/api/v1/auth/logout",
+        headers={
+            "Origin": "http://testserver",
+            "X-CSRF-Token": auth["X-CSRF-Token"],
+        },
+    )
+    assert logged_out.status_code == 204, logged_out.text
+
+    with app.state.session_factory() as db:
+        subscriptions = [db.get(PushSubscription, item) for item in subscription_ids]
+        assert all(item is not None and item.disabled_at is not None for item in subscriptions)
+        session_ids = {item.session_id for item in subscriptions if item is not None}
+        assert len(session_ids) == 1
+        session_id = session_ids.pop()
+        assert session_id is not None
+        session = db.get(AuthSession, session_id)
+        assert session is not None and session.revoked_at is not None
+        tombstone_count = len(
+            db.scalars(
+                select(ClusterEvent).where(
+                    ClusterEvent.entity_type == "push_subscription",
+                    ClusterEvent.operation == "tombstone",
+                )
+            ).all()
+        )
+        assert tombstone_count == 2
+
+
+def test_existing_browser_endpoint_gets_a_new_id_after_login_to_a_new_session(
+    client: TestClient,
+    auth: dict[str, str],
+    app,
+) -> None:
+    endpoint = "https://1.1.1.1/push/persistent-browser-endpoint"
+    first = client.post(
+        "/api/v1/push/subscriptions",
+        headers=auth,
+        json=_push_payload(endpoint, device_name="old platform label"),
+    )
+    assert first.status_code == 201, first.text
+    old_session_id = first.json()["session_id"]
+    assert (
+        client.post(
+            "/api/v1/auth/logout",
+            headers={
+                "Origin": "http://testserver",
+                "X-CSRF-Token": auth["X-CSRF-Token"],
+            },
+        ).status_code
+        == 204
+    )
+
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"username": "admin", "password": "a-strong-test-password"},
+    )
+    assert login.status_code == 200, login.text
+    login_body = login.json()
+    new_auth = {"Authorization": f"Bearer {login_body['access_token']}"}
+    rebound = client.post(
+        "/api/v1/push/subscriptions",
+        headers=new_auth,
+        json=_push_payload(endpoint, device_name="new platform label"),
+    )
+    assert rebound.status_code == 201, rebound.text
+    assert rebound.json()["id"] != first.json()["id"]
+    assert rebound.json()["session_id"] != old_session_id
+    assert rebound.json()["enabled"] is True
+
+    with app.state.session_factory() as db:
+        subscription = db.get(PushSubscription, rebound.json()["id"])
+        previous_subscription = db.get(PushSubscription, first.json()["id"])
+        assert subscription is not None
+        assert subscription.session_id == rebound.json()["session_id"]
+        assert subscription.disabled_at is None
+        assert previous_subscription is not None
+        assert previous_subscription.session_id == old_session_id
+        assert previous_subscription.disabled_at is not None
+        old_session = db.get(AuthSession, old_session_id)
+        assert old_session is not None and old_session.revoked_at is not None
+        tombstone = db.scalar(
+            select(ClusterEvent).where(
+                ClusterEvent.entity_type == "push_subscription",
+                ClusterEvent.entity_id == previous_subscription.id,
+                ClusterEvent.operation == "tombstone",
+            )
+        )
+        assert tombstone is not None
+
+
+def test_legacy_unbound_push_is_not_attributed_to_a_session(
+    client: TestClient,
+    auth: dict[str, str],
+    app,
+) -> None:
+    created = client.post(
+        "/api/v1/push/subscriptions",
+        headers=auth,
+        json=_push_payload("https://1.1.1.1/push/legacy", device_name="pytest"),
+    )
+    assert created.status_code == 201, created.text
+    with app.state.session_factory.begin() as db:
+        subscription = db.get(PushSubscription, created.json()["id"])
+        assert subscription is not None
+        subscription.session_id = None
+
+    single_session = client.get("/api/v1/devices", headers=auth)
+    assert single_session.status_code == 200
+    assert single_session.json()[0]["push_subscription_id"] is None
+    assert single_session.json()[0]["push_enabled"] is False
+
+    second_login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "username": "admin",
+            "password": "a-strong-test-password",
+            "device_name": "pytest",
+        },
+    )
+    assert second_login.status_code == 200, second_login.text
+    ambiguous = client.get("/api/v1/devices", headers=auth)
+    assert ambiguous.status_code == 200
+    assert len(ambiguous.json()) == 2
+    assert all(item["push_enabled"] is False for item in ambiguous.json())
+
+
+@pytest.mark.parametrize(
+    ("p256dh", "auth_key", "detail"),
+    [
+        (_browser_p256dh() + "=", _b64url(os.urandom(16)), "canonical unpadded base64url"),
+        (_b64url(b"\x04" + (b"\x00" * 63)), _b64url(os.urandom(16)), "invalid decoded length"),
+        (
+            _b64url(b"\x04" + (b"\x00" * 64)),
+            _b64url(os.urandom(16)),
+            "valid uncompressed P-256 public key",
+        ),
+        (_browser_p256dh(), _b64url(os.urandom(15)), "invalid decoded length"),
+        (_browser_p256dh(), _b64url(os.urandom(16)) + "=", "canonical unpadded base64url"),
+    ],
+)
+def test_push_subscription_rejects_non_browser_key_material(
+    client: TestClient,
+    auth: dict[str, str],
+    p256dh: str,
+    auth_key: str,
+    detail: str,
+) -> None:
+    response = client.post(
+        "/api/v1/push/subscriptions",
+        headers=auth,
+        json={
+            "endpoint": "https://1.1.1.1/push/invalid-device",
+            "keys": {"p256dh": p256dh, "auth": auth_key},
+        },
+    )
+
+    assert response.status_code == 422, response.text
+    assert detail in response.text
 
 
 def test_device_session_revocation_audit_and_summary(

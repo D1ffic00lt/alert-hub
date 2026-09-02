@@ -83,16 +83,27 @@ def source_example(source: Source, token: str, webhook_url: str) -> str:
             f"  - name: {source.name!r}\n"
             "    webhook_configs:\n"
             f"      - url: {webhook_url}\n"
+            "        send_resolved: true\n"
             "        http_config:\n"
-            f"          authorization:\n            credentials: {token}\n"
+            "          authorization:\n"
+            "            type: Bearer\n"
+            f"            credentials: {token}\n"
         )
     if source.kind == "heartbeat":
-        return f"curl -fsS -X POST -H 'Authorization: Bearer {token}' {webhook_url}"
+        return (
+            "curl --fail --silent --show-error -X POST "
+            "--connect-timeout 5 --max-time 10 "
+            f"-H 'Authorization: Bearer {token}' {webhook_url}"
+        )
+    example_starts_at = source.created_at.isoformat().replace("+00:00", "Z")
     return (
-        f"curl -X POST -H 'Authorization: Bearer {token}' "
+        "curl --fail --silent --show-error --connect-timeout 5 --max-time 10 "
+        f"-H 'Authorization: Bearer {token}' "
         "-H 'Content-Type: application/json' "
-        f'{webhook_url} -d \'{{"dedup_key":"example",'
-        '"status":"firing","title":"Example alert"}\''
+        f"{webhook_url} --data-binary "
+        f'\'{{"schema_version":1,"external_event_id":"example-1",'
+        f'"dedup_key":"example","status":"firing","title":"Example alert",'
+        f'"starts_at":"{example_starts_at}"}}\''
     )
 
 

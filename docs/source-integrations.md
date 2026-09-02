@@ -8,6 +8,24 @@ payload adapters and arbitrary browser-authored PromQL are not implemented. Sour
 execute source-provided code or interpolation expressions. SMTP notification templates are a
 separate allowlisted-placeholder feature described in [operations](operations.md#smtp-notification-templates).
 
+## UI quick start
+
+Sign in, open **Sources**, and choose **Add source**. The wizard supports Alertmanager, Generic
+JSON, and Heartbeat. Give the source a stable name and optional nearest region. Alertmanager and
+Generic JSON can also be restricted to comma- or newline-separated sender IPs/CIDRs; leave this
+empty until the real proxy/source address has been verified. Heartbeat interval, grace period,
+severity, and stable labels are configured in the same wizard.
+
+After **Create source**, copy the bearer token, absolute webhook URL, and generated example before
+closing the dialog. The token is shown only once. **Send test event** proves the authenticated
+management path and incident projection, but it deliberately does not exercise the source bearer,
+public ingress, sender CIDR, or external system. Complete setup with one real request from the
+sender. Rotating a source token invalidates the previous token immediately.
+
+Prometheus is not an event source in this menu. Add it under **Regional reachability → Add
+datasource**; Alert Hub runs only its fixed backend-owned queries. Grafana webhook payloads are not
+accepted directly.
+
 ## Common rules
 
 - Send HTTPS to the public source URL or private HTTPS where appropriate.
@@ -94,19 +112,32 @@ curl --fail --silent --show-error \
 }
 ```
 
-`dedup_key` is required; `status` must be `firing` or `resolved`. Reuse the same external ID for retries of one logical event. A new firing occurrence needs a new external event identity while keeping the logical dedup key.
+`dedup_key` is required; `status` must be `firing` or `resolved`. A retry must repeat the same
+normalized event identity, including the same `external_event_id`, `starts_at`, status, and event
+content; `external_event_id` alone does not override changed fields. Always send an explicit stable
+`starts_at` instead of relying on the receive-time default. A new firing occurrence needs a new
+external event identity and `starts_at` while keeping the logical dedup key. Its resolved event
+keeps that occurrence's `dedup_key` and original `starts_at` so a delayed resolution cannot close a
+newer occurrence. The generated curl uses a fixed smoke identity and timestamp, so repeating it is
+also a quick idempotency check; use the full schema above for a real sender.
 
 The response reports accepted and duplicate counts plus incident IDs. Treat any 2xx duplicate response as successful delivery. Retry transient failure with bounded exponential backoff and jitter; do not retry permanent `401`, `413`, or schema `422` without correcting the request.
 
 ## Heartbeat
 
-Create a `heartbeat` source with interval, grace period, severity, title, and stable labels in its config. Send an authenticated POST on schedule; the body may be empty:
+Create a `heartbeat` source with interval, grace period, severity, and stable labels in its config.
+The management API also accepts an optional custom title; the current UI uses
+`Heartbeat missed: <source name>`. Send an authenticated POST on schedule; the body may be empty:
 
 ```bash
 curl --fail --silent --show-error -X POST \
+  --connect-timeout 5 --max-time 10 \
   -H 'Authorization: Bearer SOURCE_TOKEN' \
   https://alerts.example.com/ingest/v1/heartbeat/SOURCE_ID
 ```
+
+The missed-heartbeat window starts when the source is created, so schedule the real sender
+immediately rather than creating it before the cron job/systemd timer is ready.
 
 Each accepted request appends a `heartbeat_observation` to cluster history and projects its receive
 time locally. Connected peers replicate that observation and keep the maximum known receive time

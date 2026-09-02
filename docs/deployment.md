@@ -302,6 +302,15 @@ separate master-encryption, peer-bearer, and deployment-smoke material from
 `CLUSTER_MASTER_KEY` with domain separation; it does not reuse the raw value. A
 later image deploy refuses an implicit key rotation.
 
+Before an `api` or `all` deployment creates or changes runtime directories and
+files, the node engine passes `VAPID_PRIVATE_KEY` to the host OpenSSL process on
+standard input. It rejects encrypted PEM, non-EC keys, malformed keys, and EC
+curves other than P-256 without writing or logging the submitted material. When
+`VAPID_PUBLIC_KEY` is set, it must be the canonical unpadded base64url encoding
+of the 65-byte uncompressed P-256 point derived from that private key. A
+`web`-only deployment and every rollback continue to use installed runtime
+material and do not require workflow API secrets.
+
 Static runner labels remain in the workflow:
 
 ```text
