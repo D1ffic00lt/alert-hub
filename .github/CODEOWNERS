@@ -1,0 +1,14 @@
+# Default owner for this single-maintainer repository.
+* @D1ffic00lt
+
+# Changes to supply-chain, schema, and production control boundaries require
+# an explicit owner review when branch protection enables code-owner reviews.
+/.github/workflows/ @D1ffic00lt
+/.github/deploy/ @D1ffic00lt
+/backend/migrations/ @D1ffic00lt
+/backend/Dockerfile @D1ffic00lt
+/frontend/Dockerfile @D1ffic00lt
+/deploy/ @D1ffic00lt
+/docker-compose*.yml @D1ffic00lt
+/AGENTS.md @D1ffic00lt
+/SECURITY.md @D1ffic00lt

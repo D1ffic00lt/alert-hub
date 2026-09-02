@@ -1,0 +1,11 @@
+# Optional overlay. It only joins an existing network; it never creates,
+# restarts, or changes Prometheus, Alertmanager, or Blackbox containers.
+services:
+  alert-hub:
+    networks:
+      - monitoring
+
+networks:
+  monitoring:
+    external: true
+    name: ${MONITORING_NETWORK:?set MONITORING_NETWORK to an existing Docker network}

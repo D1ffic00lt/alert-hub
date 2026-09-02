@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+CONFIG_FILE=${ALERT_HUB_BACKUP_CONFIG:-/etc/alert-hub/backup.env}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  alert-hub-backup backup [--label LABEL]
+  alert-hub-backup verify BACKUP.db
+  alert-hub-backup restore BACKUP.db --confirm "RESTORE NODE"
+  alert-hub-backup prune
+  alert-hub-backup list
+
+Restore is deliberately separate from application rollback because replacing
+SQLite can discard cluster events newer than the selected backup.
+EOF
+  exit 2
+}
+
+[[ ${EUID} -eq 0 ]] || die "must run as root"
+script_path=$(readlink -f -- "${BASH_SOURCE[0]}")
+script_owner=$(stat -c '%u' "${script_path}")
+script_mode=$(stat -c '%a' "${script_path}")
+script_group_digit=$(((10#${script_mode} / 10) % 10))
+script_other_digit=$((10#${script_mode} % 10))
+[[ ${script_owner} == 0 ]] || die "backup tool must be owned by root"
+(( (script_group_digit & 2) == 0 && (script_other_digit & 2) == 0 )) || die "backup tool must not be group/other writable"
+[[ -f ${CONFIG_FILE} && ! -L ${CONFIG_FILE} ]] || die "missing regular config file: ${CONFIG_FILE}"
+config_owner=$(stat -c '%u' "${CONFIG_FILE}")
+config_mode=$(stat -c '%a' "${CONFIG_FILE}")
+[[ ${config_owner} == 0 ]] || die "backup config must be owned by root"
+[[ ${config_mode} == 600 || ${config_mode} == 400 ]] || die "backup config mode must be 0600 or 0400"
+# shellcheck disable=SC1090
+source "${CONFIG_FILE}"
+
+: "${NODE_NAME:?set NODE_NAME in backup config}"
+: "${DATABASE_PATH:=/opt/alert-hub/data/alert-hub.db}"
+: "${BACKUP_DIR:=/opt/alert-hub/backups}"
+: "${CONTAINER_NAME:=alert-hub}"
+: "${DATABASE_UID:=10001}"
+: "${DATABASE_GID:=10001}"
+: "${KEEP_DAILY:=7}"
+: "${KEEP_WEEKLY:=4}"
+: "${KEEP_MONTHLY:=6}"
+
+[[ ${NODE_NAME} =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid NODE_NAME"
+[[ ${DATABASE_PATH} == /* && ${DATABASE_PATH} != / ]] || die "DATABASE_PATH must be a specific absolute path"
+[[ ${BACKUP_DIR} == /* && ${BACKUP_DIR} != / ]] || die "BACKUP_DIR must be a specific absolute path"
+[[ ${CONTAINER_NAME} =~ ^[A-Za-z0-9_.-]+$ ]] || die "invalid CONTAINER_NAME"
+[[ ${DATABASE_UID} =~ ^[0-9]+$ && ${DATABASE_GID} =~ ^[0-9]+$ ]] || die "database ownership must be numeric"
+for count in "${KEEP_DAILY}" "${KEEP_WEEKLY}" "${KEEP_MONTHLY}"; do
+  [[ ${count} =~ ^[0-9]+$ ]] || die "retention values must be non-negative integers"
+done
+
+command -v python3 >/dev/null || die "python3 is required"
+command -v sha256sum >/dev/null || die "sha256sum is required"
+install -d -o root -g root -m 0700 "${BACKUP_DIR}"
+
+verify_sqlite() {
+  local database=$1
+  [[ -f ${database} && ! -L ${database} ]] || die "not a regular SQLite file: ${database}"
+  python3 - "${database}" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).resolve()
+connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+try:
+    result = connection.execute("PRAGMA quick_check").fetchone()
+finally:
+    connection.close()
+if result != ("ok",):
+    raise SystemExit(f"SQLite quick_check failed: {result!r}")
+PY
+}
+
+verify_backup() {
+  local backup=$1
+  local checksum_file=${backup}.sha256
+  verify_sqlite "${backup}"
+  if [[ -f ${checksum_file} && ! -L ${checksum_file} ]]; then
+    (
+      cd "$(dirname -- "${backup}")"
+      sha256sum --check --status "$(basename -- "${checksum_file}")"
+    ) || die "checksum verification failed: ${backup}"
+  fi
+}
+
+assert_application_stopped() {
+  local guard_result
+  if ! guard_result=$(python3 - "${CONTAINER_NAME}" "${DATABASE_PATH}" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+expected_name = sys.argv[1]
+database_path = os.path.realpath(sys.argv[2])
+
+
+def docker(*arguments: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["docker", *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        print(f"cannot execute Docker to verify restore safety: {exc}")
+        raise SystemExit(1) from exc
+
+
+listed = docker("container", "ls", "--quiet")
+if listed.returncode != 0:
+    detail = listed.stderr.strip() or "Docker container query failed"
+    print(f"cannot verify that the application is stopped: {detail}")
+    raise SystemExit(1)
+
+container_ids = listed.stdout.split()
+if not container_ids:
+    raise SystemExit(0)
+
+inspected = docker("container", "inspect", *container_ids)
+if inspected.returncode != 0:
+    detail = inspected.stderr.strip() or "Docker container inspection failed"
+    print(f"cannot inspect running containers before restore: {detail}")
+    raise SystemExit(1)
+
+try:
+    containers = json.loads(inspected.stdout)
+except json.JSONDecodeError as exc:
+    print(f"cannot parse Docker container state before restore: {exc}")
+    raise SystemExit(1) from exc
+
+for container in containers:
+    # `docker container ls` returns active containers, including paused or
+    # restarting ones. Treat every returned ID as unsafe for replacement.
+    name = str(container.get("Name", "")).removeprefix("/") or "<unknown>"
+    if name == expected_name:
+        print(f"stop running container {name} before restoring SQLite")
+        raise SystemExit(1)
+    for mount in container.get("Mounts") or []:
+        # A broad read-only host mount (for example node-exporter) cannot write
+        # SQLite and should not make recovery impossible. Unknown/RW mounts fail
+        # closed when they contain the configured database.
+        if mount.get("RW") is False:
+            continue
+        source = mount.get("Source")
+        if not isinstance(source, str) or not source:
+            continue
+        source_path = os.path.realpath(source)
+        try:
+            contains_database = os.path.commonpath((source_path, database_path)) == source_path
+        except ValueError:
+            contains_database = False
+        if contains_database:
+            destination = mount.get("Destination", "<unknown>")
+            print(
+                f"stop running container {name}: host mount {source_path} "
+                f"at {destination} contains {database_path}"
+            )
+            raise SystemExit(1)
+PY
+  ); then
+    die "${guard_result:-cannot verify that the application is stopped}"
+  fi
+}
+
+prune_backups() {
+  python3 - "${BACKUP_DIR}" "${KEEP_DAILY}" "${KEEP_WEEKLY}" "${KEEP_MONTHLY}" <<'PY'
+import datetime as dt
+import re
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+limits = tuple(int(value) for value in sys.argv[2:5])
+pattern = re.compile(r"^alert-hub-(\d{8}T\d{6}Z)-[A-Za-z0-9._-]+-[0-9]+\.db$")
+entries = []
+for path in directory.iterdir():
+    match = pattern.match(path.name)
+    if match and path.is_file() and not path.is_symlink():
+        stamp = dt.datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+        entries.append((stamp, path))
+entries.sort(reverse=True)
+
+keep = set()
+for limit, bucket in (
+    (limits[0], lambda value: value.date()),
+    (limits[1], lambda value: value.isocalendar()[:2]),
+    (limits[2], lambda value: (value.year, value.month)),
+):
+    seen = set()
+    for stamp, path in entries:
+        key = bucket(stamp)
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(seen) <= limit:
+            keep.add(path)
+
+for _, path in entries:
+    if path not in keep:
+        path.unlink()
+        checksum = Path(f"{path}.sha256")
+        if checksum.is_file() and not checksum.is_symlink():
+            checksum.unlink()
+PY
+}
+
+create_backup() {
+  local label=$1
+  local apply_retention=${2:-true}
+  [[ ${label} =~ ^[A-Za-z0-9._-]{1,80}$ ]] || die "invalid backup label"
+  [[ -f ${DATABASE_PATH} && ! -L ${DATABASE_PATH} ]] || die "database is not a regular file: ${DATABASE_PATH}"
+  local stamp destination temporary sum
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  destination=${BACKUP_DIR}/alert-hub-${stamp}-${label}-${BASHPID}.db
+  temporary=$(mktemp "${BACKUP_DIR}/.online-backup.XXXXXX")
+  trap 'rm -f -- "${temporary:-}"' RETURN
+
+  python3 - "${DATABASE_PATH}" "${temporary}" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1]).resolve()
+destination_path = Path(sys.argv[2]).resolve()
+source = sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True, timeout=30)
+destination = sqlite3.connect(destination_path)
+try:
+    source.backup(destination, pages=256, sleep=0.05)
+    result = destination.execute("PRAGMA quick_check").fetchone()
+    if result != ("ok",):
+        raise RuntimeError(f"backup quick_check failed: {result!r}")
+finally:
+    destination.close()
+    source.close()
+PY
+
+  chmod 0600 "${temporary}"
+  mv -- "${temporary}" "${destination}"
+  trap - RETURN
+  sum=$(sha256sum "${destination}" | awk '{print $1}')
+  printf '%s  %s\n' "${sum}" "$(basename -- "${destination}")" >"${destination}.sha256"
+  chmod 0600 "${destination}.sha256"
+  verify_backup "${destination}"
+  if [[ ${apply_retention} == true ]]; then
+    prune_backups
+  fi
+  printf '%s\n' "${destination}"
+}
+
+restore_backup() {
+  local backup=$1
+  local confirmation=$2
+  [[ ${confirmation} == "RESTORE ${NODE_NAME}" ]] || die "confirmation must equal: RESTORE ${NODE_NAME}"
+  backup=$(readlink -f -- "${backup}")
+  [[ $(dirname -- "${backup}") == "${BACKUP_DIR}" ]] || die "restore source must be directly inside ${BACKUP_DIR}"
+  verify_backup "${backup}"
+  assert_application_stopped
+
+  local safety_backup="" temporary suffix sidecar
+  if [[ -f ${DATABASE_PATH} && ! -L ${DATABASE_PATH} ]]; then
+    # Do not prune while the selected recovery point is still needed by this
+    # restore transaction. The next scheduled backup/prune can enforce policy.
+    safety_backup=$(create_backup pre-restore false)
+    printf 'Current database preserved at %s\n' "${safety_backup}" >&2
+  fi
+
+  temporary=$(mktemp "$(dirname -- "${DATABASE_PATH}")/.restore.XXXXXX")
+  trap 'rm -f -- "${temporary:-}"' RETURN
+  cp --preserve=timestamps -- "${backup}" "${temporary}"
+  chown "${DATABASE_UID}:${DATABASE_GID}" "${temporary}"
+  chmod 0600 "${temporary}"
+  verify_sqlite "${temporary}"
+  # Recheck after preparing the replacement so a container started during the
+  # safety backup/copy window is caught before the database is replaced.
+  assert_application_stopped
+  mv -f -- "${temporary}" "${DATABASE_PATH}"
+  trap - RETURN
+
+  suffix=$(date -u +%Y%m%dT%H%M%SZ)
+  for sidecar in "${DATABASE_PATH}-wal" "${DATABASE_PATH}-shm"; do
+    if [[ -e ${sidecar} && ! -L ${sidecar} ]]; then
+      mv -- "${sidecar}" "${BACKUP_DIR}/replaced-${suffix}-$(basename -- "${sidecar}")"
+    fi
+  done
+  verify_sqlite "${DATABASE_PATH}"
+  printf 'Restored %s from %s. Start the application and verify cluster cursors before enabling ingest.\n' "${DATABASE_PATH}" "${backup}"
+}
+
+command_name=${1:-}
+shift || true
+case "${command_name}" in
+  backup)
+    label=scheduled
+    if (($#)); then
+      [[ $# -eq 2 && $1 == --label ]] || usage
+      label=$2
+    fi
+    create_backup "${label}"
+    ;;
+  verify)
+    [[ $# -eq 1 ]] || usage
+    verify_backup "$1"
+    printf 'Backup verified: %s\n' "$1"
+    ;;
+  restore)
+    [[ $# -eq 3 && $2 == --confirm ]] || usage
+    restore_backup "$1" "$3"
+    ;;
+  prune)
+    [[ $# -eq 0 ]] || usage
+    prune_backups
+    ;;
+  list)
+    [[ $# -eq 0 ]] || usage
+    find "${BACKUP_DIR}" -maxdepth 1 -type f -name 'alert-hub-*.db' -print | sort -r
+    ;;
+  *) usage ;;
+esac

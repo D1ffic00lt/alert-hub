@@ -1,0 +1,141 @@
+name: Roll back production
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: previous, or a recorded vX.Y.Z deployment
+        type: string
+        required: true
+        default: previous
+      component:
+        description: Component to restore independently, or the recorded pair
+        type: choice
+        required: true
+        default: all
+        options: [api, web, all]
+      target:
+        description: Protected production node or sequential RU/NL/DE rollback
+        type: choice
+        required: true
+        default: all
+        options: [all, ru, nl, de]
+      confirmation:
+        description: Type ROLLBACK PRODUCTION exactly
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+  deployments: write
+
+concurrency:
+  group: alert-hub-production-rollout
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate explicit rollback request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fail closed on malformed input
+        env:
+          VERSION: ${{ inputs.version }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -Eeuo pipefail
+          [[ "${VERSION}" == previous || "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          [[ "${CONFIRMATION}" == 'ROLLBACK PRODUCTION' ]]
+
+  rollback_ru:
+    name: Roll back RU
+    needs: prepare
+    if: inputs.target == 'all' || inputs.target == 'ru'
+    runs-on: [self-hosted, alert-hub-ru]
+    environment:
+      name: production-ru
+    timeout-minutes: 30
+    steps:
+      - name: Execute the pre-provisioned root-owned rollback boundary
+        env:
+          NODE_NAME: ru
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          ALERT_HUB_ROLLBACK_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_CONFIRMATION: ROLLBACK ru
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-rollback-node.sh
+          sudo /usr/local/sbin/docker-status-node.sh
+
+  rollback_nl:
+    name: Roll back NL
+    needs: [prepare, rollback_ru]
+    if: >-
+      always() && needs.prepare.result == 'success' &&
+      (needs.rollback_ru.result == 'success' || needs.rollback_ru.result == 'skipped') &&
+      (inputs.target == 'all' || inputs.target == 'nl')
+    runs-on: [self-hosted, alert-hub-nl]
+    environment:
+      name: production-nl
+    timeout-minutes: 30
+    steps:
+      - name: Execute the pre-provisioned root-owned rollback boundary
+        env:
+          NODE_NAME: nl
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          ALERT_HUB_ROLLBACK_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_CONFIRMATION: ROLLBACK nl
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-rollback-node.sh
+          sudo /usr/local/sbin/docker-status-node.sh
+
+  rollback_de:
+    name: Roll back DE
+    needs: [prepare, rollback_ru, rollback_nl]
+    if: >-
+      always() && needs.prepare.result == 'success' &&
+      (needs.rollback_ru.result == 'success' || needs.rollback_ru.result == 'skipped') &&
+      (needs.rollback_nl.result == 'success' || needs.rollback_nl.result == 'skipped') &&
+      (inputs.target == 'all' || inputs.target == 'de')
+    runs-on: [self-hosted, alert-hub-de]
+    environment:
+      name: production-de
+    timeout-minutes: 30
+    steps:
+      - name: Execute the pre-provisioned root-owned rollback boundary
+        env:
+          NODE_NAME: de
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          ALERT_HUB_ROLLBACK_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_CONFIRMATION: ROLLBACK de
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-rollback-node.sh
+          sudo /usr/local/sbin/docker-status-node.sh
