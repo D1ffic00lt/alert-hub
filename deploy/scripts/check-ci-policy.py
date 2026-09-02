@@ -14,6 +14,16 @@ import yaml
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_ACTION = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
 WRITE_PERMISSION = re.compile(r"(^|-)write$")
+PULL_REQUEST_EXCLUDING_EVENT_PREDICATES = {
+    "github.event_name == 'push'",
+    "github.event_name == 'schedule'",
+    "github.event_name == 'workflow_dispatch'",
+    "github.event_name != 'pull_request'",
+}
+ALLOWED_PULL_REQUEST_EXCLUSION_CONJUNCTS = {
+    *PULL_REQUEST_EXCLUDING_EVENT_PREDICATES,
+    "github.ref == 'refs/heads/main'",
+}
 REQUIRED_CODEOWNER_PATTERNS = {
     "*",
     "/.github/deploy/",
@@ -58,8 +68,8 @@ PRESERVABLE_ROOT_ENVIRONMENT = {
     "GITHUB_REPOSITORY",
     "NODE_IP",
     "NODE_NAME",
-    "PEER_ADDRESS",
     "PEER_ALLOWED_CIDRS",
+    "PEER_PUBLIC_URL",
     "PEER_URLS",
     "PUBLIC_DOMAIN",
     "SESSION_SIGNING_KEY",
@@ -171,15 +181,25 @@ def _pull_request_jobs(
     for name, job in jobs.items():
         if not isinstance(job, Mapping):
             continue
-        condition = str(job.get("if", "")).replace('"', "'").lower()
-        excludes_pull_requests = (
-            "github.event_name == 'push'" in condition
-            or "github.event_name != 'pull_request'" in condition
-            or "github.event_name == 'schedule'" in condition
-            or "github.event_name == 'workflow_dispatch'" in condition
-        )
-        if not excludes_pull_requests:
+        if not _condition_excludes_pull_requests(str(job.get("if", ""))):
             yield str(name), job
+
+
+def _condition_excludes_pull_requests(condition: str) -> bool:
+    """Prove a small allowlisted conjunction cannot run for a pull request."""
+
+    normalized = condition.replace('"', "'").strip().lower()
+    if normalized.startswith("${{") and normalized.endswith("}}"):
+        normalized = normalized[3:-2].strip()
+    if not normalized or "||" in normalized:
+        return False
+    conjuncts = [part.strip() for part in normalized.split("&&")]
+    if not conjuncts or any(
+        not conjunct or conjunct not in ALLOWED_PULL_REQUEST_EXCLUSION_CONJUNCTS
+        for conjunct in conjuncts
+    ):
+        return False
+    return any(conjunct in PULL_REQUEST_EXCLUDING_EVENT_PREDICATES for conjunct in conjuncts)
 
 
 def _permission_errors(

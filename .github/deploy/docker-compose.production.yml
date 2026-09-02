@@ -15,11 +15,13 @@ services:
       UI_ENABLED: "false"
       MIGRATE_ON_START: ${MIGRATE_ON_START:-false}
       TRUSTED_PROXY_CIDRS: >-
-        127.0.0.0/8,::1/128,${ALERT_HUB_WEB_IP:?set the dedicated web address}/32
-    # Bind the API only to this node's inventoried RFC 1918/WireGuard address.
-    # The public reverse proxy targets the web container on loopback instead.
+        127.0.0.0/8,::1/128,${ALERT_HUB_EDGE_SUBNET:?set the dedicated edge subnet},${ALERT_HUB_WEB_IP:?set the dedicated web address}/32
+    # Loopback publication is reserved for local health/smoke traffic. A host
+    # peer proxy targets the fixed API_IP on the internal edge bridge so the
+    # backend can trust that bridge and resolve the proxy's X-Forwarded-For.
+    # Never publish the API on an unspecified or public address.
     ports:
-      - "${ALERT_HUB_PEER_ADDRESS:?set the private peer bind address}:8080:8080"
+      - "127.0.0.1:${ALERT_HUB_API_HOST_PORT:-18081}:8080"
     volumes:
       - type: bind
         source: ${ALERT_HUB_DATA_DIR:?set the node data directory}
@@ -61,6 +63,8 @@ services:
     depends_on:
       alert-hub:
         condition: service_healthy
+    # Local-only operator/smoke endpoint. A host public proxy targets the fixed
+    # WEB_IP on the internal edge bridge to preserve the trusted client-IP chain.
     ports:
       - "127.0.0.1:${ALERT_HUB_HOST_PORT:-8080}:8080"
     read_only: true

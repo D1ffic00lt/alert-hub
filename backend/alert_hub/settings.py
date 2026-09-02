@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import unicodedata
@@ -12,6 +13,62 @@ from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from alert_hub.infrastructure.request_security import parse_cidr_setting
+
+
+def _normalize_peer_hostname(host: str, *, label: str) -> str:
+    if "%" in host:
+        raise ValueError(f"{label} must not use an IPv6 zone identifier")
+    try:
+        return ipaddress.ip_address(host).compressed
+    except ValueError:
+        pass
+    if (
+        not host.isascii()
+        or len(host) > 253
+        or host.endswith(".")
+        or re.fullmatch(r"[0-9.]+", host)
+        or any(
+            len(part) > 63
+            or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", part) is None
+            for part in host.split(".")
+        )
+    ):
+        raise ValueError(f"{label} must use an unambiguous ASCII DNS name or IP literal")
+    return host.lower()
+
+
+def _normalize_peer_origin(raw: object, *, label: str) -> str:
+    candidate = str(raw).strip()
+    if (
+        "*" in candidate
+        or "\\" in candidate
+        or any(
+            character.isspace() or unicodedata.category(character) == "Cc"
+            for character in candidate
+        )
+    ):
+        raise ValueError(f"{label} must not contain wildcards, backslashes, or whitespace")
+    try:
+        parsed = urlsplit(candidate)
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid {label}: {candidate}") from exc
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"{label} must use http or https")
+    if not parsed.hostname:
+        raise ValueError(f"{label} must include a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"{label} must not contain credentials")
+    if "?" in candidate or "#" in candidate:
+        raise ValueError(f"{label} must not contain a query or fragment")
+    if parsed.path not in {"", "/"}:
+        raise ValueError(f"{label} must be an exact origin without a path")
+    if parsed.netloc.endswith(":") or parsed_port == 0:
+        raise ValueError(f"{label} must use a port between 1 and 65535")
+    normalized_host = _normalize_peer_hostname(parsed.hostname, label=label)
+    host = f"[{normalized_host}]" if ":" in normalized_host else normalized_host
+    netloc = host if parsed_port is None else f"{host}:{parsed_port}"
+    return urlunsplit((parsed.scheme.lower(), netloc, "", "", ""))
 
 
 class Settings(BaseSettings):
@@ -32,7 +89,7 @@ class Settings(BaseSettings):
     )
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_format: Literal["json", "text"] = "json"
-    software_version: str = "0.1.0"
+    software_version: str = "0.1.1"
     backend_host: str = Field(default="127.0.0.1", min_length=1, max_length=253)
     backend_port: int = Field(default=8080, ge=1, le=65_535)
     database_url: str = "sqlite:///./data/alert-hub.db"
@@ -43,7 +100,10 @@ class Settings(BaseSettings):
     node_name: str = "Local node"
     node_region: str = "local"
     public_api_url: str | None = None
-    private_peer_url: str | None = None
+    private_peer_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PEER_PUBLIC_URL", "PRIVATE_PEER_URL"),
+    )
     grafana_url: str | None = None
     ingest_enabled: bool = True
     notify_enabled: bool = True
@@ -233,8 +293,6 @@ class Settings(BaseSettings):
         ):
             raise ValueError("COOKIE_DOMAIN must be a host name without scheme, port, or path")
         try:
-            import ipaddress
-
             ipaddress.ip_address(candidate)
         except ValueError:
             pass
@@ -242,7 +300,7 @@ class Settings(BaseSettings):
             raise ValueError("COOKIE_DOMAIN must not be an IP address")
         return candidate
 
-    @field_validator("public_api_url", "private_peer_url")
+    @field_validator("public_api_url")
     @classmethod
     def validate_node_urls(cls, value: str | None) -> str | None:
         if value is None:
@@ -265,6 +323,13 @@ class Settings(BaseSettings):
         netloc = host if parsed_port is None else f"{host}:{parsed_port}"
         path = parsed.path.rstrip("/")
         return urlunsplit((parsed.scheme.lower(), netloc.lower(), path, "", ""))
+
+    @field_validator("private_peer_url")
+    @classmethod
+    def validate_peer_public_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalize_peer_origin(value, label="PEER_PUBLIC_URL")
 
     @field_validator("grafana_url")
     @classmethod
@@ -310,23 +375,7 @@ class Settings(BaseSettings):
             candidate = str(raw).strip()
             if not candidate:
                 continue
-            if "*" in candidate or any(character.isspace() for character in candidate):
-                raise ValueError("peer URLs must not contain wildcards or whitespace")
-            try:
-                parsed = urlsplit(candidate)
-                parsed_port = parsed.port
-            except ValueError as exc:
-                raise ValueError(f"invalid peer URL: {candidate}") from exc
-            if parsed.scheme not in {"http", "https"}:
-                raise ValueError("peer URLs must use http or https")
-            if not parsed.hostname or parsed.username or parsed.password:
-                raise ValueError("peer URLs require a host and must not contain credentials")
-            if parsed.query or parsed.fragment:
-                raise ValueError("peer URLs must not contain a query or fragment")
-            path = parsed.path.rstrip("/")
-            host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-            netloc = host if parsed_port is None else f"{host}:{parsed_port}"
-            canonical = urlunsplit((parsed.scheme, netloc.lower(), path, "", ""))
+            canonical = _normalize_peer_origin(candidate, label="peer URLs")
             if canonical not in normalized:
                 normalized.append(canonical)
         return normalized

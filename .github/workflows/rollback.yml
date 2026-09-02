@@ -63,7 +63,6 @@ jobs:
           NODE_NAME: ru
           NODE_IP: ${{ vars.NODE_IP }}
           PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
-          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
           ALERT_HUB_ROLLBACK_VERSION: ${{ inputs.version }}
           ALERT_HUB_COMPONENT: ${{ inputs.component }}
           ALERT_HUB_CONFIRMATION: ROLLBACK ru
@@ -71,10 +70,10 @@ jobs:
           APP_NAME: ${{ vars.APP_NAME }}
         run: |
           set -Eeuo pipefail
-          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+          for required in NODE_IP PUBLIC_DOMAIN; do
             [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
           done
-          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-rollback-node.sh
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-rollback-node.sh
           sudo /usr/local/sbin/docker-status-node.sh
 
   rollback_nl:
@@ -94,7 +93,6 @@ jobs:
           NODE_NAME: nl
           NODE_IP: ${{ vars.NODE_IP }}
           PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
-          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
           ALERT_HUB_ROLLBACK_VERSION: ${{ inputs.version }}
           ALERT_HUB_COMPONENT: ${{ inputs.component }}
           ALERT_HUB_CONFIRMATION: ROLLBACK nl
@@ -102,10 +100,10 @@ jobs:
           APP_NAME: ${{ vars.APP_NAME }}
         run: |
           set -Eeuo pipefail
-          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+          for required in NODE_IP PUBLIC_DOMAIN; do
             [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
           done
-          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-rollback-node.sh
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-rollback-node.sh
           sudo /usr/local/sbin/docker-status-node.sh
 
   rollback_de:
@@ -126,7 +124,6 @@ jobs:
           NODE_NAME: de
           NODE_IP: ${{ vars.NODE_IP }}
           PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
-          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
           ALERT_HUB_ROLLBACK_VERSION: ${{ inputs.version }}
           ALERT_HUB_COMPONENT: ${{ inputs.component }}
           ALERT_HUB_CONFIRMATION: ROLLBACK de
@@ -134,8 +131,8 @@ jobs:
           APP_NAME: ${{ vars.APP_NAME }}
         run: |
           set -Eeuo pipefail
-          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+          for required in NODE_IP PUBLIC_DOMAIN; do
             [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
           done
-          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-rollback-node.sh
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-rollback-node.sh
           sudo /usr/local/sbin/docker-status-node.sh

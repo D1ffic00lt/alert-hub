@@ -1,9 +1,8 @@
 # Production deployment
 
 This guide installs one Alert Hub node without replacing its existing
-Prometheus, Alertmanager, Blackbox, Nginx, Caddy, firewall, or private-network
-configuration. Repeat it for every node and keep every SQLite database local to
-that node.
+Prometheus, Alertmanager, Blackbox, Nginx, Caddy, or firewall configuration.
+Repeat it for every node and keep every SQLite database local to that node.
 
 ## Deployment artifacts
 
@@ -17,6 +16,9 @@ docker-compose.api-only.yml
 docker-install.sh
 Caddyfile.example
 nginx.conf.example
+deploy/proxy/caddy/Caddyfile.peer.example
+deploy/proxy/nginx/alert-hub-peer.conf.example
+deploy/scripts/install-proxy-config.sh
 backend/Dockerfile
 frontend/Dockerfile
 ```
@@ -73,12 +75,15 @@ nginx -T 2>/dev/null
 caddy adapt --config /etc/caddy/Caddyfile --pretty 2>/dev/null
 ```
 
-Record a free loopback web port, the exact
-RFC1918/WireGuard address for peer traffic, public proxy ownership, firewall
-rules, filesystem capacity, backup destination, and outbound HTTPS access to
-GHCR and GitHub. If the API must reach an existing Prometheus network directly,
-also record that Docker network; this attachment is optional. Never place SQLite
-on NFS, a shared Docker volume, or another node's filesystem.
+Record separate free loopback ports for local web/API smoke checks, the fixed
+`WEB_IP` and `API_IP` on the managed edge bridge, the public UI and peer
+hostnames, exact public `/32` source addresses of the other nodes, proxy
+ownership/network mode, firewall rules, filesystem capacity, backup destination,
+and outbound HTTPS access to GHCR and GitHub. Confirm that peer DNS resolves
+directly to the node rather than through a CDN or L7 proxy. If the API must reach
+an existing Prometheus network directly, also record that Docker network; this
+attachment is optional. Never place SQLite on NFS, a shared Docker volume, or
+another node's filesystem.
 
 ## Prepare a node
 
@@ -94,7 +99,8 @@ sudo /root/alert-hub-reviewed/.github/deploy/scripts/docker-provision-node.sh \
   --runner-user RUNNER_USER \
   --repository OWNER/alert-hub \
   --node-name NODE_NAME \
-  --host-port FREE_LOOPBACK_PORT \
+  --host-port FREE_LOOPBACK_WEB_PORT \
+  --api-host-port FREE_LOOPBACK_API_PORT \
   --edge-subnet DEDICATED_RFC1918_CIDR \
   --api-ip API_ADDRESS_IN_EDGE_SUBNET \
   --web-ip WEB_ADDRESS_IN_EDGE_SUBNET \
@@ -106,10 +112,12 @@ also rejects a source path, source directory, or source file that is not
 root-owned and protected from group/other writes, closing the checkout race at
 the bootstrap boundary. It parses every script, validates both Compose
 combinations, validates the generated sudoers file with `visudo`, and installs
-only fixed root-owned entry points. Its sudoers rule uses `env_reset`, a fixed
-`secure_path`, and an explicit deployment-variable allowlist; it does not grant
-`SETENV`. The dedicated runner may invoke deploy/rollback with that validated
-environment and status without arguments, but may not invoke the provisioner.
+only fixed root-owned entry points. It also preflights the backup tool's host
+commands and Python 3.9+ SQLite backup support before changing the boundary. Its
+sudoers rule uses `env_reset`, a fixed `secure_path`, and an explicit
+deployment-variable allowlist; it does not grant `SETENV`. The dedicated runner
+may invoke deploy/rollback with that validated environment and status without
+arguments, but may not invoke the provisioner.
 GitHub runner registration remains a separate operator step: the helper has no
 option for and never reads a registration token.
 
@@ -121,9 +129,24 @@ copy, content, mode, or `visudo` failure restores the complete previous set;
 failure to restore is reported as critical and preserves root-only recovery
 material instead of deleting it.
 
+The same locked boundary installs `/usr/local/sbin/alert-hub-backup` and a
+mode-`0600` `/etc/alert-hub/backup.env`. A new config takes `NODE_NAME` from the
+validated immutable policy and uses the production API container, database
+ownership, paths, and 7-daily/4-weekly/6-monthly retention defaults. On
+re-provisioning, an existing root-owned mode-`0600` config is validated against
+a strict data-only key/value grammar and the policy node name, then preserved
+byte-for-byte. The default backup directory is created as `root:root` mode
+`0700`; a customized directory must already exist with that ownership and mode.
+A symlink, unsafe mode/owner, command-like value, unsupported or duplicate key,
+unsafe path, or different node name aborts before activation; the helper never
+silently replaces an operator-customized config with defaults. If later
+activation fails, a newly created empty default backup directory is removed
+along with the staged boundary.
+
 The generated policy has six required keys: `GITHUB_REPOSITORY`, `NODE_NAME`,
-`HOST_PORT`, `EDGE_SUBNET`, `API_IP`, and `WEB_IP`. `MONITORING_NETWORK` is a
-seventh optional key written only when requested. The policy is a root-owned
+`HOST_PORT`, `EDGE_SUBNET`, `API_IP`, and `WEB_IP`. `API_HOST_PORT` and
+`MONITORING_NETWORK` are optional keys written only when requested; the API port
+defaults to `18081`. The API and web ports must differ. The policy is a root-owned
 regular file with mode `0600`; it contains node-local topology but no public
 domain, token, or cryptographic secret, and it is never committed. The engine
 validates CIDR membership, address separation, network ownership, and
@@ -134,7 +157,8 @@ reviewed scripts/Compose files. A node-name, port, subnet, address, or monitorin
 network change requires a separately reviewed topology migration while the
 application is stopped; the bootstrap helper intentionally has no bypass flag.
 
-The deploy engine creates these paths with restrictive ownership and modes:
+The provisioner and deploy engine create these paths with restrictive ownership
+and modes:
 
 ```text
 /opt/alert-hub/config/alert-hub.env    root:root 0600
@@ -146,8 +170,10 @@ The deploy engine creates these paths with restrictive ownership and modes:
 /opt/alert-hub/history/configs/*.env    root:root 0600
 /opt/alert-hub/.deploy.lock             root:root 0600
 /etc/alert-hub/deploy-policy.env         root:root 0600
+/etc/alert-hub/backup.env                root:root 0600
 /etc/alert-hub/docker-compose*.yml       root:root 0644
 /etc/sudoers.d/alert-hub-deploy          root:root 0440
+/usr/local/sbin/alert-hub-backup          root:root 0755
 /usr/local/sbin/docker-*-node.sh         root:root 0755
 ```
 
@@ -164,6 +190,17 @@ snapshot as `history/configs/sha256-<sha256>.env`, requires a root-owned mode-
 contain runtime settings and topology, so treat them as private host material
 even though cryptographic keys remain in the separate secret files.
 
+This HTTPS peer topology also records `PEER_TRANSPORT=https-peer-v1`. Records
+created before that marker are parsed as `legacy`. Every operation against a
+currently deployed legacy API is rejected before pulling images or changing
+runtime state because even web readiness depends on the new loopback API
+listener. API and `all` rollback targets must also use the new marker; a web-only
+rollback may reuse an older web artifact after the current API has been migrated
+and its compatibility label has been verified. An existing legacy installation
+therefore needs a separately reviewed, one-time topology migration; do not
+relabel or delete its history to bypass the guard. Fresh installations need no
+migration.
+
 The secret directory also contains a deployment-smoke token derived with its
 own domain-separation label. The wrapper passes it to the API helper over stdin
 and to `curl` through a temporary root-only mode-`0600` config; the token is
@@ -173,22 +210,29 @@ never a process argument or log field.
 
 The production Compose model runs independent API and web services:
 
-- web binds `127.0.0.1:<HOST_PORT>` from the inventoried root-owned node policy
-  for the existing public HTTPS proxy;
-- API binds port `8080` only on the Environment's private `PEER_ADDRESS`;
+- web publishes `127.0.0.1:<HOST_PORT>` and API publishes
+  `127.0.0.1:<API_HOST_PORT>` for local smoke/operator access only;
 - API and web communicate on the dedicated private subnet and addresses recorded
   in the root-owned node policy;
+- a host Nginx/Caddy targets the fixed `WEB_IP:8080` for public traffic and
+  `API_IP:8080` for the peer vhost, preserving a trusted edge-gateway hop;
+- a containerized Caddy adds that edge bridge to the proxy-owned networks it
+  already needs and uses the corresponding Docker service names; the edge
+  bridge is its only Alert Hub application network;
 - only API mounts SQLite, application config, and secrets;
 - only API joins the managed outbound egress bridge;
 - only API optionally joins the inventoried external monitoring network when
   `MONITORING_NETWORK` is present in the node policy;
-- `/internal/*` is never routed by the public Nginx/Caddy examples.
+- `/internal/*` is never routed by the public UI Nginx/Caddy examples;
+- the peer virtual host routes only `GET /internal/v1/nodes/health` and
+  `POST /internal/v1/sync/events/query`, after an exact source `/32` allowlist.
 
-Firewall the private API listener to the exact peer and operator CIDRs. The
-deployment script accepts `PEER_ADDRESS` only as an RFC1918 IPv4 address without
-a scheme or port. The application protocol can validate ULA peer URLs, but the
-current production Compose/host wrapper is intentionally IPv4-only for this MVP.
-This check is a guard, not a firewall replacement.
+Neither application port is publicly bound. TLS and source filtering belong to
+the operator-managed peer proxy on `443`; the cluster bearer and the
+application's `PEER_ALLOWED_CIDRS` remain independent controls. The peer proxy
+must overwrite client-supplied forwarding headers with the address it actually
+observed. Keep the peer DNS record DNS-only so the exact source policy is not
+masked by a CDN address.
 
 An optional production monitoring network must be a user-defined, local,
 non-internal IPv4 bridge. The helper rejects Docker's built-in `bridge`, `host`,
@@ -221,7 +265,7 @@ Each Environment contains non-secret variables:
 ```text
 NODE_IP
 PUBLIC_DOMAIN
-PEER_ADDRESS
+PEER_PUBLIC_URL
 ```
 
 Optional Environment or Repository Variables consumed by deployment are:
@@ -233,14 +277,15 @@ PEER_ALLOWED_CIDRS
 VAPID_PUBLIC_KEY
 ```
 
-`APP_NAME` defaults to `Alert Hub`. `PEER_URLS` is a comma-separated list of
-private literal peer URLs; setting it also requires the narrowest applicable
-`PEER_ALLOWED_CIDRS`. `VAPID_PUBLIC_KEY` may be omitted because the API derives
-it from the P-256 private key.
+`APP_NAME` defaults to `Alert Hub`. `PEER_URLS` is a comma-separated list of the
+other nodes' exact HTTPS peer origins; setting it also requires their exact
+public IPv4 `/32` values in `PEER_ALLOWED_CIDRS`. `VAPID_PUBLIC_KEY` may be
+omitted because the API derives it from the P-256 private key.
 
-`PUBLIC_DOMAIN` is a DNS hostname without a scheme. `PEER_ADDRESS` is the
-current node's private bind address. `NODE_IP` is inventory metadata and is not
-implicitly used as a bind address.
+`PUBLIC_DOMAIN` is a DNS hostname without a scheme. `PEER_PUBLIC_URL` is this
+node's dedicated peer origin, such as `https://peer-node.example.invalid`, with
+no port, path, query, fragment, or credentials. `NODE_IP` is inventory metadata
+and is not implicitly used as a bind address.
 
 Store these shared values as Repository Secrets, or as identically configured
 Environment Secrets:
@@ -269,16 +314,23 @@ Configure required reviewers and deployment-branch rules for each Environment.
 Branch protection should require the CI jobs and CODEOWNERS review for workflow,
 Docker, production, and dependency-lock changes.
 
-Peer lists and sender CIDRs are installation topology, not universal defaults.
-When configured, pass only private `PEER_URLS` and the narrowest
-`PEER_ALLOWED_CIDRS`. Without a peer list, the node deliberately starts with
-synchronization disabled rather than inventing a topology.
+Peer origins and sender `/32` values are installation topology, not universal
+defaults. Without a peer list, the node deliberately starts with synchronization
+disabled rather than inventing a topology.
 
 ## Release and deploy behavior
 
 Pull requests to `main` build and test API and web independently and together,
-but have read-only permissions and never publish or deploy. A version tag runs
-the complete release gate. Failure of either image makes the release incomplete.
+but have read-only permissions and never publish or deploy. Semver-like
+`v*.*.*` tags also run that normal CI matrix without publishing candidates. A
+version tag separately runs the complete release gate. An operator may instead run the Release workflow on
+`main`, enter a new `vX.Y.Z` and the literal confirmation `RELEASE`; that same
+workflow validates the main revision and package versions, creates the immutable
+tag, and publishes the release. Failure of either image makes the release
+incomplete. Pushing an already-created version tag remains supported.
+If a manual run fails after creating its tag and `main` advances, resume it with
+**Re-run jobs** on that original Actions run. A new manual run starts from the
+new `main` commit and therefore refuses to reuse the older immutable tag.
 
 `deploy.yml` and `rollback.yml` are manual `workflow_dispatch` workflows. They
 have no `push` or `pull_request` trigger. A deploy selects:
@@ -287,12 +339,20 @@ have no `push` or `pull_request` trigger. A deploy selects:
 - target node or ordered node set;
 - component `api`, `web`, or `all`.
 
-The workflow resolves the signed release manifest to exact image digests before
+The workflow resolves the reviewed, checksummed release manifest to exact image digests before
 entering a protected node job. A web-only deploy leaves the API container and
 SQLite untouched. An API-only deploy backs up SQLite, runs forward migrations,
 and leaves web running in guarded mode until readiness returns. An `all` deploy
 updates the compatible pair. A component-only update is rejected when it would
 leave mismatched compatibility labels.
+
+For `api` and `all`, the engine renders and hashes the candidate runtime config
+even when the selected image digest is already running. It treats the operation
+as a no-op only when both the selected digest(s) and config checksum match;
+changed peer URLs, allowlists, domains, or other runtime settings therefore
+still create history/backup material and recreate the selected service. A
+web-only same-digest run may verify readiness and return without touching the
+API config.
 
 For each selected node, the engine:
 
@@ -310,7 +370,7 @@ For each selected node, the engine:
 6. gates container health, public readiness, PWA root, and runtime config;
 7. reads the database through `/health/deep`, provisions or verifies the
    persistent per-node `[system] Deployment smoke` heartbeat source, and sends
-   an authenticated heartbeat through web or the private API listener;
+   an authenticated heartbeat through the loopback-only API smoke listener;
 8. records the successful component references, compatibility, and active
    runtime-config checksum.
 
@@ -341,14 +401,16 @@ sudo /usr/local/sbin/docker-status-node.sh
 Use [nginx.conf.example](../nginx.conf.example) or
 [Caddyfile.example](../Caddyfile.example) as a reviewed snippet for the existing
 HTTPS service. Replace placeholders outside Git, stage the file, back up the
-active configuration, and validate the complete proxy before reload:
+active configuration, and validate the complete proxy before reload. The
+private upstream below is a sanitized example; substitute the node policy's
+fixed `WEB_IP`, not its loopback smoke port:
 
 ```bash
 sudo /usr/local/sbin/install-proxy-config.sh nginx \
   /root/alert-hub-nginx.template \
   /etc/nginx/conf.d/alert-hub.conf \
   --server-name alerts.example.com \
-  --upstream 127.0.0.1:8080 \
+  --upstream 10.253.251.3:8080 \
   --trusted-proxy 127.0.0.1/32
 sudo nginx -t
 ```
@@ -361,6 +423,146 @@ separate explicit reload.
 The examples preserve SSE, no-store service-worker/runtime headers, CSP and
 security headers, and public `404` denials for `/internal/*`, `/metrics`,
 `/health/deep`, `/api/docs*`, `/api/redoc*`, and `/api/openapi.json`.
+
+## Dedicated HTTPS peer proxy
+
+Give each node a separate peer hostname and point its DNS `A` record directly
+at that node. Do not proxy this record through a CDN: the templates deliberately
+match the TCP source against repeated exact public IPv4 `/32` entries. The peer
+hostname terminates TLS but is not a general API vhost. It exposes only:
+
+- `GET /internal/v1/nodes/health`;
+- `POST /internal/v1/sync/events/query`.
+
+Wrong methods, the cursor/apply operations, public API/UI paths, metrics, and
+diagnostics return `404`; a source outside the allowlist returns `403`. The
+ordinary public UI hostname still returns `404` for every `/internal/*` path.
+
+The following three-node table uses reserved documentation addresses and
+`.example.invalid` names; replace every value with inventory outside Git. The
+same two `/32` values go into both the peer proxy and that node's
+`PEER_ALLOWED_CIDRS`:
+
+| Environment     | `PEER_PUBLIC_URL`                 | `PEER_URLS`                                                       | `PEER_ALLOWED_CIDRS`               |
+| --------------- | --------------------------------- | ----------------------------------------------------------------- | ---------------------------------- |
+| `production-ru` | `https://peer-ru.example.invalid` | `https://peer-nl.example.invalid,https://peer-de.example.invalid` | `198.51.100.20/32,203.0.113.30/32` |
+| `production-nl` | `https://peer-nl.example.invalid` | `https://peer-ru.example.invalid,https://peer-de.example.invalid` | `192.0.2.10/32,203.0.113.30/32`    |
+| `production-de` | `https://peer-de.example.invalid` | `https://peer-ru.example.invalid,https://peer-nl.example.invalid` | `192.0.2.10/32,198.51.100.20/32`   |
+
+### RU pattern: containerized Caddy
+
+Inventory the existing Caddy mounts and networks first. If it is not already
+attached, add `alert-hub-edge` to the Caddy service in the Compose file that owns
+that container; do not connect it to egress or monitoring. A one-off
+`docker network connect` is not durable and must not be used as the installation
+method. Merge the following entries into the owning Compose without removing
+its existing networks:
+
+```yaml
+services:
+  caddy:
+    networks:
+      - existing-caddy-network
+      - alert-hub-edge
+
+networks:
+  existing-caddy-network:
+    external: true
+  alert-hub-edge:
+    external: true
+```
+
+Back up both the owning Compose and the complete Caddyfile, then validate and
+recreate only Caddy so the persistent attachment is applied. The rendered site
+file must be in a host directory already mounted and imported by the container's
+main Caddyfile:
+
+```bash
+sudo docker network inspect alert-hub-edge
+cd /HOST/CADDY/COMPOSE/DIRECTORY
+sudo docker compose config --quiet
+sudo docker compose up --detach --no-deps CADDY_SERVICE
+sudo docker inspect CADDY_CONTAINER \
+  --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}'
+sudo /usr/local/sbin/install-proxy-config.sh caddy \
+  /root/alert-hub-peer-caddy.template \
+  /HOST/PATH/IMPORTED/alert-hub-peer.caddy \
+  --server-name peer-ru.example.invalid \
+  --upstream alert-hub:8080 \
+  --peer-cidr 198.51.100.20/32 \
+  --peer-cidr 203.0.113.30/32 \
+  --caddy-container CADDY_CONTAINER \
+  --validate-config /etc/caddy/Caddyfile
+sudo docker exec CADDY_CONTAINER caddy reload --config /etc/caddy/Caddyfile
+```
+
+The node provisioner installs `install-proxy-config.sh` as a root-owned helper
+in `/usr/local/sbin`. Caddy manages the peer certificate automatically after the
+explicit validated reload. In that same container, the separate ordinary public
+UI site uses `alert-hub-web:8080` and retains its unconditional `/internal/*`
+denial; never reuse the peer block for the UI hostname.
+
+### NL pattern: host Nginx and Certbot
+
+Obtain the hostname's certificate with the installation's existing Certbot
+mode, then render the dedicated server block to an included directory. Prefer
+DNS-01 when steady-state policy exposes only `443`; the shown Nginx HTTP-01 flow
+requires a narrowly timed inbound `80` exception for issuance and renewal that
+must be removed and externally verified afterward:
+
+```bash
+sudo certbot certonly --nginx --domain peer-nl.example.invalid
+sudo /usr/local/sbin/install-proxy-config.sh nginx \
+  /root/alert-hub-peer-nginx.template \
+  /etc/nginx/conf.d/alert-hub-peer.conf \
+  --server-name peer-nl.example.invalid \
+  --upstream 10.253.251.2:8080 \
+  --peer-cidr 192.0.2.10/32 \
+  --peer-cidr 203.0.113.30/32 \
+  --tls-certificate /etc/letsencrypt/live/peer-nl.example.invalid/fullchain.pem \
+  --tls-private-key /etc/letsencrypt/live/peer-nl.example.invalid/privkey.pem
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### DE pattern: host Caddy
+
+Import the rendered site block from the active host Caddyfile. Caddy manages the
+certificate automatically and reaches the API's fixed address on the managed
+edge bridge:
+
+```bash
+sudo /usr/local/sbin/install-proxy-config.sh caddy \
+  /root/alert-hub-peer-caddy.template \
+  /etc/caddy/conf.d/alert-hub-peer.caddy \
+  --server-name peer-de.example.invalid \
+  --upstream 10.253.251.2:8080 \
+  --peer-cidr 192.0.2.10/32 \
+  --peer-cidr 198.51.100.20/32 \
+  --validate-config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+The proxy templates replace, rather than append, Internet-supplied forwarding
+headers. The API trusts only its managed edge proxy hop, then evaluates the
+recovered sender against the same exact `/32` values in
+`PEER_ALLOWED_CIDRS`. Never put peer addresses in `TRUSTED_PROXY_CIDRS`; peers
+are authenticated clients, not proxies allowed to assert another address.
+
+After validation and an explicit reload, test from an allowlisted peer and from
+an unrelated external address. Record certificate verification, the two allowed
+method/path pairs, wrong-method/path denial, source denial, and confirmation
+that ports `18080` and `18081` remain loopback-only. If a containerized proxy
+sees every client as one Docker gateway address, stop: use host networking or a
+host proxy that preserves the source. Never allowlist that shared gateway as a
+substitute for the real peer `/32` values.
+
+WireGuard remains an optional alternative, not a prerequisite. The application
+accepts literal RFC1918/ULA `http://` peer origins when the private tunnel and
+firewall provide the transport boundary; never use private HTTP over the public
+Internet. The protected production workflow documented here intentionally uses
+the HTTPS peer-hostname mode, while universal/manual deployments may retain a
+reviewed private-HTTP topology.
 
 ## Existing monitoring network
 

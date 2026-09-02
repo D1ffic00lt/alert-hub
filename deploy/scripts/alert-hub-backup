@@ -43,7 +43,7 @@ source "${CONFIG_FILE}"
 : "${NODE_NAME:?set NODE_NAME in backup config}"
 : "${DATABASE_PATH:=/opt/alert-hub/data/alert-hub.db}"
 : "${BACKUP_DIR:=/opt/alert-hub/backups}"
-: "${CONTAINER_NAME:=alert-hub}"
+: "${CONTAINER_NAME:=alert-hub-api}"
 : "${DATABASE_UID:=10001}"
 : "${DATABASE_GID:=10001}"
 : "${KEEP_DAILY:=7}"
@@ -61,6 +61,13 @@ done
 
 command -v python3 >/dev/null || die "python3 is required"
 command -v sha256sum >/dev/null || die "sha256sum is required"
+python3 - <<'PY' || die "Python 3.9+ with sqlite3 backup support is required"
+import sqlite3
+import sys
+
+if sys.version_info < (3, 9) or not hasattr(sqlite3.Connection, "backup"):
+    raise SystemExit(1)
+PY
 install -d -o root -g root -m 0700 "${BACKUP_DIR}"
 
 verify_sqlite() {

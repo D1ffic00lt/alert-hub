@@ -127,6 +127,13 @@ def _is_private_peer_host(host: str | None) -> bool:
     return any(address in network for network in _PRIVATE_PEER_NETWORKS)
 
 
+def _peer_origin_uses_permitted_transport(origin: str) -> bool:
+    parsed = urlsplit(origin)
+    return parsed.scheme == "https" or (
+        parsed.scheme == "http" and _is_private_peer_host(parsed.hostname)
+    )
+
+
 def _secret_is_weak(value: str, insecure_values: set[str]) -> bool:
     return value in insecure_values or len(value.encode()) < 32 or len(set(value)) < 12
 
@@ -185,8 +192,23 @@ def _validate_production_settings(settings: Settings) -> None:
             raise RuntimeError("COOKIE_DOMAIN must contain every trusted origin host")
     if settings.sync_enabled and not settings.peer_allowed_cidrs:
         raise RuntimeError("PEER_ALLOWED_CIDRS is required when sync is enabled in production")
-    if any(not _is_private_peer_host(urlsplit(url).hostname) for url in settings.peer_urls):
-        raise RuntimeError("PEER_URLS must use literal RFC 1918 or ULA addresses in production")
+    if settings.sync_enabled or settings.peer_urls:
+        if not settings.private_peer_url:
+            raise RuntimeError(
+                "PEER_PUBLIC_URL is required when sync is enabled or PEER_URLS are configured"
+            )
+        if not _peer_origin_uses_permitted_transport(settings.private_peer_url):
+            raise RuntimeError(
+                "PEER_PUBLIC_URL must use HTTPS, except HTTP is allowed for a literal RFC 1918 "
+                "or ULA address"
+            )
+    insecure_peer_urls = [
+        url for url in settings.peer_urls if not _peer_origin_uses_permitted_transport(url)
+    ]
+    if insecure_peer_urls:
+        raise RuntimeError(
+            "PEER_URLS must use HTTPS, except HTTP is allowed for literal RFC 1918 or ULA addresses"
+        )
 
 
 def _rate_limit_policy(

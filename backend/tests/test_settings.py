@@ -49,16 +49,48 @@ def test_ops_environment_aliases_and_secret_files(tmp_path: Path, monkeypatch) -
 def test_peer_urls_are_normalized_and_reject_unsafe_shapes(monkeypatch) -> None:
     monkeypatch.setenv(
         "PEER_URLS",
-        "https://10.0.0.2:8443/,http://peer.internal/base/,https://10.0.0.2:8443",
+        "HTTPS://Peer.Example:443/,http://10.0.0.2:8080/,https://peer.example:443",
     )
     settings = Settings()
     assert settings.peer_urls == [
-        "https://10.0.0.2:8443",
-        "http://peer.internal/base",
+        "https://peer.example:443",
+        "http://10.0.0.2:8080",
     ]
 
     monkeypatch.setenv("PEER_URLS", "https://user:password@peer.internal")
     with pytest.raises(ValueError, match="must not contain credentials"):
+        Settings()
+
+
+@pytest.mark.parametrize(
+    ("peer_url", "message"),
+    [
+        ("https://@peer.example", "credentials"),
+        ("https://peer.example/internal", "exact origin"),
+        ("https://peer.example?region=ru", "query or fragment"),
+        ("https://peer.example#health", "query or fragment"),
+        ("https://peer.example:", "port between"),
+        ("https://peer.example:0", "port between"),
+        ("https://peer.example:65536", "invalid peer URL"),
+        ("https://peer.example.", "unambiguous ASCII DNS name"),
+        ("https://peer_name.example", "unambiguous ASCII DNS name"),
+        ("https://péér.example", "unambiguous ASCII DNS name"),
+    ],
+)
+def test_peer_urls_reject_malformed_origins(peer_url: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        Settings(peer_urls=[peer_url])
+
+
+def test_peer_public_url_alias_is_exact_and_backward_compatible(monkeypatch) -> None:
+    monkeypatch.setenv("PRIVATE_PEER_URL", "http://10.0.0.2:8080/")
+    assert Settings().private_peer_url == "http://10.0.0.2:8080"
+
+    monkeypatch.setenv("PEER_PUBLIC_URL", "HTTPS://Peer-RU.Alerts.Example:443/")
+    assert Settings().private_peer_url == "https://peer-ru.alerts.example:443"
+
+    monkeypatch.setenv("PEER_PUBLIC_URL", "https://peer.example/internal")
+    with pytest.raises(ValueError, match="exact origin"):
         Settings()
 
 

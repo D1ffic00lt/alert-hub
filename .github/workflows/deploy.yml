@@ -128,7 +128,6 @@ jobs:
           NODE_NAME: ru
           NODE_IP: ${{ vars.NODE_IP }}
           PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
-          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
           ALERT_HUB_VERSION: ${{ inputs.version }}
           ALERT_HUB_COMPONENT: ${{ inputs.component }}
           ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
@@ -138,10 +137,10 @@ jobs:
           APP_NAME: ${{ vars.APP_NAME }}
         run: |
           set -Eeuo pipefail
-          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+          for required in NODE_IP PUBLIC_DOMAIN; do
             [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
           done
-          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
 
       - name: Deploy API or compatible pair through the pre-provisioned root-owned boundary
         if: inputs.component != 'web'
@@ -149,7 +148,7 @@ jobs:
           NODE_NAME: ru
           NODE_IP: ${{ vars.NODE_IP }}
           PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
-          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          PEER_PUBLIC_URL: ${{ vars.PEER_PUBLIC_URL }}
           ALERT_HUB_VERSION: ${{ inputs.version }}
           ALERT_HUB_COMPONENT: ${{ inputs.component }}
           ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
@@ -165,10 +164,10 @@ jobs:
           VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
         run: |
           set -Eeuo pipefail
-          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
+          for required in NODE_IP PUBLIC_DOMAIN PEER_PUBLIC_URL CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
             [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
           done
-          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY /usr/local/sbin/docker-deploy-node.sh
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_PUBLIC_URL,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY /usr/local/sbin/docker-deploy-node.sh
 
       - name: Verify recorded deployment status
         run: |
@@ -192,7 +191,6 @@ jobs:
           NODE_NAME: nl
           NODE_IP: ${{ vars.NODE_IP }}
           PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
-          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
           ALERT_HUB_VERSION: ${{ inputs.version }}
           ALERT_HUB_COMPONENT: ${{ inputs.component }}
           ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
@@ -202,10 +200,10 @@ jobs:
           APP_NAME: ${{ vars.APP_NAME }}
         run: |
           set -Eeuo pipefail
-          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+          for required in NODE_IP PUBLIC_DOMAIN; do
             [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
           done
-          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
 
       - name: Deploy API or compatible pair through the pre-provisioned root-owned boundary
         if: inputs.component != 'web'
@@ -213,7 +211,7 @@ jobs:
           NODE_NAME: nl
           NODE_IP: ${{ vars.NODE_IP }}
           PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
-          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          PEER_PUBLIC_URL: ${{ vars.PEER_PUBLIC_URL }}
           ALERT_HUB_VERSION: ${{ inputs.version }}
           ALERT_HUB_COMPONENT: ${{ inputs.component }}
           ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
@@ -229,10 +227,10 @@ jobs:
           VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
         run: |
           set -Eeuo pipefail
-          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
+          for required in NODE_IP PUBLIC_DOMAIN PEER_PUBLIC_URL CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
             [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
           done
-          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY /usr/local/sbin/docker-deploy-node.sh
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_PUBLIC_URL,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY /usr/local/sbin/docker-deploy-node.sh
 
       - name: Verify recorded deployment status
         run: |
@@ -257,7 +255,6 @@ jobs:
           NODE_NAME: de
           NODE_IP: ${{ vars.NODE_IP }}
           PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
-          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
           ALERT_HUB_VERSION: ${{ inputs.version }}
           ALERT_HUB_COMPONENT: ${{ inputs.component }}
           ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
@@ -267,10 +264,10 @@ jobs:
           APP_NAME: ${{ vars.APP_NAME }}
         run: |
           set -Eeuo pipefail
-          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+          for required in NODE_IP PUBLIC_DOMAIN; do
             [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
           done
-          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
 
       - name: Deploy API or compatible pair through the pre-provisioned root-owned boundary
         if: inputs.component != 'web'
@@ -278,7 +275,7 @@ jobs:
           NODE_NAME: de
           NODE_IP: ${{ vars.NODE_IP }}
           PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
-          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          PEER_PUBLIC_URL: ${{ vars.PEER_PUBLIC_URL }}
           ALERT_HUB_VERSION: ${{ inputs.version }}
           ALERT_HUB_COMPONENT: ${{ inputs.component }}
           ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
@@ -294,10 +291,10 @@ jobs:
           VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
         run: |
           set -Eeuo pipefail
-          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
+          for required in NODE_IP PUBLIC_DOMAIN PEER_PUBLIC_URL CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
             [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
           done
-          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY /usr/local/sbin/docker-deploy-node.sh
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_PUBLIC_URL,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY /usr/local/sbin/docker-deploy-node.sh
 
       - name: Verify recorded deployment status
         run: |

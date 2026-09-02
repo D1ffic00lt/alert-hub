@@ -34,9 +34,12 @@ readonly DEPLOYMENT_SMOKE_TOKEN_FILE=${SECRETS_DIR}/deployment-smoke-token
 readonly ZERO_DIGEST=sha256:0000000000000000000000000000000000000000000000000000000000000000
 readonly PLACEHOLDER_API=ghcr.io/invalid/alert-hub-api@${ZERO_DIGEST}
 readonly PLACEHOLDER_WEB=ghcr.io/invalid/alert-hub-web@${ZERO_DIGEST}
+readonly EXPECTED_PEER_TRANSPORT=https-peer-v1
+readonly LEGACY_PEER_TRANSPORT=legacy
 EXPECTED_API_REPOSITORY=""
 EXPECTED_WEB_REPOSITORY=""
 HOST_PORT=""
+API_HOST_PORT=""
 EDGE_SUBNET=""
 API_IP=""
 WEB_IP=""
@@ -153,6 +156,10 @@ validate_compatibility() {
   [[ $1 =~ ^openapi-sha256:[0-9a-f]{64}$ ]]
 }
 
+validate_peer_transport() {
+  [[ $1 == "${EXPECTED_PEER_TRANSPORT}" || $1 == "${LEGACY_PEER_TRANSPORT}" ]]
+}
+
 validate_component() {
   [[ $1 == api || $1 == web || $1 == all ]]
 }
@@ -234,18 +241,6 @@ usable_address_in_cidr() {
     (( address_integer < broadcast ))
 }
 
-address_in_cidr() {
-  local address=$1 cidr=$2 network prefix address_integer network_integer mask
-  validate_private_ipv4 "${address}" || return 1
-  validate_private_cidr "${cidr}" || return 1
-  network=${cidr%/*}
-  prefix=${cidr##*/}
-  address_integer=$(ipv4_to_integer "${address}")
-  network_integer=$(ipv4_to_integer "${network}")
-  mask=$(((0xFFFFFFFF << (32 - 10#${prefix})) & 0xFFFFFFFF))
-  (( (address_integer & mask) == network_integer ))
-}
-
 validate_host_port() {
   [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && ((10#$1 <= 65535))
 }
@@ -309,6 +304,24 @@ validate_domain() {
   done
 }
 
+validate_https_origin() {
+  local origin=$1 authority host port=""
+
+  [[ ${origin} == https://* ]] || return 1
+  authority=${origin#https://}
+  [[ -n ${authority} && ${authority} != */* && ${authority} != *\?* && ${authority} != *\#* && ${authority} != *@* ]] ||
+    return 1
+  host=${authority}
+  if [[ ${authority} == *:* ]]; then
+    [[ ${authority} != *:*:* ]] || return 1
+    host=${authority%:*}
+    port=${authority##*:}
+    validate_host_port "${port}" || return 1
+  fi
+  [[ ${host} == *[A-Za-z]* ]] || return 1
+  validate_domain "${host}"
+}
+
 validate_single_line() {
   [[ $1 != *$'\n'* && $1 != *$'\r'* ]]
 }
@@ -330,11 +343,16 @@ state_value() {
   awk -F= -v wanted="${key}" '$1 == wanted {print substr($0, index($0, "=") + 1); found = 1; exit} END {if (!found) exit 1}' "${file}"
 }
 
+state_peer_transport() {
+  local file=$1
+  state_value "${file}" PEER_TRANSPORT 2>/dev/null || printf '%s\n' "${LEGACY_PEER_TRANSPORT}"
+}
+
 load_deploy_policy() {
   require_private_file "${DEPLOY_POLICY_FILE}" 0 "deployment policy"
   awk -F= '
     NF != 2 {exit 1}
-    $1 !~ /^(GITHUB_REPOSITORY|NODE_NAME|HOST_PORT|EDGE_SUBNET|API_IP|WEB_IP|MONITORING_NETWORK)$/ {exit 1}
+    $1 !~ /^(GITHUB_REPOSITORY|NODE_NAME|HOST_PORT|API_HOST_PORT|EDGE_SUBNET|API_IP|WEB_IP|MONITORING_NETWORK)$/ {exit 1}
     seen[$1]++ > 0 {exit 1}
     END {
       required["GITHUB_REPOSITORY"] = required["NODE_NAME"] = required["HOST_PORT"] = 1
@@ -345,6 +363,8 @@ load_deploy_policy() {
   POLICY_GITHUB_REPOSITORY=$(state_value "${DEPLOY_POLICY_FILE}" GITHUB_REPOSITORY)
   POLICY_NODE_NAME=$(state_value "${DEPLOY_POLICY_FILE}" NODE_NAME)
   HOST_PORT=$(state_value "${DEPLOY_POLICY_FILE}" HOST_PORT)
+  # Legacy six-key policies predate the separate loopback API listener.
+  API_HOST_PORT=$(state_value "${DEPLOY_POLICY_FILE}" API_HOST_PORT 2>/dev/null || printf '18081\n')
   EDGE_SUBNET=$(state_value "${DEPLOY_POLICY_FILE}" EDGE_SUBNET)
   API_IP=$(state_value "${DEPLOY_POLICY_FILE}" API_IP)
   WEB_IP=$(state_value "${DEPLOY_POLICY_FILE}" WEB_IP)
@@ -352,6 +372,8 @@ load_deploy_policy() {
   [[ ${POLICY_GITHUB_REPOSITORY} =~ ^[A-Za-z0-9-]+/alert-hub$ ]] || die "deployment policy repository is invalid"
   [[ ${POLICY_NODE_NAME} =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die "deployment policy node name is invalid"
   validate_host_port "${HOST_PORT}" || die "deployment policy HOST_PORT is invalid"
+  validate_host_port "${API_HOST_PORT}" || die "deployment policy API_HOST_PORT is invalid"
+  [[ ${API_HOST_PORT} != "${HOST_PORT}" ]] || die "deployment policy API_HOST_PORT and HOST_PORT must be distinct"
   validate_private_cidr "${EDGE_SUBNET}" || die "deployment policy EDGE_SUBNET must be a canonical private IPv4 /16 through /29"
   usable_address_in_cidr "${API_IP}" "${EDGE_SUBNET}" || die "deployment policy API_IP is not usable in EDGE_SUBNET"
   usable_address_in_cidr "${WEB_IP}" "${EDGE_SUBNET}" || die "deployment policy WEB_IP is not usable in EDGE_SUBNET"
@@ -371,11 +393,11 @@ configure_compose_files() {
 }
 
 validate_state_file() {
-  local file=$1
+  local file=$1 peer_transport
   require_private_file "${file}" 0 "deployment state"
   awk -F= '
     NF != 2 {exit 1}
-    $1 !~ /^(NODE_NAME|API_REF|API_VERSION|API_COMPATIBILITY|WEB_REF|WEB_VERSION|WEB_COMPATIBILITY|CONFIG_SHA256|DEPLOYED_AT|LAST_BACKUP)$/ {exit 1}
+    $1 !~ /^(NODE_NAME|API_REF|API_VERSION|API_COMPATIBILITY|WEB_REF|WEB_VERSION|WEB_COMPATIBILITY|CONFIG_SHA256|DEPLOYED_AT|LAST_BACKUP|PEER_TRANSPORT)$/ {exit 1}
     seen[$1]++ > 0 {exit 1}
     END {
       required["NODE_NAME"] = required["API_REF"] = required["API_VERSION"] = 1
@@ -385,6 +407,9 @@ validate_state_file() {
       for (key in required) if (!seen[key]) exit 1
     }
   ' "${file}" || die "deployment state is malformed: ${file}"
+  peer_transport=$(state_peer_transport "${file}")
+  validate_peer_transport "${peer_transport}" ||
+    die "deployment state has an unsupported peer transport: ${file}"
 }
 
 config_snapshot_path() {
@@ -482,8 +507,9 @@ validate_state_values() {
 write_state() {
   local api_ref=$1 api_version=$2 api_compatibility=$3
   local web_ref=$4 web_version=$5 web_compatibility=$6 config_checksum=$7 last_backup=$8
-  local temporary
+  local peer_transport=$9 temporary
 
+  validate_peer_transport "${peer_transport}" || die "refusing to record an unsupported peer transport"
   validate_state_values \
     "${api_ref}" "${api_version}" "${api_compatibility}" \
     "${web_ref}" "${web_version}" "${web_compatibility}"
@@ -500,6 +526,7 @@ write_state() {
     "WEB_REF=${web_ref}" \
     "WEB_VERSION=${web_version}" \
     "WEB_COMPATIBILITY=${web_compatibility}" \
+    "PEER_TRANSPORT=${peer_transport}" \
     "CONFIG_SHA256=${config_checksum}" \
     "DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     "LAST_BACKUP=${last_backup}" >"${temporary}"
@@ -585,6 +612,10 @@ write_runtime_material() {
   validate_single_line "${VAPID_PUBLIC_KEY:-}" || die "VAPID_PUBLIC_KEY must be a single line"
   validate_single_line "${APP_NAME}" || die "APP_NAME must be a single line"
   [[ -n ${APP_NAME} && ${#APP_NAME} -le 80 ]] || die "APP_NAME must contain 1 to 80 characters"
+  : "${PEER_PUBLIC_URL:?PEER_PUBLIC_URL is required for API deployment}"
+  validate_https_origin "${PEER_PUBLIC_URL}" ||
+    die "PEER_PUBLIC_URL must be an exact HTTPS origin with a DNS host and no path"
+  PEER_PUBLIC_URL=$(printf '%s' "${PEER_PUBLIC_URL}" | tr '[:upper:]' '[:lower:]')
 
   temporary=$(mktemp "${CONFIG_DIR}/.alert-hub.env.XXXXXX")
   printf '%s\n' \
@@ -597,7 +628,7 @@ write_runtime_material() {
     "NODE_REGION=${NODE_NAME}" \
     "DEPLOYMENT_NODE_IP=${NODE_IP}" \
     "PUBLIC_API_URL=https://${PUBLIC_DOMAIN}" \
-    "PRIVATE_PEER_URL=http://${PEER_ADDRESS}:8080" \
+    "PRIVATE_PEER_URL=${PEER_PUBLIC_URL}" \
     'DATABASE_URL=sqlite:////data/alert-hub.db' \
     'AUTO_CREATE_SCHEMA=false' \
     'MIGRATE_ON_START=true' \
@@ -674,10 +705,10 @@ compose() {
     ALERT_HUB_DATA_DIR="${DATA_DIR}" \
     ALERT_HUB_SECRETS_DIR="${SECRETS_DIR}" \
     ALERT_HUB_HOST_PORT="${HOST_PORT}" \
+    ALERT_HUB_API_HOST_PORT="${API_HOST_PORT}" \
     ALERT_HUB_API_IP="${API_IP}" \
     ALERT_HUB_WEB_IP="${WEB_IP}" \
     ALERT_HUB_EDGE_SUBNET="${EDGE_SUBNET}" \
-    ALERT_HUB_PEER_ADDRESS="${PEER_ADDRESS}" \
     APP_NAME="${runtime_app_name}" \
     MIGRATE_ON_START="${migrate_on_start}" \
     MONITORING_NETWORK="${MONITORING_NETWORK}" \
@@ -698,14 +729,35 @@ wait_container_healthy() {
   return 1
 }
 
+container_has_exact_port_binding() {
+  local container=$1 expected_ip=$2 expected_port=$3 output
+  output=$(docker container inspect "${container}" \
+    --format '{{range $containerPort, $bindings := .HostConfig.PortBindings}}{{printf "%s=" $containerPort}}{{range $bindings}}{{printf "%s:%s," .HostIp .HostPort}}{{end}}{{println}}{{end}}' \
+    2>/dev/null) || return 1
+  [[ ${output} == "8080/tcp=${expected_ip}:${expected_port}," ]]
+}
+
+container_has_exact_network_address() {
+  local container=$1 network=$2 expected_ip=$3 actual_ip
+  actual_ip=$(docker container inspect "${container}" \
+    --format "{{with index .NetworkSettings.Networks \"${network}\"}}{{.IPAddress}}{{end}}" \
+    2>/dev/null) || return 1
+  [[ ${actual_ip} == "${expected_ip}" ]]
+}
+
 verify_target_ready() {
   local api_ref=$1 web_ref=$2
 
   if [[ -n ${api_ref} ]]; then
     wait_container_healthy "${API_CONTAINER}" || return 1
+    container_has_exact_network_address "${API_CONTAINER}" alert-hub-edge "${API_IP}" || return 1
+    container_has_exact_port_binding "${API_CONTAINER}" 127.0.0.1 "${API_HOST_PORT}" || return 1
+    curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${API_HOST_PORT}/health/ready" >/dev/null || return 1
   fi
   if [[ -n ${web_ref} ]]; then
     wait_container_healthy "${WEB_CONTAINER}" || return 1
+    container_has_exact_network_address "${WEB_CONTAINER}" alert-hub-edge "${WEB_IP}" || return 1
+    container_has_exact_port_binding "${WEB_CONTAINER}" 127.0.0.1 "${HOST_PORT}" || return 1
     curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${HOST_PORT}/health/ready" >/dev/null || return 1
     curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${HOST_PORT}/" >/dev/null || return 1
     curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${HOST_PORT}/runtime-config.js" >/dev/null || return 1
@@ -721,7 +773,7 @@ cleanup_smoke_dir() {
 }
 
 verify_runtime_smoke() {
-  local api_ref=$1 web_ref=$2 smoke_source smoke_token smoke_url smoke_status=0
+  local api_ref=$1 smoke_source smoke_token smoke_url smoke_status=0
 
   [[ -n ${api_ref} ]] || return 1
   log "Running database-read and authenticated ingest smoke tests"
@@ -749,11 +801,7 @@ verify_runtime_smoke() {
   fi
   unset smoke_token
 
-  if [[ -n ${web_ref} ]]; then
-    smoke_url="http://127.0.0.1:${HOST_PORT}/ingest/v1/heartbeat/${smoke_source}"
-  else
-    smoke_url="http://${PEER_ADDRESS}:8080/ingest/v1/heartbeat/${smoke_source}"
-  fi
+  smoke_url="http://127.0.0.1:${API_HOST_PORT}/ingest/v1/heartbeat/${smoke_source}"
   if ((smoke_status == 0)); then
     curl \
       --config "${SMOKE_DIR}/curl.conf" \
@@ -865,6 +913,21 @@ selected_refs_equal_current() {
   esac
 }
 
+selected_deployment_is_current() {
+  local component=$1 target_api_ref=$2 target_web_ref=$3 target_config_checksum=$4
+
+  selected_refs_equal_current "${component}" "${target_api_ref}" "${target_web_ref}" || return 1
+  [[ ${component} == web || ${target_config_checksum} == "${CURRENT_CONFIG_SHA256}" ]]
+}
+
+require_current_peer_transport_compatible() {
+  local component=$1 current_api_ref=$2 peer_transport=$3
+
+  if [[ -n ${current_api_ref} && ${peer_transport} != "${EXPECTED_PEER_TRANSPORT}" ]]; then
+    die "${component} deployment from legacy peer transport requires a separately reviewed one-time topology migration"
+  fi
+}
+
 load_current_state() {
   CURRENT_API_REF=""
   CURRENT_API_VERSION=""
@@ -872,6 +935,7 @@ load_current_state() {
   CURRENT_WEB_REF=""
   CURRENT_WEB_VERSION=""
   CURRENT_WEB_COMPATIBILITY=""
+  CURRENT_PEER_TRANSPORT=${LEGACY_PEER_TRANSPORT}
   CURRENT_CONFIG_SHA256=""
   LAST_BACKUP=""
 
@@ -884,6 +948,7 @@ load_current_state() {
     CURRENT_WEB_REF=$(state_value "${CURRENT_FILE}" WEB_REF)
     CURRENT_WEB_VERSION=$(state_value "${CURRENT_FILE}" WEB_VERSION)
     CURRENT_WEB_COMPATIBILITY=$(state_value "${CURRENT_FILE}" WEB_COMPATIBILITY)
+    CURRENT_PEER_TRANSPORT=$(state_peer_transport "${CURRENT_FILE}")
     CURRENT_CONFIG_SHA256=$(state_value "${CURRENT_FILE}" CONFIG_SHA256)
     LAST_BACKUP=$(state_value "${CURRENT_FILE}" LAST_BACKUP)
     validate_state_values \
@@ -917,7 +982,7 @@ verify_target_images() {
 
 history_matches_request() {
   local file=$1 requested=$2 component=$3
-  local api_ref api_version api_compatibility web_ref web_version web_compatibility config_checksum
+  local api_ref api_version api_compatibility web_ref web_version web_compatibility config_checksum peer_transport
 
   validate_state_file "${file}"
   api_ref=$(state_value "${file}" API_REF)
@@ -926,6 +991,7 @@ history_matches_request() {
   web_ref=$(state_value "${file}" WEB_REF)
   web_version=$(state_value "${file}" WEB_VERSION)
   web_compatibility=$(state_value "${file}" WEB_COMPATIBILITY)
+  peer_transport=$(state_peer_transport "${file}")
   config_checksum=$(state_value "${file}" CONFIG_SHA256)
   validate_state_values \
     "${api_ref}" "${api_version}" "${api_compatibility}" \
@@ -934,6 +1000,7 @@ history_matches_request() {
 
   case "${component}" in
     api)
+      [[ ${peer_transport} == "${EXPECTED_PEER_TRANSPORT}" ]] || return 1
       [[ -n ${api_ref} && ${api_ref} != "${CURRENT_API_REF}" ]] || return 1
       [[ -z ${CURRENT_WEB_REF} || ${api_compatibility} == "${CURRENT_WEB_COMPATIBILITY}" ]] || return 1
       [[ ${requested} == previous || ${api_version} == "${requested}" ]]
@@ -944,6 +1011,7 @@ history_matches_request() {
       [[ ${requested} == previous || ${web_version} == "${requested}" ]]
       ;;
     all)
+      [[ ${peer_transport} == "${EXPECTED_PEER_TRANSPORT}" ]] || return 1
       [[ ${api_ref} != "${CURRENT_API_REF}" || ${web_ref} != "${CURRENT_WEB_REF}" ]] || return 1
       [[ ${requested} == previous || ( ${api_version} == "${requested}" && ${web_version} == "${requested}" ) ]]
       ;;
@@ -989,7 +1057,10 @@ cleanup() {
 
 deploy_release() {
   local target_api_ref target_api_version target_api_compatibility
-  local target_web_ref target_web_version target_web_compatibility target_config_checksum
+  local target_web_ref target_web_version target_web_compatibility target_config_checksum target_peer_transport
+
+  require_current_peer_transport_compatible \
+    "${COMPONENT}" "${CURRENT_API_REF}" "${CURRENT_PEER_TRANSPORT}"
 
   : "${ALERT_HUB_VERSION:?ALERT_HUB_VERSION is required}"
   : "${ALERT_HUB_API_IMAGE:?ALERT_HUB_API_IMAGE is required}"
@@ -1006,11 +1077,13 @@ deploy_release() {
   target_web_ref=${CURRENT_WEB_REF}
   target_web_version=${CURRENT_WEB_VERSION}
   target_web_compatibility=${CURRENT_WEB_COMPATIBILITY}
+  target_peer_transport=${CURRENT_PEER_TRANSPORT}
   target_config_checksum=${CURRENT_CONFIG_SHA256}
   if [[ ${COMPONENT} == api || ${COMPONENT} == all ]]; then
     target_api_ref=${ALERT_HUB_API_IMAGE}
     target_api_version=${ALERT_HUB_VERSION}
     target_api_compatibility=${ALERT_HUB_RELEASE_COMPATIBILITY}
+    target_peer_transport=${EXPECTED_PEER_TRANSPORT}
   fi
   if [[ ${COMPONENT} == web || ${COMPONENT} == all ]]; then
     target_web_ref=${ALERT_HUB_WEB_IMAGE}
@@ -1023,8 +1096,19 @@ deploy_release() {
     "${target_api_ref}" "${target_api_version}" "${target_api_compatibility}" \
     "${target_web_ref}" "${target_web_version}" "${target_web_compatibility}"
 
-  if selected_refs_equal_current "${COMPONENT}" "${target_api_ref}" "${target_web_ref}"; then
-    log "Selected component already uses the requested immutable image; verifying readiness only"
+  if [[ ${COMPONENT} == api || ${COMPONENT} == all ]]; then
+    : "${CLUSTER_MASTER_KEY:?CLUSTER_MASTER_KEY is required for API deployment}"
+    : "${SESSION_SIGNING_KEY:?SESSION_SIGNING_KEY is required for API deployment}"
+    : "${VAPID_PRIVATE_KEY:?VAPID_PRIVATE_KEY is required for API deployment}"
+    write_runtime_material
+    target_config_checksum=${CANDIDATE_CONFIG_SHA256}
+  else
+    require_runtime_material
+  fi
+
+  if selected_deployment_is_current \
+    "${COMPONENT}" "${target_api_ref}" "${target_web_ref}" "${target_config_checksum}"; then
+    log "Selected component already uses the requested immutable image and runtime config; verifying readiness only"
     require_runtime_material
     verify_target_ready "${target_api_ref}" "${target_web_ref}" || die "current deployment is not ready"
     verify_runtime_smoke "${target_api_ref}" "${target_web_ref}" ||
@@ -1034,15 +1118,8 @@ deploy_release() {
 
   snapshot_current_state
   if [[ ${COMPONENT} == api || ${COMPONENT} == all ]]; then
-    : "${CLUSTER_MASTER_KEY:?CLUSTER_MASTER_KEY is required for API deployment}"
-    : "${SESSION_SIGNING_KEY:?SESSION_SIGNING_KEY is required for API deployment}"
-    : "${VAPID_PRIVATE_KEY:?VAPID_PRIVATE_KEY is required for API deployment}"
-    write_runtime_material
     make_database_backup "${target_api_ref}"
-    target_config_checksum=${CANDIDATE_CONFIG_SHA256}
     activate_config_snapshot "${target_config_checksum}"
-  else
-    require_runtime_material
   fi
 
   log "Deploying ${COMPONENT} component on ${NODE_NAME}"
@@ -1058,13 +1135,13 @@ deploy_release() {
   write_state \
     "${target_api_ref}" "${target_api_version}" "${target_api_compatibility}" \
     "${target_web_ref}" "${target_web_version}" "${target_web_compatibility}" \
-    "${target_config_checksum}" "${LAST_BACKUP}"
+    "${target_config_checksum}" "${LAST_BACKUP}" "${target_peer_transport}"
   log "Deployment completed successfully"
 }
 
 rollback_release() {
   local requested target_api_ref target_api_version target_api_compatibility
-  local target_web_ref target_web_version target_web_compatibility target_config_checksum
+  local target_web_ref target_web_version target_web_compatibility target_config_checksum target_peer_transport
 
   : "${ALERT_HUB_ROLLBACK_VERSION:?ALERT_HUB_ROLLBACK_VERSION is required}"
   : "${ALERT_HUB_CONFIRMATION:?ALERT_HUB_CONFIRMATION is required}"
@@ -1072,6 +1149,8 @@ rollback_release() {
   [[ ${requested} == previous ]] || validate_version "${requested}" || die "rollback version must be previous or vX.Y.Z"
   [[ ${ALERT_HUB_CONFIRMATION} == "ROLLBACK ${NODE_NAME}" ]] || die "rollback confirmation does not match this node"
   [[ -f ${CURRENT_FILE} ]] || die "there is no recorded deployment to roll back"
+  require_current_peer_transport_compatible \
+    "${COMPONENT}" "${CURRENT_API_REF}" "${CURRENT_PEER_TRANSPORT}"
   require_runtime_material
   select_rollback_state "${requested}" "${COMPONENT}" || die "no compatible recorded rollback target was found"
 
@@ -1081,11 +1160,13 @@ rollback_release() {
   target_web_ref=${CURRENT_WEB_REF}
   target_web_version=${CURRENT_WEB_VERSION}
   target_web_compatibility=${CURRENT_WEB_COMPATIBILITY}
+  target_peer_transport=${CURRENT_PEER_TRANSPORT}
   target_config_checksum=${CURRENT_CONFIG_SHA256}
   if [[ ${COMPONENT} == api || ${COMPONENT} == all ]]; then
     target_api_ref=$(state_value "${SELECTED_HISTORY}" API_REF)
     target_api_version=$(state_value "${SELECTED_HISTORY}" API_VERSION)
     target_api_compatibility=$(state_value "${SELECTED_HISTORY}" API_COMPATIBILITY)
+    target_peer_transport=$(state_peer_transport "${SELECTED_HISTORY}")
     target_config_checksum=$(state_value "${SELECTED_HISTORY}" CONFIG_SHA256)
   fi
   if [[ ${COMPONENT} == web || ${COMPONENT} == all ]]; then
@@ -1114,7 +1195,7 @@ rollback_release() {
   write_state \
     "${target_api_ref}" "${target_api_version}" "${target_api_compatibility}" \
     "${target_web_ref}" "${target_web_version}" "${target_web_compatibility}" \
-    "${target_config_checksum}" "${LAST_BACKUP}"
+    "${target_config_checksum}" "${LAST_BACKUP}" "${target_peer_transport}"
   log "Rollback completed successfully"
 }
 
@@ -1132,7 +1213,7 @@ exec 9<>"${LOCK_FILE}"
 flock -n 9 || die "another deployment, rollback, or provisioning operation is already running"
 require_root_controlled_file "${COMPOSE_FILE}" "production Compose file"
 load_deploy_policy
-readonly POLICY_GITHUB_REPOSITORY POLICY_NODE_NAME HOST_PORT EDGE_SUBNET API_IP WEB_IP MONITORING_NETWORK
+readonly POLICY_GITHUB_REPOSITORY POLICY_NODE_NAME HOST_PORT API_HOST_PORT EDGE_SUBNET API_IP WEB_IP MONITORING_NETWORK
 install -d -o root -g root -m 0700 "${CONFIG_DIR}" "${STATE_DIR}" "${HISTORY_DIR}" "${CONFIG_HISTORY_DIR}"
 install -d -o root -g "${API_GID}" -m 0750 "${SECRETS_DIR}"
 install -d -o "${API_UID}" -g "${API_GID}" -m 0750 "${DATA_DIR}"
@@ -1141,7 +1222,6 @@ install -d -o "${API_UID}" -g "${API_GID}" -m 0700 "${BACKUPS_DIR}"
 : "${NODE_NAME:?NODE_NAME is required}"
 : "${NODE_IP:?NODE_IP is required}"
 : "${PUBLIC_DOMAIN:?PUBLIC_DOMAIN is required}"
-: "${PEER_ADDRESS:?PEER_ADDRESS is required}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 COMPONENT=${ALERT_HUB_COMPONENT:?ALERT_HUB_COMPONENT is required}
 APP_NAME=${APP_NAME:-Alert Hub}
@@ -1154,10 +1234,6 @@ EXPECTED_WEB_REPOSITORY=ghcr.io/${registry_owner}/alert-hub-web
 [[ ${NODE_NAME} =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die "NODE_NAME is invalid"
 validate_host_token "${NODE_IP}" || die "NODE_IP is invalid"
 validate_domain "${PUBLIC_DOMAIN}" || die "PUBLIC_DOMAIN must be a DNS host name"
-validate_private_ipv4 "${PEER_ADDRESS}" || die "PEER_ADDRESS must be an RFC 1918 IPv4 address without a scheme or port"
-if address_in_cidr "${PEER_ADDRESS}" "${EDGE_SUBNET}"; then
-  die "PEER_ADDRESS must not overlap the dedicated application edge subnet"
-fi
 PUBLIC_DOMAIN=$(printf '%s' "${PUBLIC_DOMAIN}" | tr '[:upper:]' '[:lower:]')
 
 AUTH_DIR=""

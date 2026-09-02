@@ -1,8 +1,8 @@
 # Security policy
 
-Alert Hub has not published its first supported release yet. Until a versioned release is
-available, security fixes are made on `main` and no compatibility or response-time SLA is
-promised.
+Alert Hub publishes security fixes on `main` and, when applicable, in the latest
+versioned release; `v0.1.0` is the first published release. No compatibility or
+response-time SLA is promised during the `0.x` series.
 
 Please do not disclose a suspected vulnerability in a public issue. Use GitHub's private
 vulnerability reporting for this repository when it is enabled, or contact the repository owner

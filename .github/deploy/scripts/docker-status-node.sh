@@ -14,8 +14,13 @@ readonly DEPLOY_POLICY_FILE=/etc/alert-hub/deploy-policy.env
 readonly MONITORING_COMPOSE_FILE=/etc/alert-hub/docker-compose.production-monitoring.yml
 readonly API_CONTAINER=alert-hub-api
 readonly WEB_CONTAINER=alert-hub-web
+readonly EXPECTED_PEER_TRANSPORT=https-peer-v1
+readonly LEGACY_PEER_TRANSPORT=legacy
 POLICY_NODE_NAME=""
 HOST_PORT=""
+API_HOST_PORT=""
+API_IP=""
+WEB_IP=""
 MONITORING_NETWORK=""
 
 log() {
@@ -41,6 +46,10 @@ require_root_controlled_file() {
 state_value() {
   local key=$1
   awk -F= -v wanted="${key}" '$1 == wanted {print substr($0, index($0, "=") + 1); found = 1; exit} END {if (!found) exit 1}' "${CURRENT_FILE}"
+}
+
+state_peer_transport() {
+  state_value PEER_TRANSPORT 2>/dev/null || printf '%s\n' "${LEGACY_PEER_TRANSPORT}"
 }
 
 policy_value() {
@@ -79,7 +88,7 @@ load_status_policy() {
   [[ $(stat -c '%a' -- "${DEPLOY_POLICY_FILE}") == 600 ]] || die "deployment policy must have mode 0600"
   awk -F= '
     NF != 2 {exit 1}
-    $1 !~ /^(GITHUB_REPOSITORY|NODE_NAME|HOST_PORT|EDGE_SUBNET|API_IP|WEB_IP|MONITORING_NETWORK)$/ {exit 1}
+    $1 !~ /^(GITHUB_REPOSITORY|NODE_NAME|HOST_PORT|API_HOST_PORT|EDGE_SUBNET|API_IP|WEB_IP|MONITORING_NETWORK)$/ {exit 1}
     seen[$1]++ > 0 {exit 1}
     END {
       required["GITHUB_REPOSITORY"] = required["NODE_NAME"] = required["HOST_PORT"] = 1
@@ -89,23 +98,33 @@ load_status_policy() {
   ' "${DEPLOY_POLICY_FILE}" || die "deployment policy is malformed"
   POLICY_NODE_NAME=$(policy_value NODE_NAME)
   HOST_PORT=$(policy_value HOST_PORT)
+  # Match the deploy engine's backward-compatible legacy-policy default.
+  API_HOST_PORT=$(policy_value API_HOST_PORT 2>/dev/null || printf '18081\n')
+  API_IP=$(policy_value API_IP)
+  WEB_IP=$(policy_value WEB_IP)
   MONITORING_NETWORK=$(policy_value MONITORING_NETWORK 2>/dev/null || true)
   [[ ${POLICY_NODE_NAME} =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] ||
     die "deployment policy NODE_NAME is invalid"
   if [[ ! ${HOST_PORT} =~ ^[1-9][0-9]{0,4}$ ]] || ((10#${HOST_PORT} > 65535)); then
     die "deployment policy HOST_PORT is invalid"
   fi
+  if [[ ! ${API_HOST_PORT} =~ ^[1-9][0-9]{0,4}$ ]] || ((10#${API_HOST_PORT} > 65535)); then
+    die "deployment policy API_HOST_PORT is invalid"
+  fi
+  [[ ${API_HOST_PORT} != "${HOST_PORT}" ]] ||
+    die "deployment policy API_HOST_PORT and HOST_PORT must be distinct"
   if [[ -n ${MONITORING_NETWORK} ]]; then
     require_root_controlled_file "${MONITORING_COMPOSE_FILE}" "production monitoring Compose override"
     validate_monitoring_network "${MONITORING_NETWORK}"
   fi
-  readonly POLICY_NODE_NAME HOST_PORT MONITORING_NETWORK
+  readonly POLICY_NODE_NAME HOST_PORT API_HOST_PORT API_IP WEB_IP MONITORING_NETWORK
 }
 
 validate_state_file() {
+  local peer_transport
   awk -F= '
     NF != 2 {exit 1}
-    $1 !~ /^(NODE_NAME|API_REF|API_VERSION|API_COMPATIBILITY|WEB_REF|WEB_VERSION|WEB_COMPATIBILITY|CONFIG_SHA256|DEPLOYED_AT|LAST_BACKUP)$/ {exit 1}
+    $1 !~ /^(NODE_NAME|API_REF|API_VERSION|API_COMPATIBILITY|WEB_REF|WEB_VERSION|WEB_COMPATIBILITY|CONFIG_SHA256|DEPLOYED_AT|LAST_BACKUP|PEER_TRANSPORT)$/ {exit 1}
     seen[$1]++ > 0 {exit 1}
     END {
       required["NODE_NAME"] = required["API_REF"] = required["API_VERSION"] = 1
@@ -115,6 +134,9 @@ validate_state_file() {
       for (key in required) if (!seen[key]) exit 1
     }
   ' "${CURRENT_FILE}" || die "deployment state is malformed"
+  peer_transport=$(state_peer_transport)
+  [[ ${peer_transport} == "${EXPECTED_PEER_TRANSPORT}" || ${peer_transport} == "${LEGACY_PEER_TRANSPORT}" ]] ||
+    die "deployment state has an unsupported peer transport"
 }
 
 container_status() {
@@ -154,12 +176,31 @@ container_has_exact_networks() {
   done
 }
 
+container_has_exact_port_binding() {
+  local container=$1 expected_ip=$2 expected_port=$3 output
+  output=$(docker container inspect "${container}" \
+    --format '{{range $containerPort, $bindings := .HostConfig.PortBindings}}{{printf "%s=" $containerPort}}{{range $bindings}}{{printf "%s:%s," .HostIp .HostPort}}{{end}}{{println}}{{end}}' \
+    2>/dev/null) || return 1
+  [[ ${output} == "8080/tcp=${expected_ip}:${expected_port}," ]]
+}
+
+container_has_exact_network_address() {
+  local container=$1 network=$2 expected_ip=$3 actual_ip
+  actual_ip=$(docker container inspect "${container}" \
+    --format "{{with index .NetworkSettings.Networks \"${network}\"}}{{.IPAddress}}{{end}}" \
+    2>/dev/null) || return 1
+  [[ ${actual_ip} == "${expected_ip}" ]]
+}
+
 print_fresh_status() {
   printf 'node=%s\n' "${POLICY_NODE_NAME}"
   printf 'deployed_at=not-deployed\nconfig_sha256=not-deployed\n'
+  printf 'peer_transport=not-deployed\n'
   printf 'api_version=not-deployed\napi_image=not-deployed\napi_compatibility=not-deployed\napi_status=absent/unknown\n'
   printf 'web_version=not-deployed\nweb_image=not-deployed\nweb_compatibility=not-deployed\nweb_status=absent/unknown\n'
   printf 'api_networks=not-deployed\nweb_networks=not-deployed\n'
+  printf 'api_listener=127.0.0.1:%s\nweb_listener=127.0.0.1:%s\n' "${API_HOST_PORT}" "${HOST_PORT}"
+  printf 'api_internal_upstream=%s:8080\nweb_internal_upstream=%s:8080\n' "${API_IP}" "${WEB_IP}"
   if [[ -n ${MONITORING_NETWORK} ]]; then
     printf 'monitoring=configured-not-deployed\n'
   else
@@ -203,6 +244,7 @@ api_compatibility=$(state_value API_COMPATIBILITY)
 web_ref=$(state_value WEB_REF)
 web_version=$(state_value WEB_VERSION)
 web_compatibility=$(state_value WEB_COMPATIBILITY)
+peer_transport=$(state_peer_transport)
 config_sha256=$(state_value CONFIG_SHA256)
 deployed_at=$(state_value DEPLOYED_AT)
 
@@ -228,6 +270,7 @@ fi
 printf 'node=%s\n' "${node_name}"
 printf 'deployed_at=%s\n' "${deployed_at}"
 printf 'config_sha256=%s\n' "${config_sha256:-not-deployed}"
+printf 'peer_transport=%s\n' "${peer_transport}"
 printf 'api_version=%s\napi_image=%s\napi_compatibility=%s\napi_status=%s\n' \
   "${api_version:-not-deployed}" "${api_ref:-not-deployed}" "${api_compatibility:-not-deployed}" "$(container_status "${API_CONTAINER}")"
 printf 'web_version=%s\nweb_image=%s\nweb_compatibility=%s\nweb_status=%s\n' \
@@ -255,11 +298,17 @@ if [[ -n ${api_ref} ]]; then
   else
     container_has_exact_networks "${API_CONTAINER}" alert-hub-edge alert-hub-egress || api_networks_ok=false
   fi
+  container_has_exact_network_address "${API_CONTAINER}" alert-hub-edge "${API_IP}" || healthy=false
+  container_has_exact_port_binding "${API_CONTAINER}" 127.0.0.1 "${API_HOST_PORT}" || healthy=false
+  curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${API_HOST_PORT}/health/ready" >/dev/null || healthy=false
   [[ ${api_networks_ok} == true ]] || healthy=false
 fi
 if [[ -n ${web_ref} ]]; then
   container_has_exact_networks "${WEB_CONTAINER}" alert-hub-edge alert-hub-ingress || web_networks_ok=false
+  container_has_exact_network_address "${WEB_CONTAINER}" alert-hub-edge "${WEB_IP}" || healthy=false
   if [[ $(container_status "${WEB_CONTAINER}") != running/healthy ]]; then
+    healthy=false
+  elif ! container_has_exact_port_binding "${WEB_CONTAINER}" 127.0.0.1 "${HOST_PORT}"; then
     healthy=false
   elif ! curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${HOST_PORT}/health/ready" >/dev/null; then
     healthy=false
@@ -277,4 +326,6 @@ else
   web_networks_status=not-deployed
 fi
 printf 'api_networks=%s\nweb_networks=%s\n' "${api_networks_status}" "${web_networks_status}"
+printf 'api_listener=127.0.0.1:%s\nweb_listener=127.0.0.1:%s\n' "${API_HOST_PORT}" "${HOST_PORT}"
+printf 'api_internal_upstream=%s:8080\nweb_internal_upstream=%s:8080\n' "${API_IP}" "${WEB_IP}"
 [[ ${healthy} == true ]] || die "one or more recorded components are not ready"

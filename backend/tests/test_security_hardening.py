@@ -545,6 +545,7 @@ def _production_settings(tmp_path: Path, **updates: Any) -> Settings:
         "master_encryption_key_file": master_key,
         "cookie_secure": True,
         "public_api_url": "https://hub.example",
+        "private_peer_url": "https://peer.example",
         "trusted_origins": ["https://hub.example"],
         "peer_allowed_cidrs": ["10.0.0.0/8"],
     }
@@ -564,13 +565,22 @@ def _production_settings(tmp_path: Path, **updates: Any) -> Settings:
         ({"trusted_origins": ["https://other.example"]}, "must be present"),
         ({"cookie_domain": "other.example"}, "COOKIE_DOMAIN"),
         ({"peer_allowed_cidrs": []}, "PEER_ALLOWED_CIDRS"),
+        ({"private_peer_url": None}, "PEER_PUBLIC_URL is required"),
         (
-            {"peer_urls": ["https://peer.example"]},
-            "literal RFC 1918 or ULA",
+            {"private_peer_url": "http://peer.example"},
+            "must use HTTPS",
         ),
         (
-            {"peer_urls": ["https://203.0.113.10:8080"]},
-            "literal RFC 1918 or ULA",
+            {"private_peer_url": "http://203.0.113.10:8080"},
+            "must use HTTPS",
+        ),
+        (
+            {"peer_urls": ["http://peer.example"]},
+            "must use HTTPS",
+        ),
+        (
+            {"peer_urls": ["http://203.0.113.10:8080"]},
+            "must use HTTPS",
         ),
         (
             {
@@ -595,11 +605,23 @@ def test_production_startup_invariants(
 def test_valid_production_settings_and_unsafe_origin_cookie_shapes(tmp_path: Path) -> None:
     settings = _production_settings(
         tmp_path,
-        peer_urls=["http://10.42.0.2:8080", "http://[fd42::2]:8080"],
+        peer_urls=[
+            "https://peer-ru.alerts.example",
+            "https://203.0.113.10:8443",
+            "http://10.42.0.2:8080",
+            "http://[fd42::2]:8080",
+        ],
     )
     _validate_production_settings(settings)
     app = create_app(settings)
     app.state.engine.dispose()
+
+    wireguard_settings = _production_settings(
+        tmp_path,
+        private_peer_url="http://10.42.0.1:8080",
+        peer_urls=["http://10.42.0.2:8080", "http://[fd42::2]:8080"],
+    )
+    _validate_production_settings(wireguard_settings)
 
     with pytest.raises(ValueError, match="wildcards"):
         Settings(trusted_origins=["*"])
@@ -611,6 +633,22 @@ def test_valid_production_settings_and_unsafe_origin_cookie_shapes(tmp_path: Pat
         Settings(public_api_url="ftp://hub.example")
     with pytest.raises(ValueError, match="wildcards"):
         Settings(peer_urls=["https://*.peer.example"])
+
+
+def test_peer_public_url_requirement_tracks_sync_participation(tmp_path: Path) -> None:
+    standalone = _production_settings(
+        tmp_path,
+        sync_enabled=False,
+        private_peer_url=None,
+        peer_urls=[],
+    )
+    _validate_production_settings(standalone)
+
+    configured_peer = standalone.model_copy(
+        update={"peer_urls": ["https://peer-nl.alerts.example"]}
+    )
+    with pytest.raises(RuntimeError, match="PEER_PUBLIC_URL is required"):
+        _validate_production_settings(configured_peer)
 
 
 def test_clock_skew_threshold_and_metric_are_observable() -> None:

@@ -38,6 +38,30 @@ Alert on at least:
 - backup age/checksum/restore-test failure;
 - release digest/config checksum drift across nodes.
 
+## Peer HTTPS boundary
+
+Each node has a dedicated peer hostname on `443`; it is separate from the
+public UI hostname and resolves directly to the node. The operator proxy
+terminates and renews TLS, checks the other nodes' exact public `/32` sources,
+overwrites forwarding headers, and routes only the peer health `GET` and event
+query `POST`. The application then applies the same CIDR decision and cluster
+bearer authentication. A proxy allowlist is not a replacement for the bearer.
+
+After DNS, certificate, proxy, or public-address changes:
+
+1. validate the complete Nginx/Caddy configuration before reload;
+2. confirm `docker-status-node.sh` reports distinct loopback API/web listeners;
+3. from each allowed node, verify the certificate and both permitted operations;
+4. from an allowed node, verify wrong methods and every other path return `404`;
+5. from an unrelated network, verify the peer hostname returns `403` or `404`;
+6. externally scan that the loopback application ports are not reachable;
+7. record evidence without authorization headers, bearer values, or payloads.
+
+Certificate renewal must use the proxy's existing ACME process and a validated
+reload hook. If a node's public egress address changes, update both other
+nodes' proxy `/32` allowlists and `PEER_ALLOWED_CIDRS` as one reviewed operation;
+an incomplete change is expected to fail closed and temporarily pause sync.
+
 ## Release state
 
 Each successful node deployment records the active API and web digest references plus their
@@ -73,7 +97,21 @@ Neither substitutes for the dated failed-deploy and manual-rollback drills on a 
 
 ## Backups
 
-Cluster replication is not a backup. Schedule node-local online SQLite backup and copy verified backups to an access-controlled failure domain according to local policy. The supplied tool uses Python's SQLite backup API, runs `PRAGMA quick_check`, writes a SHA-256 sidecar, and atomically publishes the result.
+Cluster replication is not a backup. Schedule node-local online SQLite backup
+and copy verified backups to an access-controlled failure domain according to
+local policy. Node provisioning installs the root-owned tool and a mode-`0600`
+`/etc/alert-hub/backup.env`. Fresh defaults use the immutable policy's node name,
+`/opt/alert-hub/data/alert-hub.db`, `/opt/alert-hub/backups`, container
+`alert-hub-api`, database UID/GID `10001`, and 7-daily/4-weekly/6-monthly
+retention. Re-provisioning preserves a valid operator-customized config exactly
+and fails closed on an unsafe file or value instead of replacing it.
+
+The supplied tool uses Python's SQLite backup API, runs `PRAGMA quick_check`,
+writes a SHA-256 sidecar, and atomically publishes the result. Provisioning
+requires host Python 3.9+ with `sqlite3` backup support, creates the default
+backup directory with root-only access, and requires an operator-customized
+directory to exist as `root:root` mode `0700`. The tool reasserts that mode on
+each run.
 
 ```bash
 sudo /usr/local/sbin/alert-hub-backup backup --label manual
@@ -82,6 +120,13 @@ sudo /usr/local/sbin/alert-hub-backup verify /opt/alert-hub/backups/alert-hub-YY
 ```
 
 Default retention keeps the union of one newest backup for 7 daily, 4 ISO-week, and 6 monthly buckets. `prune` deletes only tool-named regular backup files in the configured backup directory. Monitor capacity independently: retention cannot help if a sudden WAL or log surge consumes the disk before backup starts.
+
+Provisioning deliberately does not enable a timer. Install and enable the
+reviewed `deploy/systemd/alert-hub-backup.{service,timer}.example` units, or use
+the site's scheduler, after confirming the destination and off-node copy policy.
+If `BACKUP_DIR` is customized, update the service sandbox's `ReadWritePaths` to
+the same directory before enabling it. If `DATABASE_PATH` is customized, update
+`ReadOnlyPaths` at the same time.
 
 At least monthly, restore a copied backup into an isolated test path/container and verify:
 
