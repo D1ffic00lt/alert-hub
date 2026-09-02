@@ -89,7 +89,7 @@ class Settings(BaseSettings):
     )
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_format: Literal["json", "text"] = "json"
-    software_version: str = "0.1.1"
+    software_version: str = "0.1.2"
     backend_host: str = Field(default="127.0.0.1", min_length=1, max_length=253)
     backend_port: int = Field(default=8080, ge=1, le=65_535)
     database_url: str = "sqlite:///./data/alert-hub.db"

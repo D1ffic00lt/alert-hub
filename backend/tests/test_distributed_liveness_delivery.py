@@ -135,6 +135,81 @@ def _assert_resolved_heartbeat(app: Any, source_id: str) -> None:
         assert state is not None and state.missed is False
 
 
+def test_source_and_heartbeat_observations_in_one_sync_page_create_one_state(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, "heartbeat-page-target")
+    app = create_app(settings)
+    source_id = new_id()
+    created_at = datetime(2026, 9, 2, 10, 0, tzinfo=UTC)
+    latest_observation = created_at + timedelta(seconds=2)
+    source_payload = {
+        "name": "Replicated heartbeat",
+        "kind": "heartbeat",
+        "enabled": True,
+        "region": "remote",
+        "config": {
+            "allowed_cidrs": [],
+            "interval_seconds": 60,
+            "grace_seconds": 0,
+        },
+        "token_hash": "replicated-token-hash",
+        "created_at": created_at.isoformat(),
+        "updated_at": created_at.isoformat(),
+        "deleted_at": None,
+    }
+    incoming = [
+        IncomingClusterEvent(
+            event_id=new_id(),
+            origin_node_id="heartbeat-page-origin",
+            origin_seq=1,
+            entity_type="source",
+            entity_id=source_id,
+            operation="upsert",
+            occurred_at=created_at,
+            payload=source_payload,
+        ),
+        IncomingClusterEvent(
+            event_id=new_id(),
+            origin_node_id="heartbeat-page-origin",
+            origin_seq=2,
+            entity_type="heartbeat_observation",
+            entity_id=source_id,
+            operation="observed",
+            occurred_at=created_at + timedelta(seconds=1),
+            payload={"source_id": source_id, "received_at": created_at.isoformat()},
+        ),
+        IncomingClusterEvent(
+            event_id=new_id(),
+            origin_node_id="heartbeat-page-origin",
+            origin_seq=3,
+            entity_type="heartbeat_observation",
+            entity_id=source_id,
+            operation="observed",
+            occurred_at=latest_observation,
+            payload={"source_id": source_id, "received_at": latest_observation.isoformat()},
+        ),
+    ]
+
+    with TestClient(app, base_url="http://testserver"):
+        with app.state.session_factory.begin() as db:
+            result = apply_cluster_events(db, incoming, settings)
+            assert result.applied == 3
+            assert result.duplicates == 0
+
+        with app.state.session_factory.begin() as db:
+            retry = apply_cluster_events(db, incoming, settings)
+            assert retry.applied == 0
+            assert retry.duplicates == 3
+
+        with app.state.session_factory() as db:
+            states = db.scalars(
+                select(HeartbeatState).where(HeartbeatState.source_id == source_id)
+            ).all()
+            assert len(states) == 1
+            assert states[0].last_received_at == latest_observation
+
+
 def test_heartbeat_observations_prevent_false_misses_and_resolve_out_of_order(
     tmp_path: Path,
 ) -> None:

@@ -407,6 +407,10 @@ def _project_source(db: Session, entity_id: str, settings: Settings) -> None:
     db.flush()
     if source.kind == "heartbeat" and db.get(HeartbeatState, source.id) is None:
         db.add(HeartbeatState(source_id=source.id, last_received_at=source.created_at))
+        # Persist the projection inside this transaction so a heartbeat
+        # observation later in the same sync page resolves this identity
+        # instead of queuing a second row with the same primary key.
+        db.flush()
     # An incident can arrive on a relay before the source that owns it.
     for incident_event in db.scalars(
         select(ClusterEvent).where(ClusterEvent.entity_type == "incident")
