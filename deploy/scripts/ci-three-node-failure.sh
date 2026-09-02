@@ -578,7 +578,7 @@ wait_webhook_sink
 webhook_container=$("${compose[@]}" ps --quiet webhook-sink)
 [[ $(docker container inspect "${webhook_container}" --format '{{.HostConfig.ReadonlyRootfs}}') == true ]]
 [[ $(docker container inspect "${webhook_container}" --format '{{.Config.User}}') == 10001:10001 ]]
-[[ $(docker container inspect "${webhook_container}" --format '{{json .HostConfig.PortBindings}}') == null ]]
+[[ $(docker container inspect "${webhook_container}" --format '{{len .HostConfig.PortBindings}}') == 0 ]]
 for node in node-ru node-nl node-de; do
   wait_node "${node}"
   for ui_path in / /sw.js /runtime-config.js /manifest.webmanifest; do
@@ -593,7 +593,7 @@ for node in node-ru node-nl node-de; do
   container_id=$("${compose[@]}" ps --quiet "${node}")
   [[ $(docker container inspect "${container_id}" --format '{{.HostConfig.ReadonlyRootfs}}') == true ]]
   [[ $(docker container inspect "${container_id}" --format '{{.Config.User}}') == 10001:10001 ]]
-  [[ $(docker container inspect "${container_id}" --format '{{json .HostConfig.PortBindings}}') == null ]]
+  [[ $(docker container inspect "${container_id}" --format '{{len .HostConfig.PortBindings}}') == 0 ]]
   data_source=$(docker container inspect "${container_id}" \
     --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}')
   [[ ${data_source} == "${test_root}/${node}" ]]

@@ -155,9 +155,8 @@ docker container exec "${web_container}" sh -c \
   'command -v nginx >/dev/null && ! command -v python >/dev/null && ! command -v node >/dev/null && ! command -v npm >/dev/null && ! command -v alert-hub >/dev/null && test ! -e /data'
 [[ $(docker container inspect "${web_container}" --format '{{len .Mounts}}') == 0 ]]
 
-api_port_bindings=$(docker container inspect "${api_container}" \
-  --format '{{json (index .NetworkSettings.Ports "8080/tcp")}}')
-[[ ${api_port_bindings} == null || ${api_port_bindings} == '<no value>' ]]
+[[ $(docker container inspect "${api_container}" \
+  --format '{{len .HostConfig.PortBindings}}') == 0 ]]
 web_port=$(docker container port "${web_container}" 8080/tcp)
 [[ ${web_port} == "127.0.0.1:${host_port}" ]]
 base_url=http://127.0.0.1:${host_port}

@@ -361,7 +361,12 @@ def test_refresh_requires_exact_origin_and_authenticated_responses_are_partition
         "/api/v1/auth/refresh",
         headers={"Origin": "http://testserver/", "X-CSRF-Token": csrf},
     )
+    mismatched = client.post(
+        "/api/v1/auth/refresh",
+        headers={"Origin": "http://testserver", "X-CSRF-Token": f"{csrf}-wrong"},
+    )
     assert missing.status_code == wrong.status_code == trailing.status_code == 403
+    assert mismatched.status_code == 403
 
     exact = client.post(
         "/api/v1/auth/refresh",

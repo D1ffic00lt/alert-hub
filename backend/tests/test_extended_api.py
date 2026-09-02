@@ -321,6 +321,11 @@ def test_only_double_submit_cookie_is_browser_readable(
     assert "HttpOnly" not in cookies["alert_hub_csrf"]
     assert "SameSite=strict" in cookies["alert_hub_csrf"]
     assert "Path=/" in cookies["alert_hub_csrf"]
+    body = response.json()
+    refresh_token = response.cookies["alert_hub_refresh"]
+    csrf_token = response.cookies["alert_hub_csrf"]
+    assert csrf_token == body["csrf_token"]
+    assert len({body["access_token"], refresh_token, csrf_token}) == 3
 
 
 def test_stream_cookie_authenticates_initial_sse_event(

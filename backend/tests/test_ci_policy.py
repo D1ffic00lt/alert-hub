@@ -886,6 +886,9 @@ def test_container_smokes_read_private_bootstrap_tokens_inside_containers() -> N
     container_smoke = (REPOSITORY / "deploy/scripts/ci-container-smoke.sh").read_text(
         encoding="utf-8"
     )
+    matrix_smoke = (REPOSITORY / "deploy/scripts/ci-image-matrix-smoke.sh").read_text(
+        encoding="utf-8"
+    )
     three_node_smoke = (REPOSITORY / "deploy/scripts/ci-three-node-failure.sh").read_text(
         encoding="utf-8"
     )
@@ -894,6 +897,10 @@ def test_container_smokes_read_private_bootstrap_tokens_inside_containers() -> N
     assert '"${compose[@]}" exec --no-TTY node-ru cat /data/bootstrap-token' in three_node_smoke
     assert 'read -r bootstrap_token <"${smoke_root}/data/bootstrap-token"' not in container_smoke
     assert 'read -r bootstrap_token <"${test_root}/node-ru/bootstrap-token"' not in three_node_smoke
+    assert three_node_smoke.count("{{len .HostConfig.PortBindings}}') == 0") == 2
+    assert "{{json .HostConfig.PortBindings}}') == null" not in three_node_smoke
+    assert matrix_smoke.count("{{len .HostConfig.PortBindings}}') == 0") == 1
+    assert "{{json (index .NetworkSettings.Ports" not in matrix_smoke
 
 
 def test_release_manifest_binds_the_exact_api_web_pair() -> None:
@@ -1237,23 +1244,20 @@ def test_controlled_three_node_peers_use_literal_private_addresses() -> None:
 
 def test_pr_codeql_is_a_read_only_failing_sarif_gate() -> None:
     workflow = _workflow("codeql.yml")
-    expected_matrix = [
-        {
-            "language": "python",
-            "suppression_query": "+codeql/python-queries@1.6.5:AlertSuppression.ql",
-        },
-        {"language": "javascript-typescript", "suppression_query": ""},
-    ]
     for job_name in ("analyze-pr", "analyze-main"):
         job = workflow["jobs"][job_name]
-        assert job["strategy"]["matrix"]["include"] == expected_matrix
+        assert job["strategy"]["matrix"]["language"] == [
+            "python",
+            "javascript-typescript",
+        ]
         init_step = next(
             step
             for step in job["steps"]
             if isinstance(step, dict)
             and str(step.get("uses", "")).startswith("github/codeql-action/init@")
         )
-        assert init_step["with"]["queries"] == "${{ matrix.suppression_query }}"
+        assert "queries" not in init_step["with"]
+        assert "packs" not in init_step["with"]
 
     analyze = workflow["jobs"]["analyze-pr"]
     analyze_steps = analyze["steps"]
@@ -1267,11 +1271,11 @@ def test_pr_codeql_is_a_read_only_failing_sarif_gate() -> None:
     assert codeql_step["with"]["output"] == "codeql-results"
     run = _job_run(analyze)
     assert "files=(codeql-results/*.sarif)" in run
-    assert 'python3 deploy/scripts/check-codeql-sarif.py "${files[@]}"' in run
+    assert 'python3 -I deploy/scripts/check-codeql-sarif.py "${files[@]}"' in run
     assert any(action.startswith("actions/upload-artifact@") for action in _job_actions(analyze))
 
 
-def test_codeql_gate_allows_only_the_reviewed_source_suppression(tmp_path: Path) -> None:
+def test_codeql_gate_allows_only_the_fully_pinned_reviewed_finding(tmp_path: Path) -> None:
     gate = _codeql_gate()
 
     def result(
@@ -1279,46 +1283,95 @@ def test_codeql_gate_allows_only_the_reviewed_source_suppression(tmp_path: Path)
         rule_id: str = "py/insecure-cookie",
         uri: str = "backend/alert_hub/api/auth.py",
         line: int = 50,
-        kind: str = "inSource",
-        status: str | None = "accepted",
-        include_status: bool = True,
+        start_column: int = 5,
+        end_line: int = 59,
+        end_column: int = 6,
+        message: str = "Cookie is added without the HttpOnly attribute properly set.",
+        suppressions: Any = None,
+        uri_base_id: str = "%SRCROOT%",
+        artifact_index: Any = 0,
+        level: Any = None,
     ) -> dict[str, Any]:
-        suppression: dict[str, Any] = {"kind": kind}
-        if include_status:
-            suppression["status"] = status
         return {
             "ruleId": rule_id,
-            "message": {"text": "fixture"},
+            "level": level,
+            "message": {"text": message},
             "locations": [
                 {
                     "physicalLocation": {
-                        "artifactLocation": {"uri": uri},
-                        "region": {"startLine": line},
+                        "artifactLocation": {
+                            "uri": uri,
+                            "uriBaseId": uri_base_id,
+                            "index": artifact_index,
+                        },
+                        "region": {
+                            "startLine": line,
+                            "startColumn": start_column,
+                            "endLine": end_line,
+                            "endColumn": end_column,
+                        },
                     }
                 }
             ],
-            "suppressions": [suppression],
+            "suppressions": suppressions,
         }
 
     accepted = result()
-    codeql_default_accepted = result(include_status=False)
     rejected = [
-        result(status="underReview"),
-        result(status="rejected"),
-        result(status=None),
-        result(kind="external"),
+        result(suppressions=[]),
+        result(suppressions=[{"kind": "inSource"}]),
         result(rule_id="py/other"),
         result(uri="backend/alert_hub/api/other.py"),
         result(line=51),
+        result(start_column=6),
+        result(end_line=60),
+        result(end_column=7),
+        result(message="different finding"),
+        result(uri_base_id="%OTHER%"),
+        result(artifact_index=1),
+        result(artifact_index=False),
+        result(level="warning"),
+        result(level=""),
+        result(level=False),
+        result(level=0),
+        result(level=[]),
     ]
+    without_suppressions = result()
+    del without_suppressions["suppressions"]
 
-    assert gate._is_approved_suppression(accepted)
-    assert gate._is_approved_suppression(codeql_default_accepted)
-    assert not any(gate._is_approved_suppression(item) for item in rejected)
+    assert gate._is_approved_finding(accepted)
+    assert gate._is_approved_finding(without_suppressions)
+    assert not gate._is_approved_finding(accepted, repository=tmp_path)
+    assert not any(gate._is_approved_finding(item) for item in rejected)
+
+    for relative_path in gate.REVIEWED_SOURCE_DIGESTS:
+        source = REPOSITORY / relative_path
+        target = tmp_path / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    assert gate._is_approved_finding(accepted, repository=tmp_path)
+
+    auth_path = tmp_path / "backend" / "alert_hub" / "api" / "auth.py"
+    auth_path.write_text(
+        auth_path.read_text(encoding="utf-8").replace(
+            "    # HttpOnly refresh cookie, one exact trusted Origin, and an equal header.",
+            "    issued.csrf_token = issued.access_token",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    assert not gate._is_approved_finding(accepted, repository=tmp_path)
+
+    approved_sarif = tmp_path / "approved.sarif"
+    approved_sarif.write_text(
+        json.dumps({"runs": [{"results": [accepted]}]}),
+        encoding="utf-8",
+    )
+    assert gate.main([str(approved_sarif)]) == 0
 
     sarif = tmp_path / "results.sarif"
     sarif.write_text(
-        json.dumps({"runs": [{"results": [accepted, codeql_default_accepted, *rejected]}]}),
+        json.dumps({"runs": [{"results": [accepted, *rejected]}]}),
         encoding="utf-8",
     )
     assert gate.main([str(sarif)]) == 1
