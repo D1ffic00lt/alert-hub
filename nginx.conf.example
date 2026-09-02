@@ -94,7 +94,7 @@ server {
         add_header X-Frame-Options "DENY" always;
     }
 
-    location ~* ^/assets/.+-[0-9A-Za-z_-]{8,}\.(?:css|js|woff2?|png|svg)$ {
+    location ~* "^/assets/.+-[0-9A-Za-z_-]{8,}\.(?:css|js|woff2?|png|svg)$" {
         proxy_pass http://alert_hub_local;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
