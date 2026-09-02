@@ -76,6 +76,14 @@ def _workflow(name: str) -> dict[str, Any]:
     return document
 
 
+def test_alertmanager_integration_documents_outage_inhibition() -> None:
+    guide = (REPOSITORY / "docs" / "source-integrations.md").read_text(encoding="utf-8")
+
+    assert "VlessServerDownGlobally" in guide
+    assert "VlessEndpointUnreachable|VlessServerUnreachableFromSource" in guide
+    assert "Keep `send_resolved: true`" in guide
+
+
 def _compose(path: str) -> dict[str, Any]:
     document = yaml.safe_load((REPOSITORY / path).read_text(encoding="utf-8"))
     assert isinstance(document, dict)
@@ -887,6 +895,7 @@ def test_public_proxy_examples_hide_operator_only_endpoints() -> None:
     nginx = (REPOSITORY / "nginx.conf.example").read_text(encoding="utf-8")
     caddy = (REPOSITORY / "Caddyfile.example").read_text(encoding="utf-8")
 
+    assert 'location ~* "^/assets/.+-[0-9A-Za-z_-]{8,}' in nginx
     assert "metrics|health/deep|api/" in nginx
     assert "openapi\\.json" in nginx
     assert "@operator_only path /metrics /health/deep" in caddy
