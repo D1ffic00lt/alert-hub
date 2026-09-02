@@ -32,7 +32,9 @@ Production-only automation is isolated under `.github`:
 │   └── rollback.yml
 └── deploy/
     ├── docker-compose.production.yml
+    ├── docker-compose.production-monitoring.yml
     └── scripts/
+        ├── docker-provision-node.sh
         ├── docker-deploy-node.sh
         ├── docker-rollback-node.sh
         └── docker-status-node.sh
@@ -71,53 +73,66 @@ nginx -T 2>/dev/null
 caddy adapt --config /etc/caddy/Caddyfile --pretty 2>/dev/null
 ```
 
-Record the existing monitoring network, a free loopback web port, the exact
+Record a free loopback web port, the exact
 RFC1918/WireGuard address for peer traffic, public proxy ownership, firewall
 rules, filesystem capacity, backup destination, and outbound HTTPS access to
-GHCR and GitHub. Never place SQLite on NFS, a shared Docker volume, or another
-node's filesystem.
+GHCR and GitHub. If the API must reach an existing Prometheus network directly,
+also record that Docker network; this attachment is optional. Never place SQLite
+on NFS, a shared Docker volume, or another node's filesystem.
 
 ## Prepare a node
 
-Install files from the exact reviewed release commit. The runner must not be
-able to edit the installed copies:
+Export the exact reviewed release commit into a root-owned staging directory
+whose complete path is not group/other writable. Do not provision directly from
+the runner's mutable checkout. Replace the uppercase inventory placeholders
+with values confirmed above; omit `--monitoring-network` when no direct
+attachment is required:
 
 ```bash
-sudo install -d -o root -g root -m 0755 /etc/alert-hub
-sudo install -d -o root -g root -m 0700 /opt/alert-hub
-sudo install -o root -g root -m 0644 \
-  .github/deploy/docker-compose.production.yml \
-  /etc/alert-hub/docker-compose.production.yml
-sudo install -o root -g root -m 0755 \
-  .github/deploy/scripts/docker-deploy-node.sh \
-  /usr/local/sbin/docker-deploy-node.sh
-sudo install -o root -g root -m 0755 \
-  .github/deploy/scripts/docker-rollback-node.sh \
-  /usr/local/sbin/docker-rollback-node.sh
-sudo install -o root -g root -m 0755 \
-  .github/deploy/scripts/docker-status-node.sh \
-  /usr/local/sbin/docker-status-node.sh
-# Create this node-local policy without using a repository file. Replace every
-# angle-bracket placeholder with values confirmed by the read-only inventory:
-sudo sh -c 'umask 077; printf "%s\n" \
-  "GITHUB_REPOSITORY=OWNER/alert-hub" \
-  "NODE_NAME=<node-name>" \
-  "HOST_PORT=<free-loopback-port>" \
-  "EDGE_SUBNET=<dedicated-rfc1918-cidr>" \
-  "API_IP=<api-address-in-edge-subnet>" \
-  "WEB_IP=<web-address-in-edge-subnet>" \
-  "MONITORING_NETWORK=<existing-docker-network>" \
-  > /etc/alert-hub/deploy-policy.env'
+sudo /root/alert-hub-reviewed/.github/deploy/scripts/docker-provision-node.sh \
+  --source-dir /root/alert-hub-reviewed \
+  --runner-user RUNNER_USER \
+  --repository OWNER/alert-hub \
+  --node-name NODE_NAME \
+  --host-port FREE_LOOPBACK_PORT \
+  --edge-subnet DEDICATED_RFC1918_CIDR \
+  --api-ip API_ADDRESS_IN_EDGE_SUBNET \
+  --web-ip WEB_ADDRESS_IN_EDGE_SUBNET \
+  --monitoring-network EXISTING_DOCKER_NETWORK
 ```
 
-Replace `OWNER` and every placeholder with the expected repository owner, fixed
-node name, inventoried free loopback port, a dedicated non-overlapping private
-bridge subnet and addresses, and the exact existing monitoring network name.
-The policy must be a root-owned regular file with mode `0600` and exactly those
-seven keys. It contains node-local network topology but no public domain, token,
-or cryptographic secret, and it is never committed. The engine validates CIDR
-membership, address separation, network ownership, and repository/node identity
-before touching a container.
+The helper rejects a root runner or any runner account in the Docker group. It
+also rejects a source path, source directory, or source file that is not
+root-owned and protected from group/other writes, closing the checkout race at
+the bootstrap boundary. It parses every script, validates both Compose
+combinations, validates the generated sudoers file with `visudo`, and installs
+only fixed root-owned entry points. Its sudoers rule uses `env_reset`, a fixed
+`secure_path`, and an explicit deployment-variable allowlist; it does not grant
+`SETENV`. The dedicated runner may invoke deploy/rollback with that validated
+environment and status without arguments, but may not invoke the provisioner.
+GitHub runner registration remains a separate operator step: the helper has no
+option for and never reads a registration token.
+
+Before replacing any trust-boundary file, the helper creates and exclusively
+locks `/opt/alert-hub/.deploy.lock`, stages every destination on its own
+filesystem, and records the previous root-owned files. Activation uses atomic
+renames while deploy, rollback, and status are excluded by the same lock. A late
+copy, content, mode, or `visudo` failure restores the complete previous set;
+failure to restore is reported as critical and preserves root-only recovery
+material instead of deleting it.
+
+The generated policy has six required keys: `GITHUB_REPOSITORY`, `NODE_NAME`,
+`HOST_PORT`, `EDGE_SUBNET`, `API_IP`, and `WEB_IP`. `MONITORING_NETWORK` is a
+seventh optional key written only when requested. The policy is a root-owned
+regular file with mode `0600`; it contains node-local topology but no public
+domain, token, or cryptographic secret, and it is never committed. The engine
+validates CIDR membership, address separation, network ownership, and
+repository/node identity before touching a container. The runner must not be
+able to edit any installed copy. Once created, the complete policy is immutable:
+ordinary re-provisioning accepts only a byte-identical policy and refreshes the
+reviewed scripts/Compose files. A node-name, port, subnet, address, or monitoring
+network change requires a separately reviewed topology migration while the
+application is stopped; the bootstrap helper intentionally has no bypass flag.
 
 The deploy engine creates these paths with restrictive ownership and modes:
 
@@ -131,6 +146,9 @@ The deploy engine creates these paths with restrictive ownership and modes:
 /opt/alert-hub/history/configs/*.env    root:root 0600
 /opt/alert-hub/.deploy.lock             root:root 0600
 /etc/alert-hub/deploy-policy.env         root:root 0600
+/etc/alert-hub/docker-compose*.yml       root:root 0644
+/etc/sudoers.d/alert-hub-deploy          root:root 0440
+/usr/local/sbin/docker-*-node.sh         root:root 0755
 ```
 
 The runtime config and secret files are never printed. Shell tracing is not
@@ -161,12 +179,27 @@ The production Compose model runs independent API and web services:
 - API and web communicate on the dedicated private subnet and addresses recorded
   in the root-owned node policy;
 - only API mounts SQLite, application config, and secrets;
-- only API joins the existing monitoring/egress network;
+- only API joins the managed outbound egress bridge;
+- only API optionally joins the inventoried external monitoring network when
+  `MONITORING_NETWORK` is present in the node policy;
 - `/internal/*` is never routed by the public Nginx/Caddy examples.
 
 Firewall the private API listener to the exact peer and operator CIDRs. The
 deployment script accepts `PEER_ADDRESS` only as an RFC1918 IPv4 address without
-a scheme or port. This check is a guard, not a firewall replacement.
+a scheme or port. The application protocol can validate ULA peer URLs, but the
+current production Compose/host wrapper is intentionally IPv4-only for this MVP.
+This check is a guard, not a firewall replacement.
+
+An optional production monitoring network must be a user-defined, local,
+non-internal IPv4 bridge. The helper rejects Docker's built-in `bridge`, `host`,
+and `none` networks, non-bridge/swarm networks, explicit disabled masquerading,
+and disabled inter-container communication. Docker does not provide a reliable
+non-mutating endpoint-attachment probe, so provisioning validates network
+properties only; the first component deployment and readiness check remain the
+attachability evidence. Both the managed egress bridge and any accepted
+monitoring bridge provide masqueraded outbound routing. This deliberately avoids
+`gw_priority`, retaining compatibility with Docker Compose 2.15.1 even if Docker
+chooses either bridge as the container's default gateway.
 
 The web container performs a readiness authorization subrequest before serving
 the PWA. If API readiness is lost, web stays running but returns `503` for
@@ -190,6 +223,20 @@ NODE_IP
 PUBLIC_DOMAIN
 PEER_ADDRESS
 ```
+
+Optional Environment or Repository Variables consumed by deployment are:
+
+```text
+APP_NAME
+PEER_URLS
+PEER_ALLOWED_CIDRS
+VAPID_PUBLIC_KEY
+```
+
+`APP_NAME` defaults to `Alert Hub`. `PEER_URLS` is a comma-separated list of
+private literal peer URLs; setting it also requires the narrowest applicable
+`PEER_ALLOWED_CIDRS`. `VAPID_PUBLIC_KEY` may be omitted because the API derives
+it from the P-256 private key.
 
 `PUBLIC_DOMAIN` is a DNS hostname without a scheme. `PEER_ADDRESS` is the
 current node's private bind address. `NODE_IP` is inventory metadata and is not
@@ -317,9 +364,9 @@ security headers, and public `404` denials for `/internal/*`, `/metrics`,
 
 ## Existing monitoring network
 
-Universal Compose does not create or modify monitoring services. For a local
-installation, join an inventoried external network only through the optional
-overlay:
+Neither universal nor production Compose creates or modifies monitoring
+services. For a local installation, join an inventoried external network only
+through the optional overlay:
 
 ```bash
 MONITORING_NETWORK=existing_monitoring \
@@ -330,7 +377,20 @@ docker compose \
 ```
 
 Joining a Docker network does not authorize exposing Prometheus, Alertmanager,
-or Blackbox ports on the host.
+or Blackbox ports on the host. Production uses the separate root-owned
+`docker-compose.production-monitoring.yml` override only when the optional
+`MONITORING_NETWORK` policy key is present. Without that key the API keeps its
+ordinary outbound egress bridge but is not attached to any monitoring network.
+Status validates the exact runtime network set: API must have only edge, egress,
+and the optional configured monitoring network; web must have only edge and
+ingress. A stale or unexpected attachment is unhealthy rather than silently
+reported as disabled.
+
+The sanitized `deploy/scripts/host-readiness.sh` field
+`sudo_unrestricted_nopasswd` checks whether the current account can run an
+arbitrary passwordless sudo command. A secure runner with only the provisioned
+three-command sudo boundary should report `no`; that result is not a failed
+deployment prerequisite.
 
 ## Deployment evidence
 

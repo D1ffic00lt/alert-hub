@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -Eeuo pipefail
 
 # An operator provisions this file from a reviewed commit as a root-owned
@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # GitHub passes production secrets in the environment and this script keeps them
 # out of argv and logs.
 umask 077
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 readonly INSTALL_ROOT=/opt/alert-hub
@@ -21,6 +21,7 @@ readonly APP_ENV_FILE=${CONFIG_DIR}/alert-hub.env
 readonly CURRENT_FILE=${STATE_DIR}/current.env
 readonly LOCK_FILE=${INSTALL_ROOT}/.deploy.lock
 readonly COMPOSE_FILE=/etc/alert-hub/docker-compose.production.yml
+readonly MONITORING_COMPOSE_FILE=/etc/alert-hub/docker-compose.production-monitoring.yml
 readonly DEPLOY_POLICY_FILE=/etc/alert-hub/deploy-policy.env
 readonly API_SERVICE=alert-hub
 readonly WEB_SERVICE=alert-hub-web
@@ -40,6 +41,7 @@ EDGE_SUBNET=""
 API_IP=""
 WEB_IP=""
 MONITORING_NETWORK=""
+COMPOSE_FILES=()
 
 log() {
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
@@ -252,6 +254,31 @@ validate_docker_network_name() {
   [[ -n $1 && ${#1} -le 128 && $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
 }
 
+validate_monitoring_network() {
+  local network_name=$1 driver scope internal masquerade inter_container subnets
+  validate_docker_network_name "${network_name}" || die "deployment policy MONITORING_NETWORK is invalid"
+  [[ ${network_name} != bridge && ${network_name} != host && ${network_name} != none ]] ||
+    die "monitoring network must be a user-defined bridge"
+  [[ ${network_name} != alert-hub-edge && ${network_name} != alert-hub-egress && ${network_name} != alert-hub-ingress ]] ||
+    die "deployment policy MONITORING_NETWORK collides with an application network"
+  docker network inspect "${network_name}" >/dev/null 2>&1 ||
+    die "the configured monitoring Docker network is unavailable"
+  driver=$(docker network inspect "${network_name}" --format '{{.Driver}}')
+  scope=$(docker network inspect "${network_name}" --format '{{.Scope}}')
+  internal=$(docker network inspect "${network_name}" --format '{{.Internal}}')
+  masquerade=$(docker network inspect "${network_name}" --format '{{index .Options "com.docker.network.bridge.enable_ip_masquerade"}}')
+  inter_container=$(docker network inspect "${network_name}" --format '{{index .Options "com.docker.network.bridge.enable_icc"}}')
+  subnets=$(docker network inspect "${network_name}" --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}')
+  [[ ${driver} == bridge && ${scope} == local && ${internal} == false ]] ||
+    die "monitoring network must be a non-internal local bridge"
+  [[ -z ${masquerade} || ${masquerade} == '<no value>' || ${masquerade} == true ]] ||
+    die "monitoring network must permit masqueraded outbound traffic"
+  [[ -z ${inter_container} || ${inter_container} == '<no value>' || ${inter_container} == true ]] ||
+    die "monitoring network must permit API-to-monitoring traffic"
+  grep -Eq '(^|[[:space:]])([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}($|[[:space:]])' <<<"${subnets}" ||
+    die "monitoring network must have an IPv4 subnet"
+}
+
 validate_managed_network_if_present() {
   local network_name=$1 logical_name=$2 expected_subnet=${3:-}
   local project_label logical_label actual_subnet
@@ -312,7 +339,6 @@ load_deploy_policy() {
     END {
       required["GITHUB_REPOSITORY"] = required["NODE_NAME"] = required["HOST_PORT"] = 1
       required["EDGE_SUBNET"] = required["API_IP"] = required["WEB_IP"] = 1
-      required["MONITORING_NETWORK"] = 1
       for (key in required) if (!seen[key]) exit 1
     }
   ' "${DEPLOY_POLICY_FILE}" || die "deployment policy is malformed"
@@ -322,7 +348,7 @@ load_deploy_policy() {
   EDGE_SUBNET=$(state_value "${DEPLOY_POLICY_FILE}" EDGE_SUBNET)
   API_IP=$(state_value "${DEPLOY_POLICY_FILE}" API_IP)
   WEB_IP=$(state_value "${DEPLOY_POLICY_FILE}" WEB_IP)
-  MONITORING_NETWORK=$(state_value "${DEPLOY_POLICY_FILE}" MONITORING_NETWORK)
+  MONITORING_NETWORK=$(state_value "${DEPLOY_POLICY_FILE}" MONITORING_NETWORK 2>/dev/null || true)
   [[ ${POLICY_GITHUB_REPOSITORY} =~ ^[A-Za-z0-9-]+/alert-hub$ ]] || die "deployment policy repository is invalid"
   [[ ${POLICY_NODE_NAME} =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die "deployment policy node name is invalid"
   validate_host_port "${HOST_PORT}" || die "deployment policy HOST_PORT is invalid"
@@ -330,9 +356,18 @@ load_deploy_policy() {
   usable_address_in_cidr "${API_IP}" "${EDGE_SUBNET}" || die "deployment policy API_IP is not usable in EDGE_SUBNET"
   usable_address_in_cidr "${WEB_IP}" "${EDGE_SUBNET}" || die "deployment policy WEB_IP is not usable in EDGE_SUBNET"
   [[ ${API_IP} != "${WEB_IP}" ]] || die "deployment policy API_IP and WEB_IP must be distinct"
-  validate_docker_network_name "${MONITORING_NETWORK}" || die "deployment policy MONITORING_NETWORK is invalid"
-  [[ ${MONITORING_NETWORK} != alert-hub-edge && ${MONITORING_NETWORK} != alert-hub-ingress ]] ||
-    die "deployment policy MONITORING_NETWORK collides with an application network"
+  if [[ -n ${MONITORING_NETWORK} ]]; then
+    validate_docker_network_name "${MONITORING_NETWORK}" || die "deployment policy MONITORING_NETWORK is invalid"
+  fi
+}
+
+configure_compose_files() {
+  COMPOSE_FILES=(--file "${COMPOSE_FILE}")
+  if [[ -n ${MONITORING_NETWORK} ]]; then
+    require_root_controlled_file "${MONITORING_COMPOSE_FILE}" "production monitoring Compose override"
+    validate_monitoring_network "${MONITORING_NETWORK}"
+    COMPOSE_FILES+=(--file "${MONITORING_COMPOSE_FILE}")
+  fi
 }
 
 validate_state_file() {
@@ -643,10 +678,10 @@ compose() {
     ALERT_HUB_WEB_IP="${WEB_IP}" \
     ALERT_HUB_EDGE_SUBNET="${EDGE_SUBNET}" \
     ALERT_HUB_PEER_ADDRESS="${PEER_ADDRESS}" \
-    MONITORING_NETWORK="${MONITORING_NETWORK}" \
     APP_NAME="${runtime_app_name}" \
     MIGRATE_ON_START="${migrate_on_start}" \
-    docker compose --project-name alert-hub --file "${COMPOSE_FILE}" "$@"
+    MONITORING_NETWORK="${MONITORING_NETWORK}" \
+    docker compose --project-name alert-hub "${COMPOSE_FILES[@]}" "$@"
 }
 
 wait_container_healthy() {
@@ -1091,19 +1126,17 @@ require_commands
 
 script_path=$(readlink -f -- "${BASH_SOURCE[0]}")
 require_root_controlled_file "${script_path}" "deployment script"
+[[ -d ${INSTALL_ROOT} && ! -L ${INSTALL_ROOT} ]] || die "install root must be a real directory"
+require_private_file "${LOCK_FILE}" 0 "deployment lock"
+exec 9<>"${LOCK_FILE}"
+flock -n 9 || die "another deployment, rollback, or provisioning operation is already running"
 require_root_controlled_file "${COMPOSE_FILE}" "production Compose file"
 load_deploy_policy
 readonly POLICY_GITHUB_REPOSITORY POLICY_NODE_NAME HOST_PORT EDGE_SUBNET API_IP WEB_IP MONITORING_NETWORK
-[[ ! -e ${INSTALL_ROOT} || ( -d ${INSTALL_ROOT} && ! -L ${INSTALL_ROOT} ) ]] || die "install root must be a real directory"
 install -d -o root -g root -m 0700 "${CONFIG_DIR}" "${STATE_DIR}" "${HISTORY_DIR}" "${CONFIG_HISTORY_DIR}"
 install -d -o root -g "${API_GID}" -m 0750 "${SECRETS_DIR}"
 install -d -o "${API_UID}" -g "${API_GID}" -m 0750 "${DATA_DIR}"
 install -d -o "${API_UID}" -g "${API_GID}" -m 0700 "${BACKUPS_DIR}"
-touch "${LOCK_FILE}"
-chown root:root "${LOCK_FILE}"
-chmod 0600 "${LOCK_FILE}"
-exec 9>"${LOCK_FILE}"
-flock -n 9 || die "another deployment or rollback is already running"
 
 : "${NODE_NAME:?NODE_NAME is required}"
 : "${NODE_IP:?NODE_IP is required}"
@@ -1131,9 +1164,10 @@ AUTH_DIR=""
 SMOKE_DIR=""
 trap cleanup EXIT
 docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
+configure_compose_files
 check_disk_preflight
-docker network inspect "${MONITORING_NETWORK}" >/dev/null 2>&1 || die "the existing monitoring Docker network is unavailable"
 validate_managed_network_if_present alert-hub-edge edge "${EDGE_SUBNET}"
+validate_managed_network_if_present alert-hub-egress egress
 validate_managed_network_if_present alert-hub-ingress ingress
 start_registry_auth
 load_current_state

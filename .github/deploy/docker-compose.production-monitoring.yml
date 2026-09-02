@@ -1,0 +1,9 @@
+services:
+  alert-hub:
+    networks:
+      monitoring: {}
+
+networks:
+  monitoring:
+    external: true
+    name: ${MONITORING_NETWORK:?set the existing monitoring network}

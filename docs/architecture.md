@@ -126,7 +126,12 @@ complete unless both artifacts, both SBOMs, and both provenance attestations suc
 
 Each node records current and historical component manifests beneath `/opt/alert-hub`. The
 root-owned deployment wrapper is the privileged interface used by a dedicated self-hosted runner.
-It locks locally, validates exact digest references and compatibility labels, protects SQLite
+The API always has a separate outbound bridge and joins an existing monitoring Docker network only
+through an optional root-owned production override. Production accepts only a masqueraded,
+non-internal user-defined local bridge and status enforces the exact expected network set. The
+root-owned provisioner and runtime wrappers share one lock, so a rollback-safe script/Compose
+refresh cannot overlap deployment work. The engine validates exact digest references and
+compatibility labels, protects SQLite
 before API migration, updates only the requested service, gates readiness, and restores that
 component's prior digest if the candidate fails. The separate manual deploy and rollback workflows
 select protected RU/NL/DE GitHub Environments; those names and runner labels are automation

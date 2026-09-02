@@ -13,6 +13,7 @@ import yaml
 REPOSITORY = Path(__file__).resolve().parents[2]
 CHECKER_PATH = REPOSITORY / "deploy" / "scripts" / "check-ci-policy.py"
 DEPLOY_ENGINE_PATH = REPOSITORY / ".github" / "deploy" / "scripts" / "docker-deploy-node.sh"
+PROVISIONER_PATH = REPOSITORY / ".github" / "deploy" / "scripts" / "docker-provision-node.sh"
 PROXY_INSTALLER_PATH = REPOSITORY / "deploy" / "scripts" / "install-proxy-config.sh"
 PIN = "0123456789abcdef0123456789abcdef01234567"
 
@@ -121,6 +122,198 @@ remove_active_config() { printf 'remove\\n'; }
         text=True,
     )
     return result.stdout.splitlines()
+
+
+def _provisioner_definitions() -> str:
+    source = PROVISIONER_PATH.read_text(encoding="utf-8")
+    definitions, marker, _entrypoint = source.partition("[[ ${EUID} -eq 0 ]]")
+    assert marker
+    return definitions
+
+
+def _run_runner_validation(groups: str) -> subprocess.CompletedProcess[str]:
+    harness = (
+        _provisioner_definitions()
+        + f"""
+getent() {{ return 0; }}
+id() {{
+  case "$1" in
+    -u) printf '1001\\n' ;;
+    -nG) printf '%s\\n' '{groups}' ;;
+    *) return 2 ;;
+  esac
+}}
+validate_runner_user alert-runner
+"""
+    )
+    return subprocess.run(
+        ["bash"],
+        input=harness,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+
+def _run_compose_file_selection(monitoring_network: str) -> list[str]:
+    source = DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
+    definitions, marker, _entrypoint = source.partition("[[ ${EUID} -eq 0 ]]")
+    assert marker
+    harness = (
+        definitions
+        + f"""
+MONITORING_NETWORK='{monitoring_network}'
+require_root_controlled_file() {{ :; }}
+validate_monitoring_network() {{ :; }}
+configure_compose_files
+printf '%s\\n' "${{COMPOSE_FILES[@]}}"
+"""
+    )
+    result = subprocess.run(
+        ["bash"],
+        input=harness,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.splitlines()
+
+
+def _run_monitoring_network_validation(
+    network_name: str,
+    *,
+    driver: str = "bridge",
+    scope: str = "local",
+    internal: str = "false",
+    masquerade: str = "true",
+    inter_container: str = "true",
+    subnets: str = "172.31.240.0/24",
+) -> subprocess.CompletedProcess[str]:
+    harness = (
+        _provisioner_definitions()
+        + r"""
+TEST_NAME=$1
+TEST_DRIVER=$2
+TEST_SCOPE=$3
+TEST_INTERNAL=$4
+TEST_MASQUERADE=$5
+TEST_INTER_CONTAINER=$6
+TEST_SUBNETS=$7
+docker() {
+  if (($# == 3)); then
+    return 0
+  fi
+  case ${5:-} in
+    *'.Driver'*) printf '%s\n' "${TEST_DRIVER}" ;;
+    *'.Scope'*) printf '%s\n' "${TEST_SCOPE}" ;;
+    *'.Internal'*) printf '%s\n' "${TEST_INTERNAL}" ;;
+    *'enable_ip_masquerade'*) printf '%s\n' "${TEST_MASQUERADE}" ;;
+    *'enable_icc'*) printf '%s\n' "${TEST_INTER_CONTAINER}" ;;
+    *'.IPAM.Config'*) printf '%s\n' "${TEST_SUBNETS}" ;;
+    *) return 2 ;;
+  esac
+}
+validate_monitoring_network "${TEST_NAME}"
+"""
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-s",
+            "--",
+            network_name,
+            driver,
+            scope,
+            internal,
+            masquerade,
+            inter_container,
+            subnets,
+        ],
+        input=harness,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+
+def _run_exact_network_validation(actual: list[str], expected: list[str]) -> int:
+    status_path = REPOSITORY / ".github/deploy/scripts/docker-status-node.sh"
+    source = status_path.read_text(encoding="utf-8")
+    definitions, marker, _entrypoint = source.partition("[[ ${EUID} -eq 0 ]]")
+    assert marker
+    harness = (
+        definitions
+        + r"""
+ACTUAL_NETWORKS=$1
+shift
+docker() { printf '%s\n' "${ACTUAL_NETWORKS}"; }
+container_has_exact_networks alert-hub-test "$@"
+"""
+    )
+    result = subprocess.run(
+        ["bash", "-s", "--", "\n".join(actual), *expected],
+        input=harness,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    return result.returncode
+
+
+def _run_boundary_restore_harness(
+    temporary_directory: Path,
+    existing_destination: Path,
+    existing_backup: Path,
+    new_destination: Path,
+    missing_backup: Path,
+) -> subprocess.CompletedProcess[str]:
+    harness = (
+        _provisioner_definitions()
+        + r"""
+temporary_directory=$1
+existing_destination=$2
+existing_backup=$3
+new_destination=$4
+missing_backup=$5
+BOUNDARY_DESTINATIONS=("${existing_destination}" "${new_destination}")
+BOUNDARY_MODES=(600 600)
+BOUNDARY_BACKUPS=("${existing_backup}" "${missing_backup}")
+BOUNDARY_EXISTED=(true false)
+install() {
+  local mode source destination
+  while (($#)); do
+    case $1 in
+      -o | -g) shift 2 ;;
+      -m) mode=$2; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  source=$1
+  destination=$2
+  command cp -- "${source}" "${destination}"
+  chmod "${mode}" "${destination}"
+}
+visudo() { :; }
+restore_boundary
+"""
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-s",
+            "--",
+            str(temporary_directory),
+            str(existing_destination),
+            str(existing_backup),
+            str(new_destination),
+            str(missing_backup),
+        ],
+        input=harness,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
 
 
 def _run_proxy_installer_harness(
@@ -448,6 +641,7 @@ def test_compose_contract_has_only_independent_api_and_web_images() -> None:
     split = _compose("docker-compose.split.yml")
     api_only = _compose("docker-compose.api-only.yml")
     production = _compose(".github/deploy/docker-compose.production.yml")
+    production_monitoring = _compose(".github/deploy/docker-compose.production-monitoring.yml")
 
     for model in (default, split, production):
         services = model["services"]
@@ -487,6 +681,24 @@ def test_compose_contract_has_only_independent_api_and_web_images() -> None:
     assert production["services"]["alert-hub-web"]["ports"] == [
         "127.0.0.1:${ALERT_HUB_HOST_PORT:-8080}:8080"
     ]
+    assert set(production["services"]["alert-hub"]["networks"]) == {
+        "edge",
+        "egress",
+    }
+    assert "monitoring" not in production["networks"]
+    assert production["networks"]["egress"] == {
+        "name": "alert-hub-egress",
+        "driver": "bridge",
+    }
+    assert production_monitoring == {
+        "services": {"alert-hub": {"networks": {"monitoring": {}}}},
+        "networks": {
+            "monitoring": {
+                "external": True,
+                "name": "${MONITORING_NETWORK:?set the existing monitoring network}",
+            }
+        },
+    }
     assert not (REPOSITORY / "Dockerfile").exists()
     assert not (REPOSITORY / "Dockerfile.api").exists()
 
@@ -499,6 +711,7 @@ def test_repository_quality_checks_each_split_runtime_boundary() -> None:
         "backend/container/entrypoint.sh",
         "frontend/container/entrypoint.sh",
         "frontend/container/render-ui-runtime.sh",
+        ".github/deploy/scripts/docker-provision-node.sh",
         ".github/deploy/scripts/docker-deploy-node.sh",
         ".github/deploy/scripts/docker-rollback-node.sh",
         ".github/deploy/scripts/docker-status-node.sh",
@@ -585,6 +798,258 @@ def test_production_network_topology_comes_from_root_owned_policy() -> None:
         assert key in status
     assert "load_status_policy" in status
     assert "readonly HOST_PORT=8080" not in status
+
+
+def test_production_monitoring_override_is_selected_only_when_configured() -> None:
+    base = ["--file", "/etc/alert-hub/docker-compose.production.yml"]
+    assert _run_compose_file_selection("") == base
+    assert _run_compose_file_selection("existing-monitoring") == [
+        *base,
+        "--file",
+        "/etc/alert-hub/docker-compose.production-monitoring.yml",
+    ]
+
+    deploy = DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
+    status = (REPOSITORY / ".github/deploy/scripts/docker-status-node.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'required["MONITORING_NETWORK"] = 1' not in deploy
+    assert 'required["MONITORING_NETWORK"] = 1' not in status
+    assert "monitoring=disabled" in status
+    assert "monitoring=attached" in status
+
+
+def test_node_provisioner_rejects_docker_group_and_writes_narrow_sudoers(
+    tmp_path: Path,
+) -> None:
+    rejected = _run_runner_validation("alert-runner docker")
+    accepted = _run_runner_validation("alert-runner operators")
+    assert rejected.returncode == 1
+    assert "must not belong to the docker group" in rejected.stderr
+    assert accepted.returncode == 0
+
+    sudoers = tmp_path / "sudoers"
+    harness = _provisioner_definitions() + 'write_sudoers_candidate "$1" alert-runner\n'
+    subprocess.run(["bash", "-s", "--", str(sudoers)], input=harness, check=True, text=True)
+    sudoers_text = sudoers.read_text(encoding="utf-8")
+    assert sudoers.stat().st_mode & 0o777 == 0o440
+    assert "env_reset" in sudoers_text
+    assert "secure_path=/usr/sbin:/usr/bin:/sbin:/bin" in sudoers_text
+    assert "env_keep +=" in sudoers_text
+    assert "BASH_ENV" not in sudoers_text
+    assert "SETENV" not in sudoers_text
+    assert 'NOPASSWD: /usr/local/sbin/docker-deploy-node.sh ""' in sudoers_text
+    assert 'NOPASSWD: /usr/local/sbin/docker-rollback-node.sh ""' in sudoers_text
+    assert 'NOPASSWD: /usr/local/sbin/docker-status-node.sh ""' in sudoers_text
+    assert "docker-provision-node.sh" not in sudoers_text
+    visudo = shutil.which("visudo")
+    if visudo is not None:
+        validation = subprocess.run(
+            [visudo, "-cf", str(sudoers)],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        assert validation.returncode == 0, validation.stderr
+
+    source = PROVISIONER_PATH.read_text(encoding="utf-8")
+    assert "visudo -cf" in source
+    assert "--token" not in source
+    assert "GH_TOKEN" not in source
+    assert "RUNNER_TOKEN" not in source
+    assert "config.sh" not in source
+    assert source.startswith("#!/bin/bash\n")
+    assert "require_root_directory_chain" in source
+    assert 'require_root_controlled_file "${SOURCE_ROOT}/${relative_path}"' in source
+
+
+def test_node_provisioner_policy_omits_optional_monitoring_when_disabled(
+    tmp_path: Path,
+) -> None:
+    without_monitoring = tmp_path / "without-monitoring.env"
+    with_monitoring = tmp_path / "with-monitoring.env"
+    harness = (
+        _provisioner_definitions()
+        + 'write_policy_candidate "$1" Example/alert-hub ru 8080 '
+        + '10.253.251.0/29 10.253.251.2 10.253.251.3 "$2"\n'
+    )
+    subprocess.run(
+        ["bash", "-s", "--", str(without_monitoring), ""],
+        input=harness,
+        check=True,
+        text=True,
+    )
+    subprocess.run(
+        ["bash", "-s", "--", str(with_monitoring), "existing-monitoring"],
+        input=harness,
+        check=True,
+        text=True,
+    )
+    assert "MONITORING_NETWORK" not in without_monitoring.read_text(encoding="utf-8")
+    assert "MONITORING_NETWORK=existing-monitoring" in with_monitoring.read_text(encoding="utf-8")
+
+
+def test_monitoring_network_must_be_an_egress_capable_user_bridge() -> None:
+    assert _run_monitoring_network_validation("monitoring").returncode == 0
+    for built_in in ("bridge", "host", "none"):
+        rejected = _run_monitoring_network_validation(built_in)
+        assert rejected.returncode == 1
+        assert "user-defined bridge" in rejected.stderr
+
+    cases = (
+        ({"driver": "overlay"}, "non-internal local bridge"),
+        ({"scope": "swarm"}, "non-internal local bridge"),
+        ({"internal": "true"}, "non-internal local bridge"),
+        ({"masquerade": "false"}, "masqueraded outbound traffic"),
+        ({"inter_container": "false"}, "API-to-monitoring traffic"),
+        ({"subnets": "fd00::/64"}, "IPv4 subnet"),
+    )
+    for overrides, expected_error in cases:
+        rejected = _run_monitoring_network_validation("monitoring", **overrides)
+        assert rejected.returncode == 1
+        assert expected_error in rejected.stderr
+
+    for path in (
+        PROVISIONER_PATH,
+        DEPLOY_ENGINE_PATH,
+        REPOSITORY / ".github/deploy/scripts/docker-status-node.sh",
+    ):
+        validation = _shell_function(
+            path.read_text(encoding="utf-8"), "validate_monitoring_network"
+        )
+        assert "com.docker.network.bridge.enable_ip_masquerade" in validation
+        assert "com.docker.network.bridge.enable_icc" in validation
+        assert ".IPAM.Config" in validation
+
+
+def test_provisioning_policy_is_immutable_and_activation_is_lock_guarded(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "current-policy.env"
+    same = tmp_path / "same-policy.env"
+    changed = tmp_path / "changed-policy.env"
+    current.write_text("NODE_NAME=ru\n", encoding="utf-8")
+    same.write_text("NODE_NAME=ru\n", encoding="utf-8")
+    changed.write_text("NODE_NAME=nl\n", encoding="utf-8")
+    for path in (current, same, changed):
+        path.chmod(0o600)
+
+    definitions = _provisioner_definitions()
+    harness = definitions + 'require_exact_root_file() { :; }\nrequire_immutable_policy "$1" "$2"\n'
+    accepted = subprocess.run(
+        ["bash", "-s", "--", str(same), str(current)],
+        input=harness,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    rejected = subprocess.run(
+        ["bash", "-s", "--", str(changed), str(current)],
+        input=harness,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert accepted.returncode == 0
+    assert rejected.returncode == 1
+    assert "deployment policy is immutable" in rejected.stderr
+
+    source = PROVISIONER_PATH.read_text(encoding="utf-8")
+    _definitions, marker, entrypoint = source.partition("[[ ${EUID} -eq 0 ]]")
+    assert marker
+    prepare_lock = _shell_function(source, "prepare_install_root_and_lock")
+    cleanup = _shell_function(source, "cleanup")
+    activate = _shell_function(source, "activate_boundary")
+    assert 'exec 9<>"${LOCK_FILE}"' in prepare_lock
+    assert "flock -n 9" in prepare_lock
+    assert "restore_boundary" in cleanup
+    assert "ACTIVATION_COMPLETE" in cleanup
+    assert "mv -f" in activate
+    assert "cmp -s" in activate
+    _assert_order(
+        entrypoint,
+        "prepare_install_root_and_lock",
+        'require_immutable_policy "${policy_candidate}"',
+        "stage_boundary_file",
+        "activate_boundary",
+    )
+
+
+def test_failed_boundary_activation_can_restore_previous_complete_set(
+    tmp_path: Path,
+) -> None:
+    existing_destination = tmp_path / "existing-destination"
+    existing_backup = tmp_path / "backup-0"
+    new_destination = tmp_path / "new-destination"
+    missing_backup = tmp_path / "backup-1"
+    existing_destination.write_text("new-content\n", encoding="utf-8")
+    existing_backup.write_text("old-content\n", encoding="utf-8")
+    new_destination.write_text("partially-activated\n", encoding="utf-8")
+
+    restored = _run_boundary_restore_harness(
+        tmp_path,
+        existing_destination,
+        existing_backup,
+        new_destination,
+        missing_backup,
+    )
+    assert restored.returncode == 0, restored.stderr
+    assert existing_destination.read_text(encoding="utf-8") == "old-content\n"
+    assert existing_destination.stat().st_mode & 0o777 == 0o600
+    assert not new_destination.exists()
+
+
+def test_deploy_and_status_lock_before_reading_mutable_boundary() -> None:
+    deploy = DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
+    _definitions, marker, deploy_entrypoint = deploy.partition("[[ ${EUID} -eq 0 ]]")
+    assert marker
+    _assert_order(
+        deploy_entrypoint,
+        'require_private_file "${LOCK_FILE}" 0 "deployment lock"',
+        "flock -n 9",
+        'require_root_controlled_file "${COMPOSE_FILE}"',
+        "load_deploy_policy",
+    )
+
+    status = (REPOSITORY / ".github/deploy/scripts/docker-status-node.sh").read_text(
+        encoding="utf-8"
+    )
+    _definitions, marker, status_entrypoint = status.partition("[[ ${EUID} -eq 0 ]]")
+    assert marker
+    _assert_order(
+        status_entrypoint,
+        'require_root_controlled_file "${LOCK_FILE}"',
+        "flock -s 9",
+        "load_status_policy",
+        "if [[ ! -e ${CURRENT_FILE} && ! -L ${CURRENT_FILE} ]]",
+        'require_root_controlled_file "${CURRENT_FILE}"',
+    )
+    assert "runtime config exists without deployment state" in status_entrypoint
+    assert "API container exists without deployment state" in status_entrypoint
+    assert "web container exists without deployment state" in status_entrypoint
+    assert "print_fresh_status" in status_entrypoint
+
+
+def test_status_requires_exact_component_network_sets() -> None:
+    api = ["alert-hub-edge", "alert-hub-egress", "monitoring"]
+    assert _run_exact_network_validation(api, api) == 0
+    assert _run_exact_network_validation([*api, "stale-monitoring"], api) != 0
+    assert _run_exact_network_validation(api[:-1], api) != 0
+    assert (
+        _run_exact_network_validation(
+            ["alert-hub-edge", "alert-hub-ingress"],
+            ["alert-hub-edge", "alert-hub-ingress"],
+        )
+        == 0
+    )
+
+    status = (REPOSITORY / ".github/deploy/scripts/docker-status-node.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "API container exists without a recorded API image" in status
+    assert "web container exists without a recorded web image" in status
+    assert "api_networks_status=not-deployed" in status
+    assert "web_networks_status=not-deployed" in status
 
 
 def test_controlled_three_node_peers_use_literal_private_addresses() -> None:

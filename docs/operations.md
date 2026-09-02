@@ -11,6 +11,12 @@ sudo docker logs --tail=200 alert-hub-api
 sudo docker logs --tail=200 alert-hub-web
 ```
 
+On a freshly provisioned node with no deployment state, runtime config, or
+managed containers, the status wrapper returns a successful explicit
+`not-deployed` report. Any partial bootstrap residue fails closed. For recorded
+components it also requires the exact managed Docker network set, so a stale
+monitoring attachment is an unhealthy state.
+
 `ready` proves the local API can read SQLite. `deep` adds peer/channel diagnostics but remote
 failures are informational, so they do not remove an autonomous node from service. The supplied
 public proxy examples deny `/health/deep`, `/metrics`, API documentation, and `/internal/*` with
@@ -46,6 +52,9 @@ snapshots are root-readable only; key material remains in the separate secret fi
 /opt/alert-hub/history/                 # state history
 /opt/alert-hub/history/configs/         # sha256-<digest>.env config snapshots
 /etc/alert-hub/docker-compose.production.yml
+/etc/alert-hub/docker-compose.production-monitoring.yml  # optional override
+/etc/alert-hub/deploy-policy.env
+/etc/sudoers.d/alert-hub-deploy
 ```
 
 `CONFIG_SHA256` is deliberately not a path. Before activation, the engine derives the fixed

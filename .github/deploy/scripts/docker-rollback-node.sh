@@ -1,11 +1,11 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -Eeuo pipefail
 
 # Keep this wrapper deliberately small. It gives sudoers a distinct rollback
 # entry point and delegates the state-machine work to the same root-owned engine
 # used by deploys, so readiness failure always restores the starting image.
 umask 077
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 readonly DEPLOY_ENGINE=/usr/local/sbin/docker-deploy-node.sh

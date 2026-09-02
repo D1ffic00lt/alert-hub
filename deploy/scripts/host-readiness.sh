@@ -12,7 +12,9 @@ uname -m
 printf 'user='
 id -un
 
-printf 'sudo_nopasswd='
+# This deliberately probes unrestricted passwordless sudo only. A correctly
+# configured narrow docker-*-node.sh sudoers policy is expected to report no.
+printf 'sudo_unrestricted_nopasswd='
 if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
   printf 'yes\n'
 else

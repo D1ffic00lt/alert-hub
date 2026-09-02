@@ -65,6 +65,7 @@ jobs:
             deploy/scripts/ci-image-matrix-smoke.sh \
             deploy/scripts/ci-three-node-failure.sh \
             deploy/scripts/host-readiness.sh \
+            .github/deploy/scripts/docker-provision-node.sh \
             .github/deploy/scripts/docker-deploy-node.sh \
             .github/deploy/scripts/docker-rollback-node.sh \
             .github/deploy/scripts/docker-status-node.sh
@@ -85,6 +86,7 @@ jobs:
             deploy/scripts/ci-image-matrix-smoke.sh \
             deploy/scripts/ci-three-node-failure.sh \
             deploy/scripts/host-readiness.sh \
+            .github/deploy/scripts/docker-provision-node.sh \
             .github/deploy/scripts/docker-deploy-node.sh \
             .github/deploy/scripts/docker-rollback-node.sh \
             .github/deploy/scripts/docker-status-node.sh \
@@ -249,17 +251,26 @@ jobs:
           ALERT_HUB_API_IP: 10.253.251.2
           ALERT_HUB_WEB_IP: 10.253.251.3
           ALERT_HUB_PEER_ADDRESS: 10.253.252.2
-          MONITORING_NETWORK: existing-monitoring
         run: |
           docker compose -f docker-compose.yml config --quiet
           docker compose -f docker-compose.split.yml config --quiet
           docker compose -f docker-compose.api-only.yml config --quiet
-          docker compose -f docker-compose.yml -f deploy/docker-compose.monitoring.yaml config --quiet
-          docker compose -f docker-compose.split.yml -f deploy/docker-compose.monitoring.yaml config --quiet
-          docker compose -f docker-compose.api-only.yml -f deploy/docker-compose.monitoring.yaml config --quiet
+          MONITORING_NETWORK=existing-monitoring \
+            docker compose -f docker-compose.yml -f deploy/docker-compose.monitoring.yaml config --quiet
+          MONITORING_NETWORK=existing-monitoring \
+            docker compose -f docker-compose.split.yml -f deploy/docker-compose.monitoring.yaml config --quiet
+          MONITORING_NETWORK=existing-monitoring \
+            docker compose -f docker-compose.api-only.yml -f deploy/docker-compose.monitoring.yaml config --quiet
           ALERT_HUB_API_IMAGE=ghcr.io/example/alert-hub-api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             ALERT_HUB_WEB_IMAGE=ghcr.io/example/alert-hub-web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
             docker compose -f .github/deploy/docker-compose.production.yml config --quiet
+          ALERT_HUB_API_IMAGE=ghcr.io/example/alert-hub-api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            ALERT_HUB_WEB_IMAGE=ghcr.io/example/alert-hub-web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            MONITORING_NETWORK=existing-monitoring \
+            docker compose \
+              -f .github/deploy/docker-compose.production.yml \
+              -f .github/deploy/docker-compose.production-monitoring.yml \
+              config --quiet
           docker compose -f deploy/docker-compose.ci-three-node.yaml config --quiet
       - name: Exercise online backup and restore
         run: sudo bash deploy/scripts/test-backup-tool.sh

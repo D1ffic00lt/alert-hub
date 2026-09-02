@@ -49,7 +49,7 @@ services:
     networks:
       edge:
         ipv4_address: ${ALERT_HUB_API_IP:?set the dedicated API address}
-      monitoring: {}
+      egress: {}
 
   alert-hub-web:
     container_name: alert-hub-web
@@ -102,6 +102,6 @@ networks:
   ingress:
     name: alert-hub-ingress
     driver: bridge
-  monitoring:
-    external: true
-    name: ${MONITORING_NETWORK:?set the existing monitoring network}
+  egress:
+    name: alert-hub-egress
+    driver: bridge

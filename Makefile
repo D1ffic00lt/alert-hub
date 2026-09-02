@@ -12,6 +12,7 @@ BASH_SCRIPTS := \
 	deploy/scripts/ci-image-matrix-smoke.sh \
 	deploy/scripts/ci-three-node-failure.sh \
 	deploy/scripts/host-readiness.sh \
+	.github/deploy/scripts/docker-provision-node.sh \
 	.github/deploy/scripts/docker-deploy-node.sh \
 	.github/deploy/scripts/docker-rollback-node.sh \
 	.github/deploy/scripts/docker-status-node.sh
@@ -140,8 +141,19 @@ operations-check:
 		ALERT_HUB_EDGE_SUBNET=10.253.251.0/29 \
 		ALERT_HUB_API_IP=10.253.251.2 ALERT_HUB_WEB_IP=10.253.251.3 \
 		ALERT_HUB_PEER_ADDRESS=10.253.252.2 \
-		MONITORING_NETWORK=existing-monitoring \
 		docker compose -f .github/deploy/docker-compose.production.yml config --quiet
+	ALERT_HUB_API_IMAGE=ghcr.io/example/alert-hub-api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+		ALERT_HUB_WEB_IMAGE=ghcr.io/example/alert-hub-web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+		ALERT_HUB_ENV_FILE="$(abspath .env.example)" \
+		ALERT_HUB_DATA_DIR=/tmp ALERT_HUB_SECRETS_DIR=/tmp \
+		ALERT_HUB_EDGE_SUBNET=10.253.251.0/29 \
+		ALERT_HUB_API_IP=10.253.251.2 ALERT_HUB_WEB_IP=10.253.251.3 \
+		ALERT_HUB_PEER_ADDRESS=10.253.252.2 \
+		MONITORING_NETWORK=existing-monitoring \
+		docker compose \
+			-f .github/deploy/docker-compose.production.yml \
+			-f .github/deploy/docker-compose.production-monitoring.yml \
+			config --quiet
 	ALERT_HUB_API_IMAGE=alert-hub-api:ci \
 		ALERT_HUB_CI_ROOT=/tmp/alert-hub-ci-compose-validation \
 		ALERT_HUB_CI_SUBNET=10.253.250.0/28 \

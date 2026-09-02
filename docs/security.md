@@ -57,8 +57,10 @@ Application logging uses a fixed structured-field allowlist, excludes request he
 - Public inbound: existing HTTPS `443` only; SSH `22` only if already required and restricted.
 - Host application: only the inventoried `127.0.0.1:<HOST_PORT>` from the
   root-owned node policy.
-- Peer: explicit literal RFC 1918/ULA WireGuard addresses, allowlisted peer CIDRs, never a
-  public hostname or public proxy.
+- Peer: explicit literal RFC 1918/ULA WireGuard addresses at the application
+  protocol boundary, allowlisted peer CIDRs, never a public hostname or public
+  proxy. The current production host wrapper binds only literal RFC1918 IPv4;
+  ULA-only host deployment needs a separately reviewed extension.
 - SQLite: filesystem only, no network listener.
 - Prometheus/Alertmanager/Blackbox: existing private/local exposure unchanged.
 - Runner: outbound HTTPS to GitHub; no inbound deployment port.
@@ -118,6 +120,20 @@ Compare both reported digests and compatibility labels with the node state after
 The dedicated runner account must not be in the Docker group. Root-owned node scripts validate the
 operation/version/component, hold a lock, validate paths and config, and invoke fixed commands.
 They never execute a script or Compose file from the Actions checkout.
+
+`docker-provision-node.sh` is an operator-only bootstrap boundary. It copies the
+reviewed Compose and node scripts from a fully root-controlled source tree,
+rejects Docker-group membership, generates a command-exact sudoers policy, and
+validates it with `visudo`. Sudo preserves only an explicit deployment-variable
+allowlist under `env_reset` and a system-only `secure_path`; broad `SETENV`,
+mutable-checkout provisioning, user-writable command paths, and
+environment-selected interpreters are not trusted. The runner cannot sudo the
+provisioner, and runner registration tokens are never an input to it.
+Provisioning and runtime operations share one root-owned lock. Boundary files
+are staged and rollback-restored as a set, and an established node policy may be
+refreshed only byte-for-byte; topology mutation is not hidden inside a script
+upgrade. Status accepts a missing state only on a genuinely empty node and
+rejects unexpected container networks, including stale monitoring access.
 
 Deployment state stores only the active runtime config's lowercase SHA-256, never an arbitrary
 snapshot path. The root engine derives a fixed content-addressed filename beneath the private
