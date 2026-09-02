@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alert-hub"
-version = "0.1.1"
+version = "0.1.2"
 description = "Self-hosted, eventually-consistent alert hub"
 license = "MIT"
 requires-python = ">=3.12,<3.14"
