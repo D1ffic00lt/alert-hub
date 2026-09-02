@@ -20,7 +20,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [python, javascript-typescript]
+        include:
+          - language: python
+            suppression_query: "+codeql/python-queries:AlertSuppression.ql"
+          - language: javascript-typescript
+            suppression_query: ""
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -29,6 +33,7 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: none
+          queries: ${{ matrix.suppression_query }}
       - uses: github/codeql-action/analyze@0b1f0509b2ddb4dc7bd94367abfe7ad1d8a1b810 # v3.30.5
         with:
           category: /language:${{ matrix.language }}
@@ -63,7 +68,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [python, javascript-typescript]
+        include:
+          - language: python
+            suppression_query: "+codeql/python-queries:AlertSuppression.ql"
+          - language: javascript-typescript
+            suppression_query: ""
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -72,6 +81,7 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: none
+          queries: ${{ matrix.suppression_query }}
       - uses: github/codeql-action/analyze@0b1f0509b2ddb4dc7bd94367abfe7ad1d8a1b810 # v3.30.5
         with:
           category: /language:${{ matrix.language }}

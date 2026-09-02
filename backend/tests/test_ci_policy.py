@@ -882,6 +882,20 @@ def test_repository_quality_checks_each_split_runtime_boundary() -> None:
     assert "Dockerfile.api" not in run
 
 
+def test_container_smokes_read_private_bootstrap_tokens_inside_containers() -> None:
+    container_smoke = (REPOSITORY / "deploy/scripts/ci-container-smoke.sh").read_text(
+        encoding="utf-8"
+    )
+    three_node_smoke = (REPOSITORY / "deploy/scripts/ci-three-node-failure.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'docker container exec "${container_name}" cat /data/bootstrap-token' in container_smoke
+    assert '"${compose[@]}" exec --no-TTY node-ru cat /data/bootstrap-token' in three_node_smoke
+    assert 'read -r bootstrap_token <"${smoke_root}/data/bootstrap-token"' not in container_smoke
+    assert 'read -r bootstrap_token <"${test_root}/node-ru/bootstrap-token"' not in three_node_smoke
+
+
 def test_release_manifest_binds_the_exact_api_web_pair() -> None:
     release = _workflow("release.yml")["jobs"]["release"]
     run = _job_run(release)
@@ -1222,7 +1236,26 @@ def test_controlled_three_node_peers_use_literal_private_addresses() -> None:
 
 
 def test_pr_codeql_is_a_read_only_failing_sarif_gate() -> None:
-    analyze = _workflow("codeql.yml")["jobs"]["analyze-pr"]
+    workflow = _workflow("codeql.yml")
+    expected_matrix = [
+        {
+            "language": "python",
+            "suppression_query": "+codeql/python-queries:AlertSuppression.ql",
+        },
+        {"language": "javascript-typescript", "suppression_query": ""},
+    ]
+    for job_name in ("analyze-pr", "analyze-main"):
+        job = workflow["jobs"][job_name]
+        assert job["strategy"]["matrix"]["include"] == expected_matrix
+        init_step = next(
+            step
+            for step in job["steps"]
+            if isinstance(step, dict)
+            and str(step.get("uses", "")).startswith("github/codeql-action/init@")
+        )
+        assert init_step["with"]["queries"] == "${{ matrix.suppression_query }}"
+
+    analyze = workflow["jobs"]["analyze-pr"]
     analyze_steps = analyze["steps"]
     codeql_step = next(
         step

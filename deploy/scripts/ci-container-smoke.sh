@@ -140,7 +140,11 @@ done
   printf 'Bootstrap token was not created in the durable data mount\n' >&2
   exit 1
 }
-IFS= read -r bootstrap_token <"${smoke_root}/data/bootstrap-token"
+# The runtime deliberately creates this secret as 0600 under UID 10001. Read it
+# as that container user: a Linux host runner must not be able to read the bind-
+# mounted file merely because Docker Desktop makes that work on macOS.
+bootstrap_token=$(docker container exec "${container_name}" cat /data/bootstrap-token)
+[[ -n ${bootstrap_token} ]]
 smoke_password=$(openssl rand -base64 24)
 BOOTSTRAP_TOKEN=${bootstrap_token} SMOKE_PASSWORD=${smoke_password} \
   "${smoke_python}" -c 'import json, os; print(json.dumps({"bootstrap_token": os.environ["BOOTSTRAP_TOKEN"], "username": "ci-admin", "password": os.environ["SMOKE_PASSWORD"], "device_name": "container-smoke"}))' \

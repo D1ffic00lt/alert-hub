@@ -4,11 +4,13 @@ import { describe, expect, it } from "vitest";
 describe("static SPA security contract", () => {
   it("loads runtime configuration and application code only from external scripts", () => {
     const html = readFileSync("index.html", "utf8");
-    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
-    expect(scripts).toHaveLength(2);
-    for (const [, attributes, body] of scripts) {
-      expect(attributes).toMatch(/\bsrc="\/[^"]+"/);
-      expect(body.trim()).toBe("");
+    const approvedScripts = [
+      '<script vite-ignore src="/runtime-config.js"></script>',
+      '<script type="module" src="/app/main.tsx"></script>',
+    ];
+    expect(html.toLowerCase().split("<script")).toHaveLength(approvedScripts.length + 1);
+    for (const script of approvedScripts) {
+      expect(html).toContain(script);
     }
   });
 

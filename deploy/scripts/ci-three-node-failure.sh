@@ -612,7 +612,10 @@ for ((attempt = 1; attempt <= 30; attempt += 1)); do
   sleep 1
 done
 [[ -s ${test_root}/node-ru/bootstrap-token ]]
-IFS= read -r bootstrap_token <"${test_root}/node-ru/bootstrap-token"
+# Keep the generated 0600 secret private to the non-root container UID. Linux
+# bind mounts preserve that ownership, so consume it through the owning node.
+bootstrap_token=$("${compose[@]}" exec --no-TTY node-ru cat /data/bootstrap-token)
+[[ -n ${bootstrap_token} ]]
 admin_password=$(openssl rand -base64 24)
 BOOTSTRAP_TOKEN=${bootstrap_token} ADMIN_PASSWORD=${admin_password} \
   "${smoke_python}" -c 'import json, os; print(json.dumps({"bootstrap_token": os.environ["BOOTSTRAP_TOKEN"], "username": "ci-admin", "password": os.environ["ADMIN_PASSWORD"], "device_name": "controlled-three-node-ci"}))' \
