@@ -10,7 +10,7 @@ on:
         description: Version as vX.Y.Z or X.Y.Z
         type: string
         required: false
-        default: v0.1.5
+        default: v0.0.0
 
 permissions:
   contents: write

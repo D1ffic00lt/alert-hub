@@ -1157,12 +1157,7 @@ def test_manual_release_reserves_tag_and_publishes_assets_idempotently() -> None
     dispatch_inputs = triggers["workflow_dispatch"]["inputs"]
     assert set(dispatch_inputs) == {"version"}
     assert dispatch_inputs["version"]["required"] == "false"
-    backend_version = re.search(
-        r'(?m)^version = "([^"]+)"$',
-        (REPOSITORY / "backend" / "pyproject.toml").read_text(encoding="utf-8"),
-    )
-    assert backend_version is not None
-    assert dispatch_inputs["version"]["default"] == f"v{backend_version.group(1)}"
+    assert dispatch_inputs["version"]["default"] == "v0.0.0"
 
     release = _workflow("release.yml")["jobs"]["release"]
     steps = release["steps"]
