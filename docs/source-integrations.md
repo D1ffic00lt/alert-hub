@@ -69,6 +69,26 @@ receivers:
             credentials: SOURCE_TOKEN
 ```
 
+For rule trees that emit both a global outage and per-probe/per-endpoint alerts,
+inhibit the child alerts while the global alert is active. This preserves the
+detailed series in Prometheus while preventing one node failure from producing
+one notification per probe and port:
+
+```yaml
+inhibit_rules:
+  - source_matchers:
+      - 'alertname="VlessServerDownGlobally"'
+    target_matchers:
+      - 'alertname=~"VlessEndpointUnreachable|VlessServerUnreachableFromSource"'
+    equal:
+      - target_server
+```
+
+Keep `send_resolved: true` when Alert Hub is the incident state owner. Turning it
+off hides recovery from Alert Hub rather than merely silencing recovery pushes.
+Use inhibition at Alertmanager and notification routing in Alert Hub to control
+fan-out without leaving incidents permanently open.
+
 Route only the intended alert tree, then validate before reload:
 
 ```bash

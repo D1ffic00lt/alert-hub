@@ -76,6 +76,14 @@ def _workflow(name: str) -> dict[str, Any]:
     return document
 
 
+def test_alertmanager_integration_documents_outage_inhibition() -> None:
+    guide = (REPOSITORY / "docs" / "source-integrations.md").read_text(encoding="utf-8")
+
+    assert "VlessServerDownGlobally" in guide
+    assert "VlessEndpointUnreachable|VlessServerUnreachableFromSource" in guide
+    assert "Keep `send_resolved: true`" in guide
+
+
 def _compose(path: str) -> dict[str, Any]:
     document = yaml.safe_load((REPOSITORY / path).read_text(encoding="utf-8"))
     assert isinstance(document, dict)
