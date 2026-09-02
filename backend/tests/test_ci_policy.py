@@ -1240,7 +1240,7 @@ def test_pr_codeql_is_a_read_only_failing_sarif_gate() -> None:
     expected_matrix = [
         {
             "language": "python",
-            "suppression_query": "+codeql/python-queries:AlertSuppression.ql",
+            "suppression_query": "+codeql/python-queries@1.6.5:AlertSuppression.ql",
         },
         {"language": "javascript-typescript", "suppression_query": ""},
     ]

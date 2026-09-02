@@ -22,7 +22,7 @@ jobs:
       matrix:
         include:
           - language: python
-            suppression_query: "+codeql/python-queries:AlertSuppression.ql"
+            suppression_query: "+codeql/python-queries@1.6.5:AlertSuppression.ql"
           - language: javascript-typescript
             suppression_query: ""
     steps:
@@ -70,7 +70,7 @@ jobs:
       matrix:
         include:
           - language: python
-            suppression_query: "+codeql/python-queries:AlertSuppression.ql"
+            suppression_query: "+codeql/python-queries@1.6.5:AlertSuppression.ql"
           - language: javascript-typescript
             suppression_query: ""
     steps:
