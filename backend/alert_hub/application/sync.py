@@ -874,5 +874,8 @@ def apply_cluster_events(
         key=lambda item: (priorities.get(item.entity_type, 10), *_event_order(item)),
     ):
         _project_event(db, event, settings)
-    db.flush()
+        # A later event in this page may project the same entity again.  Flush
+        # each projection boundary so primary-key lookups resolve rows added by
+        # the previous event while keeping the whole page in one transaction.
+        db.flush()
     return ApplyResult(applied=len(applied_events), duplicates=duplicates)

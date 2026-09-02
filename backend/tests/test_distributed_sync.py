@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -23,6 +23,8 @@ from alert_hub.infrastructure.db.models import (
     IncidentEvent,
     Node,
     NotificationChannel,
+    NotificationRoute,
+    PrometheusDatasource,
     PushSubscription,
     Session,
     Source,
@@ -240,6 +242,154 @@ def test_user_and_session_in_same_sync_page_are_projected_once(tmp_path: Path) -
         with app_b.state.session_factory() as db:
             assert int(db.scalar(select(func.count(User.id))) or 0) == 1
             assert int(db.scalar(select(func.count(Session.id))) or 0) == 1
+
+
+def test_repeated_state_upserts_in_same_sync_page_project_once(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, "node-page-target")
+    app = create_app(settings)
+    occurred_at = datetime(2026, 9, 2, 15, 25, tzinfo=UTC)
+    node_id = "ru"
+    base_payload: dict[str, object] = {
+        "name": "ru",
+        "region": "ru",
+        "public_api_url": "https://alerts.example.test",
+        "private_peer_url": "https://peer-ru.example.test",
+        "enabled_roles": ["ingest", "notify", "sync"],
+        "created_at": occurred_at.isoformat(),
+    }
+    incoming = [
+        IncomingClusterEvent(
+            event_id="node-upsert-v0.1.1",
+            origin_node_id=node_id,
+            origin_seq=1,
+            entity_type="node",
+            entity_id=node_id,
+            operation="upsert",
+            occurred_at=occurred_at,
+            payload={**base_payload, "software_version": "v0.1.1"},
+        ),
+        IncomingClusterEvent(
+            event_id="node-upsert-v0.1.2",
+            origin_node_id=node_id,
+            origin_seq=2,
+            entity_type="node",
+            entity_id=node_id,
+            operation="upsert",
+            occurred_at=occurred_at + timedelta(minutes=43),
+            payload={**base_payload, "software_version": "v0.1.2"},
+        ),
+        IncomingClusterEvent(
+            event_id="route-upsert-old",
+            origin_node_id=node_id,
+            origin_seq=3,
+            entity_type="notification_route",
+            entity_id="primary-route",
+            operation="upsert",
+            occurred_at=occurred_at + timedelta(minutes=44),
+            payload={"name": "Old route", "priority": 1},
+        ),
+        IncomingClusterEvent(
+            event_id="route-upsert-latest",
+            origin_node_id=node_id,
+            origin_seq=4,
+            entity_type="notification_route",
+            entity_id="primary-route",
+            operation="upsert",
+            occurred_at=occurred_at + timedelta(minutes=45),
+            payload={"name": "Latest route", "priority": 2},
+        ),
+        IncomingClusterEvent(
+            event_id="datasource-upsert-old",
+            origin_node_id=node_id,
+            origin_seq=5,
+            entity_type="prometheus_datasource",
+            entity_id="primary-prometheus",
+            operation="upsert",
+            occurred_at=occurred_at + timedelta(minutes=46),
+            payload={"name": "Old Prometheus", "url": "https://old.example.test"},
+        ),
+        IncomingClusterEvent(
+            event_id="datasource-upsert-latest",
+            origin_node_id=node_id,
+            origin_seq=6,
+            entity_type="prometheus_datasource",
+            entity_id="primary-prometheus",
+            operation="upsert",
+            occurred_at=occurred_at + timedelta(minutes=47),
+            payload={"name": "Latest Prometheus", "url": "https://new.example.test"},
+        ),
+    ]
+
+    with TestClient(app, base_url="http://testserver"):
+        with app.state.session_factory.begin() as db:
+            result = apply_cluster_events(db, incoming, settings)
+            assert result.applied == 6
+            assert result.duplicates == 0
+
+        with app.state.session_factory.begin() as db:
+            retry = apply_cluster_events(db, incoming, settings)
+            assert retry.applied == 0
+            assert retry.duplicates == 6
+
+        with app.state.session_factory() as db:
+            nodes = db.scalars(select(Node).where(Node.id == node_id)).all()
+            assert len(nodes) == 1
+            assert nodes[0].software_version == "v0.1.2"
+            assert nodes[0].last_seen_at == occurred_at + timedelta(minutes=43)
+            routes = db.scalars(
+                select(NotificationRoute).where(NotificationRoute.id == "primary-route")
+            ).all()
+            assert len(routes) == 1
+            assert routes[0].name == "Latest route"
+            assert routes[0].priority == 2
+            datasources = db.scalars(
+                select(PrometheusDatasource).where(PrometheusDatasource.id == "primary-prometheus")
+            ).all()
+            assert len(datasources) == 1
+            assert datasources[0].name == "Latest Prometheus"
+            assert datasources[0].url == "https://new.example.test"
+
+
+def test_same_page_bootstrap_conflict_records_one_audit_entry(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, "bootstrap-page-target")
+    app = create_app(settings)
+    occurred_at = datetime(2026, 9, 2, 16, tzinfo=UTC)
+    incoming = [
+        IncomingClusterEvent(
+            event_id=f"bootstrap-{sequence}",
+            origin_node_id="bootstrap-origin",
+            origin_seq=sequence,
+            entity_type="user",
+            entity_id=f"admin-{sequence}",
+            operation="bootstrap",
+            occurred_at=occurred_at + timedelta(seconds=sequence),
+            payload={
+                "username": f"admin-{sequence}",
+                "password_hash": f"opaque-password-hash-{sequence}",
+                "is_admin": True,
+                "created_at": (occurred_at + timedelta(seconds=sequence)).isoformat(),
+            },
+        )
+        for sequence in (1, 2)
+    ]
+
+    with TestClient(app, base_url="http://testserver"):
+        with app.state.session_factory.begin() as db:
+            result = apply_cluster_events(db, incoming, settings)
+            assert result.applied == 2
+            assert result.duplicates == 0
+
+        with app.state.session_factory.begin() as db:
+            retry = apply_cluster_events(db, incoming, settings)
+            assert retry.applied == 0
+            assert retry.duplicates == 2
+
+        with app.state.session_factory() as db:
+            conflicts = db.scalars(
+                select(AuditLog).where(AuditLog.action == "bootstrap_conflict_detected")
+            ).all()
+            assert len(conflicts) == 1
+            assert conflicts[0].details_json["user_ids"] == ["admin-1", "admin-2"]
 
 
 def test_partitioned_identical_alerts_converge_to_one_incident_and_event(
