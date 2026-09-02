@@ -169,6 +169,9 @@ class PushSubscription(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sessions.id", ondelete="SET NULL"), index=True
+    )
     device_name: Mapped[str] = mapped_column(String(255))
     endpoint: Mapped[bytes] = mapped_column(LargeBinary)
     p256dh: Mapped[bytes] = mapped_column(LargeBinary)

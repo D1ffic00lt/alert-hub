@@ -8,6 +8,7 @@ BASH_SCRIPTS := \
 	deploy/scripts/ci-migrations.sh \
 	deploy/scripts/check-no-secrets.sh \
 	deploy/scripts/test-backup-tool.sh \
+	deploy/scripts/test-deploy-vapid-preflight.sh \
 	deploy/scripts/ci-container-smoke.sh \
 	deploy/scripts/ci-image-matrix-smoke.sh \
 	deploy/scripts/ci-three-node-failure.sh \
@@ -163,6 +164,7 @@ operations-check:
 		ALERT_HUB_CI_DE_IP=10.253.250.4 \
 		ALERT_HUB_CI_SINK_IP=10.253.250.5 \
 		docker compose -f deploy/docker-compose.ci-three-node.yaml config --quiet
+	bash deploy/scripts/test-deploy-vapid-preflight.sh
 	sudo bash deploy/scripts/test-backup-tool.sh
 
 container-smoke:

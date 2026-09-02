@@ -2,26 +2,37 @@ from __future__ import annotations
 
 import base64
 import binascii
+import re
 from typing import Any
 
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from alert_hub.api.dependencies import current_user, get_db, get_envelope_cipher, get_settings
-from alert_hub.application.auth import add_audit
+from alert_hub.api.dependencies import (
+    current_session,
+    current_user,
+    get_db,
+    get_envelope_cipher,
+    get_settings,
+)
+from alert_hub.application.auth import add_audit, disable_push_subscription
 from alert_hub.application.incidents import append_cluster_event
 from alert_hub.application.notifications import push_subscription_payload
 from alert_hub.infrastructure.db.base import new_id, utc_now
 from alert_hub.infrastructure.db.models import PushSubscription, User
+from alert_hub.infrastructure.db.models import Session as AuthSession
 from alert_hub.infrastructure.encryption import EncryptionError, EnvelopeCipher
+from alert_hub.infrastructure.notifications.secrets import decrypt_push_subscription
 from alert_hub.infrastructure.url_safety import UnsafeURL, validate_webhook_url
 from alert_hub.infrastructure.vapid import VapidConfigurationError, vapid_public_key
 from alert_hub.security import constant_time_equal
 from alert_hub.settings import Settings
 
 router = APIRouter(prefix="/api/v1/push", tags=["push"])
+_BASE64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class PushKeys(BaseModel):
@@ -37,38 +48,41 @@ class PushSubscriptionCreate(BaseModel):
     expirationTime: float | None = None
 
 
-def _decode_key(value: str, name: str, minimum: int, maximum: int) -> None:
+def _decode_key(value: str, name: str, expected_length: int) -> bytes:
+    if _BASE64URL_PATTERN.fullmatch(value) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{name} must be canonical unpadded base64url",
+        )
     try:
         padding = "=" * (-len(value) % 4)
-        decoded = base64.urlsafe_b64decode(value + padding)
+        decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
     except (ValueError, binascii.Error) as exc:
         raise HTTPException(status_code=422, detail=f"{name} must be base64url encoded") from exc
-    if not minimum <= len(decoded) <= maximum:
+    canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+    if canonical != value:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{name} must be canonical unpadded base64url",
+        )
+    if len(decoded) != expected_length:
         raise HTTPException(status_code=422, detail=f"{name} has an invalid decoded length")
+    return decoded
 
 
 def _context(subscription_id: str, field: str) -> str:
     return f"push_subscription:{subscription_id}:{field}"
 
 
-def _decrypt_endpoint(subscription: PushSubscription, cipher: EnvelopeCipher) -> str | None:
-    try:
-        return cipher.decrypt(
-            subscription.endpoint,
-            context=_context(subscription.id, "endpoint"),
-        ).decode()
-    except (EncryptionError, UnicodeDecodeError):
-        return None
-
-
 def _response(subscription: PushSubscription) -> dict[str, Any]:
     return {
         "id": subscription.id,
+        "session_id": subscription.session_id,
         "device_name": subscription.device_name,
         "user_agent": subscription.user_agent,
         "created_at": subscription.created_at,
         "last_success_at": subscription.last_success_at,
-        "enabled": subscription.disabled_at is None,
+        "enabled": subscription.disabled_at is None and subscription.session_id is not None,
         "disabled_at": subscription.disabled_at,
     }
 
@@ -106,29 +120,64 @@ def create_push_subscription(
     db: Session = Depends(get_db),
     cipher: EnvelopeCipher = Depends(get_envelope_cipher),
     settings: Settings = Depends(get_settings),
-    user: User = Depends(current_user),
+    auth_session: AuthSession = Depends(current_session),
 ) -> dict[str, Any]:
+    user = auth_session.user
     try:
         endpoint = validate_webhook_url(payload.endpoint, allow_http=False, allow_private=False)
     except UnsafeURL as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    _decode_key(payload.keys.p256dh, "p256dh", 32, 128)
-    _decode_key(payload.keys.auth, "auth", 8, 64)
+    p256dh = _decode_key(payload.keys.p256dh, "p256dh", 65)
+    try:
+        ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), p256dh)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="p256dh must be a valid uncompressed P-256 public key",
+        ) from exc
+    _decode_key(payload.keys.auth, "auth", 16)
 
     subscription = None
+    stale_matches: list[PushSubscription] = []
     candidates = db.scalars(
-        select(PushSubscription).where(PushSubscription.user_id == user.id)
+        select(PushSubscription)
+        .where(PushSubscription.user_id == user.id)
+        .order_by(PushSubscription.created_at.desc(), PushSubscription.id)
     ).all()
     for candidate in candidates:
-        current_endpoint = _decrypt_endpoint(candidate, cipher)
-        if current_endpoint is not None and constant_time_equal(current_endpoint, endpoint):
+        try:
+            current_endpoint, current_p256dh, current_auth = decrypt_push_subscription(
+                candidate,
+                cipher,
+            )
+        except EncryptionError:
+            continue
+        if not constant_time_equal(current_endpoint, endpoint):
+            continue
+        exact_active_binding = (
+            candidate.disabled_at is None
+            and candidate.session_id == auth_session.id
+            and constant_time_equal(current_p256dh, payload.keys.p256dh)
+            and constant_time_equal(current_auth, payload.keys.auth)
+        )
+        if exact_active_binding and subscription is None:
             subscription = candidate
-            break
+        elif candidate.disabled_at is None:
+            stale_matches.append(candidate)
+    replaced_at = utc_now()
+    for candidate in stale_matches:
+        disable_push_subscription(
+            db,
+            candidate,
+            settings,
+            disabled_at=replaced_at,
+        )
     created = subscription is None
     if subscription is None:
         subscription = PushSubscription(
             id=new_id(),
             user_id=user.id,
+            session_id=auth_session.id,
             device_name=payload.device_name.strip(),
             endpoint=b"",
             p256dh=b"",
@@ -136,6 +185,7 @@ def create_push_subscription(
             user_agent=payload.user_agent,
         )
         db.add(subscription)
+    subscription.session_id = auth_session.id
     subscription.device_name = payload.device_name.strip()
     subscription.endpoint = cipher.encrypt(
         endpoint.encode(), context=_context(subscription.id, "endpoint")

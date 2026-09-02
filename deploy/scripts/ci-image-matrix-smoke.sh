@@ -167,12 +167,21 @@ curl --fail --silent --show-error "${base_url}/runtime-config.js" \
   >"${smoke_root}/runtime-config.js"
 curl --fail --silent --show-error "${base_url}/manifest.webmanifest" \
   >"${smoke_root}/manifest.json"
+curl --fail --silent --show-error --dump-header "${smoke_root}/sw.headers" \
+  --output "${smoke_root}/sw.js" "${base_url}/sw.js"
 curl --fail --silent --show-error "${base_url}/api/openapi.json" \
   >"${smoke_root}/openapi.json"
 grep -F 'runtime-config.js' "${smoke_root}/index.html" >/dev/null
 grep -F 'Alert Hub Matrix' "${smoke_root}/runtime-config.js" >/dev/null
 grep -F '"name":"Alert Hub Matrix"' "${smoke_root}/manifest.json" >/dev/null
 grep -F '"/api/v1/incidents"' "${smoke_root}/openapi.json" >/dev/null
+# /sw.js is rooted at the origin, so its default maximum scope is already '/'.
+# The public edge may add this header, while the image must not emit a second
+# value that Fetch combines into the invalid `/, /` form.
+if grep -Fiq 'Service-Worker-Allowed:' "${smoke_root}/sw.headers"; then
+  printf 'Web image unexpectedly emitted Service-Worker-Allowed\n' >&2
+  exit 1
+fi
 
 # Stopping only API must withdraw every server-origin UI response while the web
 # container itself stays available to recover without an image restart.

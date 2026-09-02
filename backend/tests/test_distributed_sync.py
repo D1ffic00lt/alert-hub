@@ -8,9 +8,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
+from alert_hub.application.notifications import (
+    DeliveryResult,
+    DeliveryTarget,
+    NotificationMessage,
+    ProviderRegistry,
+)
 from alert_hub.application.sync import (
     IncomingClusterEvent,
     advance_peer_cursor,
@@ -37,6 +45,16 @@ from alert_hub.workers import sync as sync_worker_module
 from alert_hub.workers.sync import PeerSyncWorker
 
 
+class _SuccessProvider:
+    async def send(
+        self,
+        message: NotificationMessage,
+        target: DeliveryTarget,
+    ) -> DeliveryResult:
+        del message, target
+        return DeliveryResult("succeeded", "http_201")
+
+
 def _settings(tmp_path: Path, node_id: str) -> Settings:
     return Settings(
         environment="test",
@@ -54,6 +72,15 @@ def _settings(tmp_path: Path, node_id: str) -> Settings:
         sync_page_size=2,
         sync_interval_seconds=0.1,
     )
+
+
+def _browser_p256dh() -> str:
+    public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
+    encoded = public_key.public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode()
 
 
 def _bootstrap(client: TestClient, node_id: str) -> dict[str, str]:
@@ -154,8 +181,8 @@ def test_empty_cursor_bootstraps_new_node_and_replicates_sensitive_state(
             json={
                 "endpoint": "https://1.1.1.1/push/replicated-device",
                 "keys": {
-                    "p256dh": base64.urlsafe_b64encode(os.urandom(65)).decode(),
-                    "auth": base64.urlsafe_b64encode(os.urandom(16)).decode(),
+                    "p256dh": _browser_p256dh(),
+                    "auth": base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode(),
                 },
                 "device_name": "node-a-browser",
             },
@@ -188,6 +215,10 @@ def test_empty_cursor_bootstraps_new_node_and_replicates_sensitive_state(
             assert int(db.scalar(select(func.count(NotificationChannel.id))) or 0) == 1
             assert int(db.scalar(select(func.count(PushSubscription.id))) or 0) == 1
             assert int(db.scalar(select(func.count(Node.id))) or 0) == 2
+            replicated_push = db.get(PushSubscription, push_response.json()["id"])
+            assert replicated_push is not None
+            assert replicated_push.session_id == push_response.json()["session_id"]
+            assert db.get(Session, replicated_push.session_id) is not None
             serialized_history = "\n".join(
                 str(event.payload_json) for event in db.scalars(select(ClusterEvent)).all()
             )
@@ -216,6 +247,328 @@ def test_empty_cursor_bootstraps_new_node_and_replicates_sensitive_state(
             assert replicated_source is not None and replicated_source.deleted_at is not None
             assert replicated_channel is not None and replicated_channel.deleted_at is not None
             assert replicated_push is not None and replicated_push.disabled_at is not None
+
+
+def test_successful_web_push_channel_test_replicates_last_success_at(
+    tmp_path: Path,
+) -> None:
+    settings_a = _settings(tmp_path, "push-success-a")
+    settings_b = _settings(tmp_path, "push-success-b")
+    app_a = create_app(settings_a)
+    app_b = create_app(settings_b)
+
+    with (
+        TestClient(app_a, base_url="http://testserver") as client_a,
+        TestClient(app_b, base_url="http://testserver"),
+    ):
+        auth = _bootstrap(client_a, "push-success-a")
+        channel = client_a.post(
+            "/api/v1/channels",
+            headers=auth,
+            json={"name": "Browser push", "kind": "web_push", "config": {}},
+        )
+        assert channel.status_code == 201, channel.text
+        subscription = client_a.post(
+            "/api/v1/push/subscriptions",
+            headers=auth,
+            json={
+                "endpoint": "https://1.1.1.1/push/successful-replication",
+                "keys": {
+                    "p256dh": _browser_p256dh(),
+                    "auth": base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode(),
+                },
+                "device_name": "replicated browser",
+            },
+        )
+        assert subscription.status_code == 201, subscription.text
+        subscription_id = subscription.json()["id"]
+        app_a.state.notification_providers = ProviderRegistry({"web_push": _SuccessProvider()})
+
+        tested = client_a.post(f"/api/v1/channels/{channel.json()['id']}/test", headers=auth)
+        assert tested.status_code == 200, tested.text
+        assert tested.json()["status"] == "succeeded"
+        with app_a.state.session_factory() as db:
+            local = db.get(PushSubscription, subscription_id)
+            assert local is not None and local.last_success_at is not None
+            expected = local.last_success_at
+            success_event = db.scalar(
+                select(ClusterEvent).where(
+                    ClusterEvent.entity_type == "push_subscription",
+                    ClusterEvent.entity_id == subscription_id,
+                    ClusterEvent.operation == "delivery_success",
+                )
+            )
+            assert success_event is not None
+            assert set(success_event.payload_json) == {"schema_version", "last_success_at"}
+
+        worker = _pull(app_b, settings_b, app_a)
+        assert worker.states["http://configured-peer"].last_error is None
+        with app_b.state.session_factory() as db:
+            replicated = db.get(PushSubscription, subscription_id)
+            assert replicated is not None
+            assert replicated.last_success_at == expected
+
+
+def test_push_tombstone_is_remove_wins_over_late_upserts_and_success_evidence(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, "push-remove-wins")
+    app = create_app(settings)
+    with TestClient(app, base_url="http://testserver") as client:
+        auth = _bootstrap(client, "push-remove-wins")
+        created = client.post(
+            "/api/v1/push/subscriptions",
+            headers=auth,
+            json={
+                "endpoint": "https://1.1.1.1/push/remove-wins",
+                "keys": {
+                    "p256dh": _browser_p256dh(),
+                    "auth": base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode(),
+                },
+                "device_name": "remove-wins browser",
+            },
+        )
+        assert created.status_code == 201, created.text
+        subscription_id = created.json()["id"]
+        session_id = created.json()["session_id"]
+        with app.state.session_factory() as db:
+            initial = db.scalar(
+                select(ClusterEvent).where(
+                    ClusterEvent.entity_type == "push_subscription",
+                    ClusterEvent.entity_id == subscription_id,
+                    ClusterEvent.operation == "upsert",
+                )
+            )
+            assert initial is not None
+            bound_payload = dict(initial.payload_json)
+
+        removed = client.delete(
+            f"/api/v1/push/subscriptions/{subscription_id}",
+            headers=auth,
+        )
+        assert removed.status_code == 204, removed.text
+
+        late_at = datetime(2030, 1, 1, tzinfo=UTC)
+        legacy_payload = dict(bound_payload)
+        legacy_payload["session_id"] = None
+        legacy_payload["disabled_at"] = None
+        bound_payload["disabled_at"] = None
+        incoming = [
+            IncomingClusterEvent(
+                event_id="late-bound-upsert",
+                origin_node_id="late-origin",
+                origin_seq=1,
+                entity_type="push_subscription",
+                entity_id=subscription_id,
+                operation="upsert",
+                occurred_at=late_at,
+                payload=bound_payload,
+            ),
+            IncomingClusterEvent(
+                event_id="late-legacy-upsert",
+                origin_node_id="late-origin",
+                origin_seq=2,
+                entity_type="push_subscription",
+                entity_id=subscription_id,
+                operation="upsert",
+                occurred_at=late_at + timedelta(seconds=1),
+                payload=legacy_payload,
+            ),
+            IncomingClusterEvent(
+                event_id="late-delivery-success",
+                origin_node_id="late-origin",
+                origin_seq=3,
+                entity_type="push_subscription",
+                entity_id=subscription_id,
+                operation="delivery_success",
+                occurred_at=late_at + timedelta(seconds=2),
+                payload={
+                    "schema_version": 1,
+                    "last_success_at": (late_at + timedelta(seconds=2)).isoformat(),
+                },
+            ),
+        ]
+        with app.state.session_factory.begin() as db:
+            result = apply_cluster_events(db, incoming, settings)
+            assert result.applied == 3
+
+        with app.state.session_factory() as db:
+            subscription = db.get(PushSubscription, subscription_id)
+            assert subscription is not None
+            assert subscription.session_id == session_id
+            assert subscription.disabled_at is not None
+            assert subscription.last_success_at == late_at + timedelta(seconds=2)
+
+
+def test_session_revocation_is_remove_wins_over_a_late_rotation(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, "session-remove-wins")
+    app = create_app(settings)
+    with TestClient(app, base_url="http://testserver") as client:
+        auth = _bootstrap(client, "session-remove-wins")
+        with app.state.session_factory() as db:
+            auth_session = db.scalar(select(Session))
+            assert auth_session is not None
+            session_id = auth_session.id
+            late_payload = {
+                "user_id": auth_session.user_id,
+                "refresh_token_hash": "b" * 64,
+                "device_name": auth_session.device_name,
+                "created_at": auth_session.created_at.isoformat(),
+                "last_used_at": datetime(2030, 1, 1, tzinfo=UTC).isoformat(),
+                "expires_at": datetime(2030, 1, 2, tzinfo=UTC).isoformat(),
+                "absolute_expires_at": datetime(2030, 2, 1, tzinfo=UTC).isoformat(),
+                "revoked_at": None,
+            }
+
+        revoked = client.delete(f"/api/v1/devices/{session_id}/sessions", headers=auth)
+        assert revoked.status_code == 204, revoked.text
+        late_rotation = IncomingClusterEvent(
+            event_id="rotation-after-revocation",
+            origin_node_id="late-origin",
+            origin_seq=1,
+            entity_type="session",
+            entity_id=session_id,
+            operation="rotate",
+            occurred_at=datetime(2030, 1, 1, tzinfo=UTC),
+            payload=late_payload,
+        )
+        with app.state.session_factory.begin() as db:
+            result = apply_cluster_events(db, [late_rotation], settings)
+            assert result.applied == 1
+        with app.state.session_factory() as db:
+            projected = db.get(Session, session_id)
+            assert projected is not None
+            assert projected.revoked_at is not None
+
+
+def test_session_revocation_replicates_linked_push_tombstone(tmp_path: Path) -> None:
+    settings_a = _settings(tmp_path, "push-revoke-a")
+    settings_b = _settings(tmp_path, "push-revoke-b")
+    app_a = create_app(settings_a)
+    app_b = create_app(settings_b)
+
+    with (
+        TestClient(app_a, base_url="http://testserver") as client_a,
+        TestClient(app_b, base_url="http://testserver"),
+    ):
+        auth = _bootstrap(client_a, "push-revoke-a")
+        push = client_a.post(
+            "/api/v1/push/subscriptions",
+            headers=auth,
+            json={
+                "endpoint": "https://1.1.1.1/push/revoked-session",
+                "keys": {
+                    "p256dh": _browser_p256dh(),
+                    "auth": base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode(),
+                },
+                "device_name": "same visible name",
+            },
+        )
+        assert push.status_code == 201, push.text
+        first_pull = _pull(app_b, settings_b, app_a)
+        assert first_pull.states["http://configured-peer"].last_error is None
+
+        revoker_login = client_a.post(
+            "/api/v1/auth/login",
+            json={
+                "username": "admin",
+                "password": "a-strong-test-password",
+                "device_name": "same visible name",
+            },
+        )
+        assert revoker_login.status_code == 200, revoker_login.text
+        revoker_body = revoker_login.json()
+        revoked = client_a.delete(
+            f"/api/v1/devices/{push.json()['session_id']}/sessions",
+            headers={"Authorization": f"Bearer {revoker_body['access_token']}"},
+        )
+        assert revoked.status_code == 204, revoked.text
+
+        second_pull = _pull(app_b, settings_b, app_a)
+        assert second_pull.states["http://configured-peer"].last_error is None
+        with app_b.state.session_factory() as db:
+            replicated_session = db.get(Session, push.json()["session_id"])
+            replicated_push = db.get(PushSubscription, push.json()["id"])
+            assert replicated_session is not None and replicated_session.revoked_at is not None
+            assert replicated_push is not None and replicated_push.disabled_at is not None
+            assert replicated_push.session_id == replicated_session.id
+            tombstones = db.scalars(
+                select(ClusterEvent).where(
+                    ClusterEvent.entity_type == "push_subscription",
+                    ClusterEvent.entity_id == replicated_push.id,
+                    ClusterEvent.operation == "tombstone",
+                )
+            ).all()
+            assert len(tombstones) == 1
+            assert tombstones[0].payload_json["session_id"] == replicated_session.id
+
+
+def test_push_projection_binds_after_out_of_order_session_arrival(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, "push-order-target")
+    app = create_app(settings)
+    with TestClient(app, base_url="http://testserver") as client:
+        _bootstrap(client, "push-order-target")
+
+        with app.state.session_factory() as db:
+            user = db.scalar(select(User))
+            assert user is not None
+            user_id = user.id
+
+        occurred_at = datetime(2026, 9, 2, 15, 25, tzinfo=UTC)
+        subscription_id = "out-of-order-subscription"
+        session_id = "out-of-order-session"
+        push_event = IncomingClusterEvent(
+            event_id="push-before-session",
+            origin_node_id="remote-origin",
+            origin_seq=1,
+            entity_type="push_subscription",
+            entity_id=subscription_id,
+            operation="upsert",
+            occurred_at=occurred_at,
+            payload={
+                "user_id": user_id,
+                "session_id": session_id,
+                "device_name": "remote browser",
+                "endpoint": base64.b64encode(b"encrypted endpoint").decode(),
+                "p256dh": base64.b64encode(b"encrypted p256dh").decode(),
+                "auth": base64.b64encode(b"encrypted auth").decode(),
+                "created_at": occurred_at.isoformat(),
+                "disabled_at": None,
+            },
+        )
+        with app.state.session_factory.begin() as db:
+            result = apply_cluster_events(db, [push_event], settings)
+            assert result.applied == 1
+        with app.state.session_factory() as db:
+            subscription = db.get(PushSubscription, subscription_id)
+            assert subscription is None
+
+        session_event = IncomingClusterEvent(
+            event_id="session-after-push",
+            origin_node_id="remote-origin",
+            origin_seq=2,
+            entity_type="session",
+            entity_id=session_id,
+            operation="issued",
+            occurred_at=occurred_at - timedelta(seconds=1),
+            payload={
+                "user_id": user_id,
+                "refresh_token_hash": "a" * 64,
+                "device_name": "remote browser",
+                "created_at": occurred_at.isoformat(),
+                "last_used_at": occurred_at.isoformat(),
+                "expires_at": (occurred_at + timedelta(days=1)).isoformat(),
+                "absolute_expires_at": (occurred_at + timedelta(days=7)).isoformat(),
+                "revoked_at": None,
+            },
+        )
+        with app.state.session_factory.begin() as db:
+            result = apply_cluster_events(db, [session_event], settings)
+            assert result.applied == 1
+        with app.state.session_factory() as db:
+            subscription = db.get(PushSubscription, subscription_id)
+            assert subscription is not None
+            assert subscription.session_id == session_id
 
 
 def test_user_and_session_in_same_sync_page_are_projected_once(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ const SHELL_CACHE = "alert-hub-v3-shell";
 // does not erase a verified session partition needed for a cold offline start.
 const DATA_CACHE = "alert-hub-v2-read-model";
 const SHELL = ["/", "/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"];
+const MANIFEST_FETCH_TIMEOUT_MS = 750;
 const SPA_ROUTE =
   /^\/(?:$|incidents(?:\/[^/]+)?|reachability|sources|channels|devices|cluster|audit|settings)\/?$/;
 
@@ -33,7 +34,11 @@ self.addEventListener("activate", (event) => {
 
 function isReadableApi(url, request) {
   if (request.method !== "GET" || !url.pathname.startsWith("/api/v1/")) return false;
-  return !url.pathname.includes("/auth/") && !url.pathname.endsWith("/stream");
+  return (
+    !url.pathname.includes("/auth/") &&
+    !url.pathname.endsWith("/stream") &&
+    url.pathname !== "/api/v1/push/vapid-public-key"
+  );
 }
 
 async function readThrough(request) {
@@ -163,6 +168,34 @@ self.addEventListener("fetch", (event) => {
   }
 });
 
+async function notificationAppName() {
+  let manifestResponse = await caches.match("/manifest.webmanifest");
+  if (!manifestResponse) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), MANIFEST_FETCH_TIMEOUT_MS);
+    try {
+      const response = await fetch("/manifest.webmanifest", {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (response.ok) manifestResponse = response;
+    } catch {
+      // Runtime branding is optional; notification visibility is not.
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (!manifestResponse) return "Alert Hub";
+  try {
+    const manifest = await manifestResponse.json();
+    return typeof manifest.name === "string" && manifest.name.trim()
+      ? manifest.name.trim()
+      : "Alert Hub";
+  } catch {
+    return "Alert Hub";
+  }
+}
+
 self.addEventListener("push", (event) => {
   let payload = {};
   try {
@@ -184,22 +217,7 @@ self.addEventListener("push", (event) => {
         payload.id;
       const status = String(payload.status || payload.event_type || "firing").toLowerCase();
       const resolved = status === "resolved";
-      let appName = "Alert Hub";
-      try {
-        let manifestResponse;
-        try {
-          manifestResponse = await fetch("/manifest.webmanifest", { cache: "no-store" });
-          if (!manifestResponse.ok) throw new Error("manifest unavailable");
-        } catch {
-          manifestResponse = await caches.match("/manifest.webmanifest");
-        }
-        if (!manifestResponse) throw new Error("manifest unavailable");
-        const manifest = await manifestResponse.json();
-        if (typeof manifest.name === "string" && manifest.name.trim())
-          appName = manifest.name.trim();
-      } catch {
-        // A visible fallback notification is more important than runtime branding.
-      }
+      const appName = await notificationAppName();
       const title =
         payload.title || (resolved ? `${appName}: incident resolved` : `${appName}: incident`);
       const fallbackUrl = incidentId
@@ -261,8 +279,16 @@ self.addEventListener("notificationclick", (event) => {
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(async (windows) => {
       for (const client of windows) {
         if (new URL(client.url).origin === self.location.origin) {
-          await client.navigate(destination);
-          return client.focus();
+          try {
+            const navigatedClient = await client.navigate(destination);
+            if (navigatedClient) {
+              await navigatedClient.focus();
+              return;
+            }
+          } catch {
+            // Safari can reject navigation for a stale window client. Try the
+            // next client, then fall back to opening a new app window.
+          }
         }
       }
       return self.clients.openWindow(destination);

@@ -187,19 +187,57 @@ def delivery_receipt_payload(
     }
 
 
+def advance_push_subscription_success(
+    subscription: PushSubscription,
+    succeeded_at: datetime,
+) -> bool:
+    """Advance delivery evidence monotonically despite out-of-order replication."""
+
+    normalized = (
+        succeeded_at.replace(tzinfo=UTC)
+        if succeeded_at.tzinfo is None
+        else succeeded_at.astimezone(UTC)
+    )
+    if subscription.last_success_at is not None:
+        current = (
+            subscription.last_success_at.replace(tzinfo=UTC)
+            if subscription.last_success_at.tzinfo is None
+            else subscription.last_success_at.astimezone(UTC)
+        )
+        if current >= normalized:
+            return False
+    subscription.last_success_at = normalized
+    return True
+
+
 def push_subscription_payload(subscription: PushSubscription) -> dict[str, Any]:
     """Return the encrypted, replication-safe representation of a subscription."""
 
     return {
         "user_id": subscription.user_id,
+        "session_id": subscription.session_id,
         "device_name": subscription.device_name,
         "endpoint": base64.b64encode(subscription.endpoint).decode(),
         "p256dh": base64.b64encode(subscription.p256dh).decode(),
         "auth": base64.b64encode(subscription.auth).decode(),
         "user_agent": subscription.user_agent,
         "created_at": subscription.created_at.isoformat(),
+        "last_success_at": (
+            subscription.last_success_at.isoformat() if subscription.last_success_at else None
+        ),
         "disabled_at": (subscription.disabled_at.isoformat() if subscription.disabled_at else None),
     }
+
+
+def push_subscription_success_payload(succeeded_at: datetime) -> dict[str, str | int]:
+    """Serialize monotonic evidence without carrying mutable subscription state."""
+
+    normalized = (
+        succeeded_at.replace(tzinfo=UTC)
+        if succeeded_at.tzinfo is None
+        else succeeded_at.astimezone(UTC)
+    )
+    return {"schema_version": 1, "last_success_at": normalized.isoformat()}
 
 
 def apply_delivery_receipt(db: Session, payload: Mapping[str, Any]) -> bool:
@@ -245,11 +283,15 @@ def apply_delivery_receipt(db: Session, payload: Mapping[str, Any]) -> bool:
         existing.status = status
     existing.provider_status = _safe_status(payload.get("provider_status"))
     existing.error_code = _safe_status(payload.get("error_code"))
+    finished_at: datetime | None = None
     if payload.get("finished_at"):
         with suppress(ValueError):
-            existing.finished_at = datetime.fromisoformat(
-                str(payload["finished_at"]).replace("Z", "+00:00")
-            )
+            finished_at = datetime.fromisoformat(str(payload["finished_at"]).replace("Z", "+00:00"))
+            existing.finished_at = finished_at
+    if status == "succeeded" and existing.subscription_id and finished_at is not None:
+        subscription = db.get(PushSubscription, existing.subscription_id)
+        if subscription is not None:
+            advance_push_subscription_success(subscription, finished_at)
     _apply_delivery_timeline(db, payload, existing)
     # A dependency replay can project a receipt that is also present later in the
     # same sync page. Flush here so a second projection in this unit of work sees

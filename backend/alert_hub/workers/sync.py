@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from threading import Lock
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -121,6 +122,10 @@ class PeerSyncWorker:
         self._monotonic = monotonic
         self._random_value = random_value
         self.states = {url: PeerState(base_url=url) for url in settings.peer_urls}
+        # FastAPI executes synchronous status handlers in a worker thread while
+        # this worker updates peer state on the application event loop. Keep each
+        # externally visible snapshot coherent across the related fields.
+        self._state_lock = Lock()
 
     def _timeout(self) -> httpx.Timeout:
         return httpx.Timeout(
@@ -280,7 +285,8 @@ class PeerSyncWorker:
             raise SyncProtocolError(f"peer {health.node_id} reported status {health.status!r}")
         if health.node_id == self.settings.node_id:
             raise SyncProtocolError("configured peer URL resolves to this node")
-        state.node_id = health.node_id
+        with self._state_lock:
+            state.node_id = health.node_id
         with self.session_factory.begin() as db:
             self._touch_peer_node(db, health)
             cursor = peer_cursor(db, health.node_id)
@@ -322,8 +328,10 @@ class PeerSyncWorker:
         else:
             raise SyncProtocolError("peer exceeded the configured page limit for one cycle")
 
-        state.lag_seconds = self._lag_seconds(health.cursor, cursor, oldest_observed)
-        SYNC_LAG.labels(peer_node_id=health.node_id).set(state.lag_seconds)
+        lag_seconds = self._lag_seconds(health.cursor, cursor, oldest_observed)
+        with self._state_lock:
+            state.lag_seconds = lag_seconds
+        SYNC_LAG.labels(peer_node_id=health.node_id).set(lag_seconds)
 
     def _touch_peer_node(self, db: Session, health: PeerHealthResponse) -> None:
         node = db.get(Node, health.node_id)
@@ -356,38 +364,45 @@ class PeerSyncWorker:
         return max(0.0, (utc_now() - oldest_observed).total_seconds())
 
     def _mark_failure(self, state: PeerState, exc: Exception) -> None:
-        state.failures += 1
-        state.last_error = f"{type(exc).__name__}: {exc}"[:1_024]
-        state.next_attempt_at = self._monotonic() + self.backoff_delay(state.failures)
-        PEER_UP.labels(peer_node_id=state.metric_id).set(0)
+        with self._state_lock:
+            state.failures += 1
+            state.last_error = f"{type(exc).__name__}: {exc}"[:1_024]
+            state.next_attempt_at = self._monotonic() + self.backoff_delay(state.failures)
+            metric_id = state.metric_id
+            node_id = state.node_id
+            failure_count = state.failures
+        PEER_UP.labels(peer_node_id=metric_id).set(0)
         SYNC_EVENTS.labels(direction="pull", result="error").inc()
         logger.warning(
             "peer_sync_failed",
             extra={
                 "event": "peer_sync_failed",
-                "peer_node_id": state.node_id,
-                "failure_count": state.failures,
+                "peer_node_id": node_id,
+                "failure_count": failure_count,
                 "exception_type": type(exc).__name__,
             },
         )
 
     def _mark_success(self, state: PeerState) -> None:
-        state.failures = 0
-        state.last_error = None
-        state.last_success_at = utc_now()
-        state.next_attempt_at = self._monotonic() + self.settings.sync_interval_seconds
-        PEER_UP.labels(peer_node_id=state.metric_id).set(1)
+        with self._state_lock:
+            state.failures = 0
+            state.last_error = None
+            state.last_success_at = utc_now()
+            state.next_attempt_at = self._monotonic() + self.settings.sync_interval_seconds
+            metric_id = state.metric_id
+        PEER_UP.labels(peer_node_id=metric_id).set(1)
         SYNC_EVENTS.labels(direction="pull", result="success").inc()
 
     def status_snapshot(self) -> dict[str, dict[str, Any]]:
-        return {
-            state.metric_id: {
-                "url": state.base_url,
-                "up": state.failures == 0 and state.last_success_at is not None,
-                "last_success_at": state.last_success_at,
-                "last_error": state.last_error,
-                "failures": state.failures,
-                "lag_seconds": state.lag_seconds,
+        with self._state_lock:
+            return {
+                state.metric_id: {
+                    "url": state.base_url,
+                    "up": state.failures == 0 and state.last_success_at is not None,
+                    "last_success_at": state.last_success_at,
+                    "last_error": state.last_error,
+                    "failures": state.failures,
+                    "lag_seconds": state.lag_seconds,
+                }
+                for state in self.states.values()
             }
-            for state in self.states.values()
-        }

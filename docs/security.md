@@ -94,6 +94,14 @@ unrelated address, verify the peer hostname fails closed.
 
 Use exact HTTPS origins. Wildcard CORS with credentials is rejected. Refresh and logout require one exact allowed `Origin` plus the matching double-submit CSRF value; a missing Origin is not accepted. Authenticated responses expose `X-Alert-Hub-Cache-Partition`, and CORS permits/exposes that header so the service worker can keep session cache namespaces separate. Permission for browser notifications must be requested only from a direct user gesture in an installed Home Screen PWA; do not attempt silent push.
 
+Web Push subscriptions are bound by the API to the authenticated session ID; the client-supplied device label is not an authorization or identity key. Revoking a device session, logging out, reaching absolute session expiry, or disabling the owning user prevents delivery and emits a replicated, remove-wins subscription tombstone before the next provider request. A locally observed sliding expiry suppresses delivery without a permanent tombstone because another replica may later supply a valid rotation. Pre-migration subscriptions without a session ID are disabled during migration and are also rejected fail-closed at runtime; the browser must register them again after upgrade.
+
+Immediately before Web Push delivery, the API resolves the endpoint, rejects every non-global
+answer, and pins the actual TLS connection to that validated address set while retaining the
+original hostname for SNI, certificate verification, and the HTTP `Host` value. The pinned client
+does not use environment proxies and refuses redirects, so provider I/O cannot trigger a second
+attacker-controlled resolution or escape to another origin.
+
 Shared parent-domain cookies reduce friction but expand the compromise boundary to every trusted sibling subdomain. Prefer per-node sessions unless all subdomains share administration and hardening. Session signing keys may be common across nodes only with replicated revocation/session state.
 
 ## Client addresses, CIDRs, and rate limits

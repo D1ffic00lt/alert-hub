@@ -23,6 +23,13 @@ public proxy examples deny `/health/deep`, `/metrics`, API documentation, and `/
 `404`. Query or scrape those operator surfaces through loopback/private paths; never publish a
 separate metrics port.
 
+The authenticated UI uses `/api/v1/cluster/status`. It combines durable node inventory with the
+serving process's current peer result: the local node is healthy when it serves the request, a peer
+is healthy after a successful pull, degraded during the first two consecutive failures, offline
+from the third consecutive failure, and unknown before an attempt has produced evidence. Sync lag
+is the worker's current cursor evidence, not an estimate from the durable `last_seen_at` field. The
+UI refreshes this runtime view every 30 seconds even while its cluster-event stream is connected.
+
 Set the optional `GRAFANA_URL` to the installation's HTTPS dashboard when the UI should offer a
 detailed-view link. The validated URL is returned only in the authenticated metrics summary. It is
 navigation metadata, not a Grafana credential or a way to submit PromQL; Prometheus remains the
@@ -56,6 +63,10 @@ After DNS, certificate, proxy, or public-address changes:
 5. from an unrelated network, verify the peer hostname returns `403` or `404`;
 6. externally scan that the loopback application ports are not reachable;
 7. record evidence without authorization headers, bearer values, or payloads.
+
+An allowlisted request that reaches the application with a missing or invalid cluster bearer is
+intentionally written to the audit log before returning `401`. One bounded negative probe is enough
+for each reviewed path; do not use an unauthenticated retry loop for boundary verification.
 
 Certificate renewal must use the proxy's existing ACME process and a validated
 reload hook. If a node's public egress address changes, update both other
@@ -167,6 +178,53 @@ Never echo a key in a shell command recorded by Actions. The root-owned secret d
 traversable only by container GID `10001`; individual files are owned by UID/GID `10001`, mode
 `0600`, and mounted read-only.
 
+## Web Push registration and test
+
+A browser subscription and a delivery route are separate resources. Complete this sequence for
+each device that should receive alerts:
+
+1. In **Channels**, create and enable a `Web Push` channel.
+2. Create an enabled route whose incident filters include that channel. An empty filter matches
+   every source/severity; tighten it only after the broad test works.
+3. On desktop, open Alert Hub through HTTPS. On iPhone or iPad 16.4 or newer, open the site in
+   Safari, use **Share → Add to Home Screen**, then launch and sign in from the installed icon.
+4. Select **Enable alerts** and accept the browser/system permission prompt. The UI registers the
+   root service worker, fetches the node's public VAPID key, replaces an old browser subscription
+   when that key changed, and binds the new endpoint to the current authenticated session.
+5. In **Channels**, select **Send test** on the Web Push channel. Success requires a visible
+   notification, not only an HTTP success message. Then test one real firing event, its resolved
+   event, and the notification deep link while the app is closed.
+
+Upgrades from a version that created Web Push subscriptions without a browser-session binding
+disable those legacy endpoints. Each affected browser must select **Enable alerts** again; this is
+intentional so a signed-out or lost device cannot retain notification access after migration.
+
+Permission `denied` is a device setting and cannot be reset by the site. On macOS Safari use
+**Safari → Settings → Websites → Notifications**. In Chromium/Firefox use the site-permissions
+control beside the address bar. On iOS/iPadOS use **Settings → Notifications → Alert Hub** for the
+installed app. Reload or reopen the app after allowing it, then repeat registration.
+
+Troubleshoot in this order:
+
+- `curl -sS -D - -o /dev/null https://alerts.example.com/sw.js` must return JavaScript from the
+  same origin. Because the worker lives at `/sw.js`, `Service-Worker-Allowed` is unnecessary; if
+  an edge adds it, there must be exactly one valid `/` value, never a combined `/, /` value.
+- A VAPID-key error before subscription means the serving API node cannot load or validate its
+  sender key. All delivery nodes must use the same unencrypted P-256 private key; omit the public
+  override unless it is the matching canonical public point.
+- A subscription error after permission was granted is reported with the API/DOM failure instead
+  of a green status. Check HTTPS, service-worker registration, API readiness, egress DNS and TCP
+  `443`, then retry.
+- A channel test reports sanitized provider status/error codes. `subscription_gone` requires
+  registering that browser again; provider `401`/`403` usually indicates VAPID configuration or
+  subject policy; timeout/transport failures require checking node egress.
+- Device/session revocation and logout disable every server-side Push endpoint bound to that
+  session. A later sign-in must register again before delivery resumes.
+
+VAPID rotation intentionally invalidates existing provider subscriptions. Roll the same key to
+every delivery node, then re-register each browser; do not mix old and new private keys across the
+cluster.
+
 ## SMTP notification templates
 
 SMTP channel configuration accepts optional `subject_template` and `body_template` strings.
@@ -201,7 +259,12 @@ The request boundary accepts a caller/proxy `X-Request-ID` only when it is 1–1
 
 Access to Docker logs remains privileged because approved incident/source identifiers and proxy metadata can still be sensitive. Log redaction is not an audit guarantee and logs are not a secret-storage channel.
 
-Security-relevant audit should cover authentication, source/channel changes, token rotations, session revocation, failed peer authorization, and deployment-relevant actions. Deployment manifests/history are host evidence; they do not replace the application audit log.
+Security-relevant audit covers authentication, source/channel changes, token rotations, session
+revocation, failed peer authorization, and deployment-relevant actions. The current application
+audit is append-only and local to the node serving the request; it is not replicated cluster
+history. The UI may group identical events from a short burst for readability, while its JSONL
+export retains every loaded row. Deployment manifests/history are host evidence; they do not
+replace the application audit log.
 
 ## Follow-on distributed operations
 

@@ -5,6 +5,7 @@ set -Eeuo pipefail
 # executable before enabling the protected workflow. Never enable shell tracing:
 # GitHub passes production secrets in the environment and this script keeps them
 # out of argv and logs.
+set +x
 umask 077
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -335,6 +336,111 @@ secret_is_acceptable() {
   local value=$2
   [[ ${#value} -ge 32 ]] || die "${name} must contain at least 32 characters"
   [[ ${value} != *$'\r'* ]] || die "${name} contains an unsupported carriage return"
+}
+
+vapid_private_key_has_unencrypted_pem_envelope() {
+  local private_key=${1%$'\n'}
+
+  [[ -n ${private_key} && ${private_key} != *$'\r'* && ${private_key} != *$'\n' ]] || return 1
+  printf '%s\n' "${private_key}" | awk '
+    NR == 1 {
+      pem_begin = "-----BEGIN "
+      if ($0 == pem_begin "PRIVATE KEY-----") {
+        footer = "-----END PRIVATE KEY-----"
+      } else if ($0 == pem_begin "EC PRIVATE KEY-----") {
+        footer = "-----END EC PRIVATE KEY-----"
+      } else {
+        exit 1
+      }
+      next
+    }
+    /ENCRYPTED/ || /^Proc-Type:/ || /^DEK-Info:/ || /^-----BEGIN / {
+      exit 1
+    }
+    /^-----END / {
+      if (found_footer || $0 != footer) {
+        exit 1
+      }
+      found_footer = 1
+      next
+    }
+    found_footer {
+      exit 1
+    }
+    END {
+      if (!found_footer) {
+        exit 1
+      }
+    }
+  '
+}
+
+vapid_private_key_is_p256() {
+  local private_key=${1%$'\n'}
+
+  if openssl pkey -help 2>&1 |
+    grep -E -- '(^|[[:space:]])-check([[:space:]]|$)' >/dev/null; then
+    printf '%s\n' "${private_key}" |
+      openssl pkey -passin pass: -check -noout >/dev/null 2>&1 || return 1
+  else
+    printf '%s\n' "${private_key}" |
+      openssl pkey -passin pass: -noout >/dev/null 2>&1 || return 1
+  fi
+  printf '%s\n' "${private_key}" |
+    openssl pkey -passin pass: -text_pub -noout 2>/dev/null |
+    grep -E '^[[:space:]]*ASN1 OID: prime256v1[[:space:]]*$' >/dev/null
+}
+
+derive_vapid_public_key() {
+  local private_key=${1%$'\n'}
+
+  printf '%s\n' "${private_key}" |
+    openssl pkey -passin pass: -pubout 2>/dev/null |
+    openssl ec \
+      -pubin \
+      -conv_form uncompressed \
+      -param_enc named_curve \
+      -outform DER 2>/dev/null |
+    tail -c 65 |
+    openssl base64 -A 2>/dev/null |
+    tr '+/' '-_' |
+    tr -d '='
+}
+
+validate_vapid_material() {
+  local private_key=$1
+  local public_key=$2
+  local derived_public_key
+
+  if ! vapid_private_key_has_unencrypted_pem_envelope "${private_key}" ||
+    ! vapid_private_key_is_p256 "${private_key}"; then
+    die "VAPID_PRIVATE_KEY must be an unencrypted PEM EC private key on P-256"
+  fi
+  derived_public_key=$(derive_vapid_public_key "${private_key}") ||
+    die "could not derive the VAPID public key"
+  [[ ${derived_public_key} =~ ^B[A-Za-z0-9_-]{85}[AEIMQUYcgkosw048]$ ]] ||
+    die "derived VAPID public key is malformed"
+
+  if [[ -n ${public_key} ]]; then
+    [[ ${public_key} =~ ^B[A-Za-z0-9_-]{85}[AEIMQUYcgkosw048]$ ]] ||
+      die "VAPID_PUBLIC_KEY must be a canonical unpadded base64url P-256 public point"
+    [[ ${public_key} == "${derived_public_key}" ]] ||
+      die "VAPID_PUBLIC_KEY does not match VAPID_PRIVATE_KEY"
+  fi
+  log "VAPID key material preflight passed"
+}
+
+preflight_vapid_material() {
+  local operation=$1
+  local component=$2
+  local command_name
+
+  [[ ${operation} == deploy && ( ${component} == api || ${component} == all ) ]] || return 0
+  : "${VAPID_PRIVATE_KEY:?VAPID_PRIVATE_KEY is required for API deployment}"
+  for command_name in openssl tail; do
+    command -v "${command_name}" >/dev/null || die "required VAPID preflight command is missing: ${command_name}"
+  done
+  validate_vapid_material "${VAPID_PRIVATE_KEY}" "${VAPID_PUBLIC_KEY:-}"
 }
 
 state_value() {
@@ -1214,10 +1320,6 @@ flock -n 9 || die "another deployment, rollback, or provisioning operation is al
 require_root_controlled_file "${COMPOSE_FILE}" "production Compose file"
 load_deploy_policy
 readonly POLICY_GITHUB_REPOSITORY POLICY_NODE_NAME HOST_PORT API_HOST_PORT EDGE_SUBNET API_IP WEB_IP MONITORING_NETWORK
-install -d -o root -g root -m 0700 "${CONFIG_DIR}" "${STATE_DIR}" "${HISTORY_DIR}" "${CONFIG_HISTORY_DIR}"
-install -d -o root -g "${API_GID}" -m 0750 "${SECRETS_DIR}"
-install -d -o "${API_UID}" -g "${API_GID}" -m 0750 "${DATA_DIR}"
-install -d -o "${API_UID}" -g "${API_GID}" -m 0700 "${BACKUPS_DIR}"
 
 : "${NODE_NAME:?NODE_NAME is required}"
 : "${NODE_IP:?NODE_IP is required}"
@@ -1235,6 +1337,12 @@ EXPECTED_WEB_REPOSITORY=ghcr.io/${registry_owner}/alert-hub-web
 validate_host_token "${NODE_IP}" || die "NODE_IP is invalid"
 validate_domain "${PUBLIC_DOMAIN}" || die "PUBLIC_DOMAIN must be a DNS host name"
 PUBLIC_DOMAIN=$(printf '%s' "${PUBLIC_DOMAIN}" | tr '[:upper:]' '[:lower:]')
+preflight_vapid_material "${operation}" "${COMPONENT}"
+
+install -d -o root -g root -m 0700 "${CONFIG_DIR}" "${STATE_DIR}" "${HISTORY_DIR}" "${CONFIG_HISTORY_DIR}"
+install -d -o root -g "${API_GID}" -m 0750 "${SECRETS_DIR}"
+install -d -o "${API_UID}" -g "${API_GID}" -m 0750 "${DATA_DIR}"
+install -d -o "${API_UID}" -g "${API_GID}" -m 0700 "${BACKUPS_DIR}"
 
 AUTH_DIR=""
 SMOKE_DIR=""

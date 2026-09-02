@@ -10,6 +10,13 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from alert_hub.application.auth import (
+    disable_push_subscription,
+    disable_session_push_subscriptions,
+    eligible_push_subscriptions,
+    push_subscription_session_state,
+    push_subscription_state_requires_tombstone,
+)
 from alert_hub.application.incidents import append_cluster_event
 from alert_hub.application.notifications import (
     DeliveryResult,
@@ -207,9 +214,12 @@ class NotificationOutboxProcessor:
                 )
             ).all()
             channels_by_id = {channel.id: channel for channel in channels}
-            active_subscriptions = db.scalars(
-                select(PushSubscription).where(PushSubscription.disabled_at.is_(None))
-            ).all()
+            active_subscriptions = eligible_push_subscriptions(
+                db,
+                self._settings,
+                now=self._now(),
+            )
+            db.commit()
             targets: list[_TargetDescriptor] = []
             for channel_id in selected_ids:
                 channel = channels_by_id.get(channel_id)
@@ -419,6 +429,30 @@ class NotificationOutboxProcessor:
                 subscription = db.get(PushSubscription, descriptor.subscription_id)
                 if subscription is None or subscription.disabled_at is not None:
                     raise EncryptionError("push subscription is unavailable")
+                observed_at = self._now()
+                session_state = push_subscription_session_state(
+                    db,
+                    subscription,
+                    now=observed_at,
+                )
+                if session_state != "active":
+                    if push_subscription_state_requires_tombstone(session_state):
+                        if subscription.session_id is not None:
+                            disable_session_push_subscriptions(
+                                db,
+                                subscription.session_id,
+                                self._settings,
+                                disabled_at=observed_at,
+                            )
+                        else:
+                            disable_push_subscription(
+                                db,
+                                subscription,
+                                self._settings,
+                                disabled_at=observed_at,
+                            )
+                        db.commit()
+                    raise EncryptionError("push subscription owner or session is unavailable")
                 endpoint, p256dh, auth = decrypt_push_subscription(
                     subscription,
                     self._cipher,

@@ -3,17 +3,29 @@ from __future__ import annotations
 import os
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session as DbSession
 
 from alert_hub.application.incidents import append_cluster_event
+from alert_hub.application.notifications import push_subscription_payload
 from alert_hub.infrastructure.db.base import utc_now
-from alert_hub.infrastructure.db.models import AuditLog, Session, User
+from alert_hub.infrastructure.db.models import AuditLog, PushSubscription, Session, User
 from alert_hub.security import encode_access_token, hash_token, random_token
 from alert_hub.settings import Settings
+
+PushSubscriptionSessionState = Literal[
+    "active",
+    "legacy_unbound",
+    "owner_unavailable",
+    "session_unavailable",
+    "revoked",
+    "sliding_expired",
+    "absolute_expired",
+]
 
 
 @dataclass(slots=True)
@@ -122,6 +134,142 @@ def issue_session(
     return IssuedSession(access, raw_refresh, random_token(24), session)
 
 
+def disable_session_push_subscriptions(
+    db: DbSession,
+    session_id: str,
+    settings: Settings,
+    *,
+    disabled_at: datetime | None = None,
+) -> list[str]:
+    """Disable and replicate every active Web Push endpoint owned by a session."""
+
+    subscriptions = db.scalars(
+        select(PushSubscription).where(
+            PushSubscription.session_id == session_id,
+            PushSubscription.disabled_at.is_(None),
+        )
+    ).all()
+    for subscription in subscriptions:
+        disable_push_subscription(
+            db,
+            subscription,
+            settings,
+            disabled_at=disabled_at,
+        )
+    return [subscription.id for subscription in subscriptions]
+
+
+def disable_push_subscription(
+    db: DbSession,
+    subscription: PushSubscription,
+    settings: Settings,
+    *,
+    disabled_at: datetime | None = None,
+) -> bool:
+    """Tombstone one active subscription, including a legacy unbound row."""
+
+    if subscription.disabled_at is not None:
+        return False
+    event_occurred_at = utc_now()
+    subscription.disabled_at = disabled_at or event_occurred_at
+    append_cluster_event(
+        db,
+        settings,
+        entity_type="push_subscription",
+        entity_id=subscription.id,
+        operation="tombstone",
+        payload=push_subscription_payload(subscription),
+        occurred_at=event_occurred_at,
+    )
+    return True
+
+
+def push_subscription_session_state(
+    db: DbSession,
+    subscription: PushSubscription,
+    *,
+    now: datetime | None = None,
+) -> PushSubscriptionSessionState:
+    """Classify whether a subscription can receive Push without reviving stale state."""
+
+    owner = db.get(User, subscription.user_id)
+    if owner is None or owner.disabled_at is not None:
+        return "owner_unavailable"
+    if subscription.session_id is None:
+        return "legacy_unbound"
+    auth_session = db.get(Session, subscription.session_id)
+    if auth_session is None or auth_session.user_id != subscription.user_id:
+        return "session_unavailable"
+    observed_at = now or utc_now()
+    if auth_session.revoked_at is not None:
+        return "revoked"
+    if auth_session.absolute_expires_at <= observed_at:
+        return "absolute_expired"
+    if auth_session.expires_at <= observed_at:
+        # Sliding expiry is replicated mutable state. A partitioned node can have
+        # missed a newer rotation, so it must suppress delivery without publishing
+        # a permanent subscription tombstone.
+        return "sliding_expired"
+    return "active"
+
+
+def push_subscription_session_is_active(
+    db: DbSession,
+    subscription: PushSubscription,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    return push_subscription_session_state(db, subscription, now=now) == "active"
+
+
+def push_subscription_state_requires_tombstone(state: PushSubscriptionSessionState) -> bool:
+    """Return whether an inactive state is immutable or explicitly revoked."""
+
+    return state not in {"active", "sliding_expired"}
+
+
+def eligible_push_subscriptions(
+    db: DbSession,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> list[PushSubscription]:
+    """Select deliverable subscriptions and tombstone stale session bindings."""
+
+    observed_at = now or utc_now()
+    candidates = db.scalars(
+        select(PushSubscription)
+        .where(PushSubscription.disabled_at.is_(None))
+        .order_by(PushSubscription.id)
+    ).all()
+    eligible: list[PushSubscription] = []
+    disabled_session_ids: set[str] = set()
+    for subscription in candidates:
+        state = push_subscription_session_state(db, subscription, now=observed_at)
+        if state == "active":
+            eligible.append(subscription)
+            continue
+        if not push_subscription_state_requires_tombstone(state):
+            continue
+        session_id = subscription.session_id
+        if session_id is not None and session_id not in disabled_session_ids:
+            disable_session_push_subscriptions(
+                db,
+                session_id,
+                settings,
+                disabled_at=observed_at,
+            )
+            disabled_session_ids.add(session_id)
+        elif session_id is None:
+            disable_push_subscription(
+                db,
+                subscription,
+                settings,
+                disabled_at=observed_at,
+            )
+    return eligible
+
+
 def rotate_session(db: DbSession, raw_refresh: str, settings: Settings) -> IssuedSession | None:
     token_hash = hash_token(raw_refresh, settings.signing_key, "refresh")
     session = db.scalar(select(Session).where(Session.refresh_token_hash == token_hash))
@@ -133,15 +281,22 @@ def rotate_session(db: DbSession, raw_refresh: str, settings: Settings) -> Issue
         or session.absolute_expires_at <= now
         or session.user.disabled_at is not None
     ):
-        if session is not None and session.revoked_at is None:
-            session.revoked_at = now
-            append_cluster_event(
+        if session is not None:
+            if session.revoked_at is None:
+                session.revoked_at = now
+                append_cluster_event(
+                    db,
+                    settings,
+                    entity_type="session",
+                    entity_id=session.id,
+                    operation="revoke",
+                    payload=session_cluster_payload(session),
+                )
+            disable_session_push_subscriptions(
                 db,
+                session.id,
                 settings,
-                entity_type="session",
-                entity_id=session.id,
-                operation="revoke",
-                payload=session_cluster_payload(session),
+                disabled_at=session.revoked_at,
             )
         return None
     new_refresh = random_token(48)

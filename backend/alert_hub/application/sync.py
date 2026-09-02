@@ -306,6 +306,16 @@ def _session_events_for_user(db: Session, user_id: str) -> list[ClusterEvent]:
     ]
 
 
+def _push_events_for_session(db: Session, session_id: str) -> list[ClusterEvent]:
+    return [
+        event
+        for event in db.scalars(
+            select(ClusterEvent).where(ClusterEvent.entity_type == "push_subscription")
+        ).all()
+        if str(event.payload_json.get("session_id") or "") == session_id
+    ]
+
+
 def _project_session(db: Session, entity_id: str) -> None:
     events = sorted(
         db.scalars(
@@ -319,10 +329,20 @@ def _project_session(db: Session, entity_id: str) -> None:
     if not events:
         return
     state: dict[str, Any] = {}
+    revoked_at: datetime | None = None
     for event in events:
-        state.update(event.payload_json)
-        if event.operation in {"revoke", "tombstone"} and not state.get("revoked_at"):
-            state["revoked_at"] = event.occurred_at.isoformat()
+        # Revocation is terminal. A delayed rotation can carry a stale null
+        # revoked_at value, but it must never make the session usable again.
+        state.update(
+            (key, value) for key, value in event.payload_json.items() if key != "revoked_at"
+        )
+        candidate_revoked_at = _payload_datetime(event.payload_json, "revoked_at")
+        if candidate_revoked_at is None and event.operation in {"revoke", "tombstone"}:
+            candidate_revoked_at = event.occurred_at
+        if candidate_revoked_at is not None and (
+            revoked_at is None or candidate_revoked_at < revoked_at
+        ):
+            revoked_at = candidate_revoked_at
     user_id = str(state.get("user_id") or "")
     refresh_hash = str(state.get("refresh_token_hash") or "")
     if not user_id or not refresh_hash or db.get(User, user_id) is None:
@@ -354,11 +374,13 @@ def _project_session(db: Session, entity_id: str) -> None:
     auth_session.last_used_at = last_used_at
     auth_session.expires_at = expires_at
     auth_session.absolute_expires_at = absolute
-    auth_session.revoked_at = _payload_datetime(state, "revoked_at")
+    auth_session.revoked_at = revoked_at
     # A user projection can replay this session before the same sync page reaches
     # its explicit session event.  Flush the newly created row so the second
     # projection resolves it instead of queuing a duplicate INSERT.
     db.flush()
+    for push_event in _push_events_for_session(db, entity_id):
+        _project_push_subscription(db, push_event.entity_id)
 
 
 def _project_source(db: Session, entity_id: str, settings: Settings) -> None:
@@ -544,10 +566,29 @@ def _push_events_for_user(db: Session, user_id: str) -> list[ClusterEvent]:
 
 
 def _project_push_subscription(db: Session, entity_id: str) -> None:
-    event = _latest_entity_event(db, "push_subscription", entity_id)
-    if event is None:
+    events = db.scalars(
+        select(ClusterEvent).where(
+            ClusterEvent.entity_type == "push_subscription",
+            ClusterEvent.entity_id == entity_id,
+        )
+    ).all()
+    state_events = [event for event in events if event.operation in {"upsert", "tombstone"}]
+    if not state_events:
         return
-    payload = event.payload_json
+    bound_state_events = [event for event in state_events if event.payload_json.get("session_id")]
+    if bound_state_events:
+        # Once a subscription is bound to an authenticated session, an old
+        # pre-migration upsert must not erase that binding or revive a tombstone.
+        effective_state_events = [
+            event
+            for event in state_events
+            if event.operation == "tombstone" or event.payload_json.get("session_id")
+        ]
+        configuration_event = max(bound_state_events, key=_event_order)
+    else:
+        effective_state_events = state_events
+        configuration_event = max(state_events, key=_event_order)
+    payload = configuration_event.payload_json
     user_id = str(payload.get("user_id") or "")
     endpoint = _decode_blob(payload, "endpoint")
     p256dh = _decode_blob(payload, "p256dh")
@@ -560,20 +601,36 @@ def _project_push_subscription(db: Session, entity_id: str) -> None:
         or auth is None
     ):
         return
-    created_at = _payload_datetime(payload, "created_at", default=event.occurred_at)
+    requested_session_id = str(payload.get("session_id") or "") or None
+    linked_session = db.get(AuthSession, requested_session_id) if requested_session_id else None
+    if requested_session_id is not None and (
+        linked_session is None or linked_session.user_id != user_id
+    ):
+        # A subscription may arrive through another origin before the session it
+        # references. Keep the event and replay it when session projection catches
+        # up instead of weakening the foreign key into a legacy, unbound endpoint.
+        return
+    session_id = requested_session_id
+    created_at = _payload_datetime(
+        payload,
+        "created_at",
+        default=configuration_event.occurred_at,
+    )
     subscription = db.get(PushSubscription, entity_id)
     if subscription is None:
         subscription = PushSubscription(
             id=entity_id,
             user_id=user_id,
+            session_id=session_id,
             device_name=str(payload.get("device_name") or "Installed PWA")[:255],
             endpoint=endpoint,
             p256dh=p256dh,
             auth=auth,
-            created_at=created_at or event.occurred_at,
+            created_at=created_at or configuration_event.occurred_at,
         )
         db.add(subscription)
     subscription.user_id = user_id
+    subscription.session_id = session_id
     subscription.device_name = str(payload.get("device_name") or subscription.device_name)[:255]
     subscription.endpoint = endpoint
     subscription.p256dh = p256dh
@@ -581,11 +638,36 @@ def _project_push_subscription(db: Session, entity_id: str) -> None:
     subscription.user_agent = (
         str(payload["user_agent"])[:1024] if payload.get("user_agent") else None
     )
-    subscription.disabled_at = (
-        _payload_datetime(payload, "disabled_at", default=event.occurred_at)
-        if event.operation == "tombstone" or payload.get("disabled_at")
-        else None
-    )
+    last_success_at: datetime | None = None
+    for history_event in events:
+        candidate = _payload_datetime(history_event.payload_json, "last_success_at")
+        if candidate is not None and (last_success_at is None or candidate > last_success_at):
+            last_success_at = candidate
+    if last_success_at is not None and (
+        subscription.last_success_at is None or subscription.last_success_at < last_success_at
+    ):
+        subscription.last_success_at = last_success_at
+    removal_events = [
+        event
+        for event in effective_state_events
+        if event.operation == "tombstone" or event.payload_json.get("disabled_at")
+    ]
+    disabled_at: datetime | None = None
+    if removal_events:
+        # Subscription IDs are immutable generations. Once one generation is
+        # removed, no delayed upsert may resurrect it; re-registration gets a
+        # fresh ID instead.
+        removal_event = min(removal_events, key=_event_order)
+        disabled_at = _payload_datetime(
+            removal_event.payload_json,
+            "disabled_at",
+            default=removal_event.occurred_at,
+        )
+    if requested_session_id is None:
+        disabled_at = disabled_at or configuration_event.occurred_at
+    if linked_session is not None and linked_session.revoked_at is not None:
+        disabled_at = disabled_at or linked_session.revoked_at
+    subscription.disabled_at = disabled_at
     db.flush()
     _replay_delivery_receipts(db, subscription_id=entity_id)
 

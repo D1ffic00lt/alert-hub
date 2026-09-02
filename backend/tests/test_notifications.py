@@ -14,7 +14,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from alert_hub.application.notifications import (
     DeliveryResult,
@@ -23,6 +26,7 @@ from alert_hub.application.notifications import (
     ProviderRegistry,
     enqueue_notification_event,
 )
+from alert_hub.application.sync import IncomingClusterEvent, apply_cluster_events
 from alert_hub.domain.routing import (
     LabelMatcher,
     NodeCandidate,
@@ -31,8 +35,9 @@ from alert_hub.domain.routing import (
     rank_delivery_nodes,
     select_channel_ids,
 )
-from alert_hub.infrastructure.db.base import Base, new_id
+from alert_hub.infrastructure.db.base import Base, new_id, utc_now
 from alert_hub.infrastructure.db.models import (
+    ClusterEvent,
     Delivery,
     Incident,
     IncidentEvent,
@@ -42,7 +47,9 @@ from alert_hub.infrastructure.db.models import (
     Outbox,
     PushSubscription,
     Source,
+    User,
 )
+from alert_hub.infrastructure.db.models import Session as AuthSession
 from alert_hub.infrastructure.db.session import initialize_database
 from alert_hub.infrastructure.notifications.generic_webhook import GenericWebhookProvider
 from alert_hub.infrastructure.notifications.http import (
@@ -77,6 +84,15 @@ class _SequenceProvider:
     ) -> DeliveryResult:
         self.calls.append((message, target))
         return self._results.pop(0)
+
+
+def _browser_p256dh() -> str:
+    public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
+    encoded = public_key.public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode()
 
 
 class _HTTPTransport:
@@ -489,7 +505,7 @@ def test_web_push_marks_gone_subscriptions(status_code: int) -> None:
         channel_kind="web_push",
         config={},
         subscription_id="subscription",
-        endpoint="https://push.example.test/device",
+        endpoint="https://1.1.1.1/push/device",
         p256dh="key",
         auth="auth",
     )
@@ -617,6 +633,58 @@ def _seed_event(
     return event_id, channel_id
 
 
+def _seed_push_subscription(app: Any) -> str:
+    cipher = app.state.envelope_cipher
+    assert cipher is not None
+    user_id = new_id()
+    session_id = new_id()
+    subscription_id = new_id()
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    with app.state.session_factory.begin() as db:
+        db.add(
+            User(
+                id=user_id,
+                username=f"push-{user_id}",
+                password_hash="not-a-real-password-hash",
+            )
+        )
+        db.flush()
+        db.add(
+            AuthSession(
+                id=session_id,
+                user_id=user_id,
+                refresh_token_hash="a" * 64,
+                device_name="Worker browser",
+                created_at=created_at,
+                last_used_at=created_at,
+                expires_at=datetime(2029, 1, 1, tzinfo=UTC),
+                absolute_expires_at=datetime(2030, 1, 1, tzinfo=UTC),
+            )
+        )
+        db.flush()
+        db.add(
+            PushSubscription(
+                id=subscription_id,
+                user_id=user_id,
+                session_id=session_id,
+                device_name="Worker browser",
+                endpoint=cipher.encrypt(
+                    b"https://1.1.1.1/push/worker-device",
+                    context=f"push_subscription:{subscription_id}:endpoint",
+                ),
+                p256dh=cipher.encrypt(
+                    b"browser-public-key",
+                    context=f"push_subscription:{subscription_id}:p256dh",
+                ),
+                auth=cipher.encrypt(
+                    b"browser-auth-secret",
+                    context=f"push_subscription:{subscription_id}:auth",
+                ),
+            )
+        )
+    return subscription_id
+
+
 def test_worker_records_delivery_timeline_and_preserves_event_snapshot(
     app: Any, settings: Any
 ) -> None:
@@ -645,6 +713,172 @@ def test_worker_records_delivery_timeline_and_preserves_event_snapshot(
         assert db.get(Outbox, event_id).completed_at is not None
         timeline = db.query(IncidentEvent).filter_by(event_type="delivery_succeeded").one()
         assert timeline.payload_json["delivery_id"] == delivery.id
+
+
+def test_web_push_delivery_success_and_receipts_advance_subscription_monotonically(
+    app: Any,
+    settings: Any,
+) -> None:
+    _initialize_processor_database(app, settings)
+    delivered_at = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+    subscription_id = _seed_push_subscription(app)
+    event_id, channel_id = _seed_event(app, settings, now=delivered_at)
+    with app.state.session_factory.begin() as db:
+        channel = db.get(NotificationChannel, channel_id)
+        assert channel is not None
+        channel.kind = "web_push"
+
+    provider = _SequenceProvider(DeliveryResult("succeeded", "http_201"))
+    processor = NotificationOutboxProcessor(
+        app.state.session_factory,
+        settings,
+        app.state.envelope_cipher,
+        ProviderRegistry({"web_push": provider}),
+        now=_Clock(delivered_at),
+    )
+    assert asyncio.run(processor.run_once()) == 1
+    assert len(provider.calls) == 1
+    assert provider.calls[0][1].subscription_id == subscription_id
+
+    with app.state.session_factory() as db:
+        subscription = db.get(PushSubscription, subscription_id)
+        assert subscription is not None
+        assert subscription.last_success_at == delivered_at
+        receipt = db.scalar(
+            select(ClusterEvent).where(ClusterEvent.entity_type == "delivery_receipt")
+        )
+        assert receipt is not None
+        assert receipt.payload_json["subscription_id"] == subscription_id
+        assert receipt.payload_json["finished_at"] == delivered_at.isoformat()
+
+    newer = delivered_at + timedelta(hours=2)
+    older = delivered_at + timedelta(hours=1)
+    receipts = ((newer, 1), (older, 2))
+    with app.state.session_factory.begin() as db:
+        for finished_at, origin_seq in receipts:
+            receipt_event_id = new_id()
+            delivery_id = new_id()
+            payload = {
+                "delivery_id": delivery_id,
+                "event_id": event_id,
+                "source_event_key": f"event-{event_id}",
+                "channel_id": channel_id,
+                "subscription_id": subscription_id,
+                "owner_node_id": "peer-node",
+                "attempt": 1,
+                "status": "succeeded",
+                "provider_status": "http_201",
+                "error_code": None,
+                "created_at": finished_at.isoformat(),
+                "finished_at": finished_at.isoformat(),
+                "receipt_event_id": receipt_event_id,
+                "receipt_origin_node_id": "peer-node",
+                "receipt_origin_seq": origin_seq,
+                "receipt_occurred_at": finished_at.isoformat(),
+                "receipt_event_key": f"delivery:{delivery_id}:peer-node:1:succeeded",
+            }
+            result = apply_cluster_events(
+                db,
+                [
+                    IncomingClusterEvent(
+                        event_id=receipt_event_id,
+                        origin_node_id="peer-node",
+                        origin_seq=origin_seq,
+                        entity_type="delivery_receipt",
+                        entity_id=delivery_id,
+                        operation="delivery_succeeded",
+                        occurred_at=finished_at,
+                        payload=payload,
+                    )
+                ],
+                settings,
+            )
+            assert result.applied == 1
+
+    with app.state.session_factory() as db:
+        subscription = db.get(PushSubscription, subscription_id)
+        assert subscription is not None
+        assert subscription.last_success_at == newer
+
+
+@pytest.mark.parametrize(
+    ("session_state", "should_tombstone"),
+    [
+        ("sliding_expired", False),
+        ("absolute_expired", True),
+        ("revoked", True),
+        ("disabled_user", True),
+    ],
+)
+def test_worker_tombstones_push_bound_to_an_inactive_session_before_delivery(
+    client: TestClient,
+    auth: dict[str, str],
+    app: Any,
+    settings: Any,
+    session_state: str,
+    should_tombstone: bool,
+) -> None:
+    now = utc_now()
+    subscription = client.post(
+        "/api/v1/push/subscriptions",
+        headers=auth,
+        json={
+            "endpoint": f"https://1.1.1.1/push/worker-{session_state}",
+            "keys": {
+                "p256dh": _browser_p256dh(),
+                "auth": base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode(),
+            },
+            "device_name": "inactive worker browser",
+        },
+    )
+    assert subscription.status_code == 201, subscription.text
+    event_id, channel_id = _seed_event(app, settings, now=now)
+    with app.state.session_factory.begin() as db:
+        channel = db.get(NotificationChannel, channel_id)
+        auth_session = db.get(AuthSession, subscription.json()["session_id"])
+        assert channel is not None
+        assert auth_session is not None
+        channel.kind = "web_push"
+        if session_state == "sliding_expired":
+            auth_session.expires_at = now
+        elif session_state == "absolute_expired":
+            auth_session.absolute_expires_at = now
+        elif session_state == "disabled_user":
+            auth_session.user.disabled_at = now
+        else:
+            auth_session.revoked_at = now
+        auth_session_id = auth_session.id
+
+    provider = _SequenceProvider(DeliveryResult("succeeded", "http_201"))
+    processor = NotificationOutboxProcessor(
+        app.state.session_factory,
+        settings,
+        app.state.envelope_cipher,
+        ProviderRegistry({"web_push": provider}),
+        now=_Clock(now),
+    )
+    assert asyncio.run(processor.run_once()) == 1
+    assert provider.calls == []
+
+    with app.state.session_factory() as db:
+        persisted = db.get(PushSubscription, subscription.json()["id"])
+        assert persisted is not None
+        if should_tombstone:
+            assert persisted.disabled_at == now
+        else:
+            assert persisted.disabled_at is None
+        assert db.get(Outbox, event_id).completed_at is not None
+        assert db.query(Delivery).count() == 0
+        tombstones = db.scalars(
+            select(ClusterEvent).where(
+                ClusterEvent.entity_type == "push_subscription",
+                ClusterEvent.entity_id == persisted.id,
+                ClusterEvent.operation == "tombstone",
+            )
+        ).all()
+        assert len(tombstones) == int(should_tombstone)
+        if should_tombstone:
+            assert tombstones[0].payload_json["session_id"] == auth_session_id
 
 
 def test_worker_retries_after_restart_without_duplicate_delivery(app: Any, settings: Any) -> None:
@@ -800,7 +1034,7 @@ def test_route_crud_and_live_web_push_test_disables_gone_subscription(
         json={
             "endpoint": endpoint,
             "keys": {
-                "p256dh": base64.urlsafe_b64encode(os.urandom(65)).rstrip(b"=").decode(),
+                "p256dh": _browser_p256dh(),
                 "auth": base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode(),
             },
             "device_name": "gone browser",
@@ -821,3 +1055,168 @@ def test_route_crud_and_live_web_push_test_disables_gone_subscription(
     deleted = client.delete(f"/api/v1/routes/{route.json()['id']}", headers=auth)
     assert deleted.status_code == 204
     assert client.get("/api/v1/routes", headers=auth).json() == []
+
+
+def test_live_web_push_test_records_and_replicates_success_evidence(
+    client: TestClient,
+    auth: dict[str, str],
+    app: Any,
+) -> None:
+    channel = client.post(
+        "/api/v1/channels",
+        headers=auth,
+        json={"name": "Browser push", "kind": "web_push", "config": {}},
+    )
+    assert channel.status_code == 201, channel.text
+    subscription = client.post(
+        "/api/v1/push/subscriptions",
+        headers=auth,
+        json={
+            "endpoint": "https://1.1.1.1/push/success-device",
+            "keys": {
+                "p256dh": _browser_p256dh(),
+                "auth": base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode(),
+            },
+            "device_name": "successful browser",
+        },
+    )
+    assert subscription.status_code == 201, subscription.text
+    subscription_id = subscription.json()["id"]
+    app.state.notification_providers = ProviderRegistry(
+        {"web_push": _SequenceProvider(DeliveryResult("succeeded", "http_201"))}
+    )
+
+    tested = client.post(f"/api/v1/channels/{channel.json()['id']}/test", headers=auth)
+    assert tested.status_code == 200
+    assert tested.json()["status"] == "succeeded"
+
+    with app.state.session_factory() as db:
+        persisted = db.get(PushSubscription, subscription_id)
+        assert persisted is not None
+        assert persisted.last_success_at is not None
+        events = db.scalars(
+            select(ClusterEvent)
+            .where(
+                ClusterEvent.entity_type == "push_subscription",
+                ClusterEvent.entity_id == subscription_id,
+                ClusterEvent.operation == "delivery_success",
+            )
+            .order_by(ClusterEvent.origin_seq)
+        ).all()
+        assert len(events) == 1
+        assert events[0].payload_json == {
+            "schema_version": 1,
+            "last_success_at": persisted.last_success_at.isoformat(),
+        }
+
+
+def test_live_web_push_test_suppresses_sliding_expiry_without_tombstoning(
+    client: TestClient,
+    auth: dict[str, str],
+    app: Any,
+) -> None:
+    channel = client.post(
+        "/api/v1/channels",
+        headers=auth,
+        json={"name": "Browser push", "kind": "web_push", "config": {}},
+    )
+    assert channel.status_code == 201, channel.text
+    subscription = client.post(
+        "/api/v1/push/subscriptions",
+        headers=auth,
+        json={
+            "endpoint": "https://1.1.1.1/push/expired-channel-test",
+            "keys": {
+                "p256dh": _browser_p256dh(),
+                "auth": base64.urlsafe_b64encode(os.urandom(16)).rstrip(b"=").decode(),
+            },
+            "device_name": "expired test browser",
+        },
+    )
+    assert subscription.status_code == 201, subscription.text
+    second_login = client.post(
+        "/api/v1/auth/login",
+        json={"username": "admin", "password": "a-strong-test-password"},
+    )
+    assert second_login.status_code == 200, second_login.text
+    second_auth = {"Authorization": f"Bearer {second_login.json()['access_token']}"}
+
+    with app.state.session_factory.begin() as db:
+        first_session = db.get(AuthSession, subscription.json()["session_id"])
+        assert first_session is not None
+        first_session.expires_at = utc_now() - timedelta(seconds=1)
+
+    provider = _SequenceProvider(DeliveryResult("succeeded", "http_201"))
+    app.state.notification_providers = ProviderRegistry({"web_push": provider})
+    tested = client.post(
+        f"/api/v1/channels/{channel.json()['id']}/test",
+        headers=second_auth,
+    )
+    assert tested.status_code == 200, tested.text
+    assert tested.json()["attempted"] is False
+    assert tested.json()["status"] == "not_configured"
+    assert tested.json()["missing_fields"] == ["active_push_subscription"]
+    assert provider.calls == []
+
+    with app.state.session_factory() as db:
+        persisted = db.get(PushSubscription, subscription.json()["id"])
+        assert persisted is not None and persisted.disabled_at is None
+        tombstones = db.scalars(
+            select(ClusterEvent).where(
+                ClusterEvent.entity_type == "push_subscription",
+                ClusterEvent.entity_id == persisted.id,
+                ClusterEvent.operation == "tombstone",
+            )
+        ).all()
+        assert tombstones == []
+
+    with app.state.session_factory.begin() as db:
+        first_session = db.get(AuthSession, subscription.json()["session_id"])
+        assert first_session is not None
+        first_session.expires_at = utc_now() + timedelta(days=1)
+    retried = client.post(
+        f"/api/v1/channels/{channel.json()['id']}/test",
+        headers=second_auth,
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["status"] == "succeeded"
+    assert len(provider.calls) == 1
+
+
+def test_live_web_push_test_tombstones_unbound_legacy_subscription(
+    client: TestClient,
+    auth: dict[str, str],
+    app: Any,
+) -> None:
+    channel = client.post(
+        "/api/v1/channels",
+        headers=auth,
+        json={"name": "Browser push", "kind": "web_push", "config": {}},
+    )
+    assert channel.status_code == 201, channel.text
+    subscription_id = _seed_push_subscription(app)
+    with app.state.session_factory.begin() as db:
+        subscription = db.get(PushSubscription, subscription_id)
+        assert subscription is not None and subscription.session_id is not None
+        subscription.session_id = None
+
+    provider = _SequenceProvider(DeliveryResult("succeeded", "http_201"))
+    app.state.notification_providers = ProviderRegistry({"web_push": provider})
+    tested = client.post(f"/api/v1/channels/{channel.json()['id']}/test", headers=auth)
+    assert tested.status_code == 200, tested.text
+    assert tested.json()["attempted"] is False
+    assert tested.json()["missing_fields"] == ["active_push_subscription"]
+    assert provider.calls == []
+
+    with app.state.session_factory() as db:
+        persisted = db.get(PushSubscription, subscription_id)
+        assert persisted is not None and persisted.disabled_at is not None
+        tombstone = db.scalar(
+            select(ClusterEvent).where(
+                ClusterEvent.entity_type == "push_subscription",
+                ClusterEvent.entity_id == subscription_id,
+                ClusterEvent.operation == "tombstone",
+            )
+        )
+        assert tombstone is not None
+        assert tombstone.payload_json["session_id"] is None

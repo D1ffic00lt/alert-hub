@@ -221,30 +221,40 @@ def logout(
     require_cookie_csrf(request, settings)
     raw_refresh = request.cookies.get(settings.refresh_cookie_name)
     if raw_refresh:
+        from alert_hub.application.auth import disable_session_push_subscriptions
         from alert_hub.security import hash_token
 
         token_hash = hash_token(raw_refresh, settings.signing_key, "refresh")
         session = db.scalar(select(AuthSession).where(AuthSession.refresh_token_hash == token_hash))
-        if session and session.revoked_at is None:
-            session.revoked_at = utc_now()
-            append_cluster_event(
+        if session is not None:
+            newly_revoked = session.revoked_at is None
+            if newly_revoked:
+                session.revoked_at = utc_now()
+                append_cluster_event(
+                    db,
+                    settings,
+                    entity_type="session",
+                    entity_id=session.id,
+                    operation="revoke",
+                    payload=session_cluster_payload(session),
+                )
+                add_audit(
+                    db,
+                    settings,
+                    "logout",
+                    actor_user_id=session.user_id,
+                    entity_type="session",
+                    entity_id=session.id,
+                    request_id=getattr(request.state, "request_id", None),
+                )
+            disabled_subscription_ids = disable_session_push_subscriptions(
                 db,
+                session.id,
                 settings,
-                entity_type="session",
-                entity_id=session.id,
-                operation="revoke",
-                payload=session_cluster_payload(session),
+                disabled_at=session.revoked_at,
             )
-            add_audit(
-                db,
-                settings,
-                "logout",
-                actor_user_id=session.user_id,
-                entity_type="session",
-                entity_id=session.id,
-                request_id=getattr(request.state, "request_id", None),
-            )
-            db.commit()
+            if newly_revoked or disabled_subscription_ids:
+                db.commit()
     response.delete_cookie(
         settings.refresh_cookie_name,
         path="/api/v1/auth",
