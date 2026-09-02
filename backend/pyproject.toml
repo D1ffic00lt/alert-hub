@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alert-hub"
-version = "0.1.0"
+version = "0.1.1"
 description = "Self-hosted, eventually-consistent alert hub"
 license = "MIT"
 requires-python = ">=3.12,<3.14"
@@ -23,10 +23,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "mypy>=1.13,<2",
+  "mypy>=1.13,<3",
   "pip-audit>=2.9,<3",
   "pytest>=9.0.3,<10",
-  "pytest-cov>=6,<7",
+  "pytest-cov>=6,<8",
   "ruff>=0.8,<1",
   "yamllint>=1.37,<2",
 ]

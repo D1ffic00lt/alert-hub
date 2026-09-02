@@ -1,14 +1,56 @@
-# Bind this site only to an exact private/WireGuard address. Do not use :8443
-# without an address because that would listen on every interface.
-https://__WIREGUARD_IP__:8443 {
-    tls /etc/ssl/alert-hub-peer/fullchain.pem /etc/ssl/alert-hub-peer/privkey.pem
+# Dedicated HTTPS peer virtual host. Keep this hostname distinct from the
+# public UI hostname: the public Caddyfile must continue to deny /internal/*.
+#
+# Caddy obtains and renews this hostname's certificate. Publish the peer DNS
+# record directly to this proxy (DNS-only, without a CDN or another L7 proxy),
+# because the source allowlist deliberately matches the TCP peer address.
+__SERVER_NAME__ {
+	request_body {
+		max_size 1MB
+	}
 
-    @not_peer not path /internal/*
-    respond @not_peer 404
+	route {
+		# Repeated --peer-cidr installer arguments render as exact /32s here.
+		# A failed/masked source-address inventory therefore fails closed.
+		@source_denied not remote_ip __PEER_CIDRS__
+		respond @source_denied 403
 
-    @allowed remote_ip __PEER_CIDR__
-    handle @allowed {
-        reverse_proxy 127.0.0.1:8080
-    }
-    respond 403
+		@peer_health {
+			method GET
+			path /internal/v1/nodes/health
+		}
+		reverse_proxy @peer_health __UPSTREAM__ {
+			# Never let an Internet client author the address checked by the
+			# API's PEER_ALLOWED_CIDRS policy.
+			header_up X-Forwarded-For {http.request.remote.host}
+			header_up X-Real-IP {http.request.remote.host}
+			header_up X-Forwarded-Proto https
+			header_up -Forwarded
+			header_up -X-Forwarded-Host
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+		}
+
+		@peer_query {
+			method POST
+			path /internal/v1/sync/events/query
+		}
+		reverse_proxy @peer_query __UPSTREAM__ {
+			header_up X-Forwarded-For {http.request.remote.host}
+			header_up X-Real-IP {http.request.remote.host}
+			header_up X-Forwarded-Proto https
+			header_up -Forwarded
+			header_up -X-Forwarded-Host
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+		}
+
+		# This hostname is not a second public API. Wrong methods, every other
+		# internal operation, UI/API paths, metrics, and diagnostics stay dark.
+		respond 404
+	}
 }

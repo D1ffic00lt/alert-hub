@@ -1,25 +1,61 @@
-# Optional private-only peer listener. Replace __WIREGUARD_IP__ with one exact
-# local WireGuard address and restrict source CIDRs again at the host firewall.
+# Dedicated HTTPS peer virtual host. Keep this hostname distinct from the
+# public UI hostname: the public Nginx server must continue to deny /internal/*.
+# Obtain the certificate before installing this file. The installer substitutes
+# operator-managed certificate paths and validates the complete Nginx config.
 server {
-    listen __WIREGUARD_IP__:8443 ssl;
-    server_name _;
+    listen 443 ssl;
+    server_name __SERVER_NAME__;
 
-    ssl_certificate /etc/ssl/alert-hub-peer/fullchain.pem;
-    ssl_certificate_key /etc/ssl/alert-hub-peer/privkey.pem;
+    ssl_certificate __TLS_CERTIFICATE__;
+    ssl_certificate_key __TLS_PRIVATE_KEY__;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
 
-    allow __PEER_CIDR__;
+    client_max_body_size 1m;
+    client_body_timeout 15s;
+    server_tokens off;
+
+    # Publish peer DNS directly to this proxy (DNS-only, without a CDN or
+    # another L7 proxy). Repeated --peer-cidr arguments render as exact /32s.
+    __PEER_NGINX_ALLOW__
     deny all;
-    client_max_body_size 2m;
 
-    location /internal/ {
-        proxy_pass http://127.0.0.1:8080;
+    location = /internal/v1/nodes/health {
+        # limit_except treats HEAD as GET; an explicit return preserves the
+        # protocol's exact GET-only surface.
+        if ($request_method != GET) { return 404; }
+
+        proxy_pass http://__UPSTREAM__;
+        proxy_http_version 1.1;
         proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Forwarded-Host "";
         proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
         proxy_read_timeout 30s;
     }
 
+    location = /internal/v1/sync/events/query {
+        if ($request_method != POST) { return 404; }
+
+        proxy_pass http://__UPSTREAM__;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Forwarded-Host "";
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+    }
+
+    # This hostname is not a second public API. Every other internal operation,
+    # UI/API path, metrics endpoint, and diagnostic endpoint remains hidden.
     location / {
         return 404;
     }

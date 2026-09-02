@@ -141,7 +141,7 @@ operations-check:
 		ALERT_HUB_DATA_DIR=/tmp ALERT_HUB_SECRETS_DIR=/tmp \
 		ALERT_HUB_EDGE_SUBNET=10.253.251.0/29 \
 		ALERT_HUB_API_IP=10.253.251.2 ALERT_HUB_WEB_IP=10.253.251.3 \
-		ALERT_HUB_PEER_ADDRESS=10.253.252.2 \
+		ALERT_HUB_API_HOST_PORT=18081 \
 		docker compose -f .github/deploy/docker-compose.production.yml config --quiet
 	ALERT_HUB_API_IMAGE=ghcr.io/example/alert-hub-api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
 		ALERT_HUB_WEB_IMAGE=ghcr.io/example/alert-hub-web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
@@ -149,7 +149,7 @@ operations-check:
 		ALERT_HUB_DATA_DIR=/tmp ALERT_HUB_SECRETS_DIR=/tmp \
 		ALERT_HUB_EDGE_SUBNET=10.253.251.0/29 \
 		ALERT_HUB_API_IP=10.253.251.2 ALERT_HUB_WEB_IP=10.253.251.3 \
-		ALERT_HUB_PEER_ADDRESS=10.253.252.2 \
+		ALERT_HUB_API_HOST_PORT=18081 \
 		MONITORING_NETWORK=existing-monitoring \
 		docker compose \
 			-f .github/deploy/docker-compose.production.yml \

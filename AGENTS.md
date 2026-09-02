@@ -8,7 +8,7 @@ This repository implements a self-hosted, eventually consistent alert hub. Treat
 - Prefer preserving an alert over suppressing every duplicate. A partition may produce a duplicate notification; it must not erase an event.
 - Every node owns its own SQLite file. Never introduce shared/network SQLite, Redis, a broker, or a hidden central coordinator.
 - Replicated history is append-only and idempotent. Preserve `origin_node_id`, `origin_seq`, `event_id`, tombstones, and deterministic projection ordering.
-- Public traffic terminates at the operator's existing HTTPS proxy. Application and peer ports stay loopback/private; `/internal/*` must never be routed by the public virtual host.
+- Public traffic terminates at the operator's existing HTTPS proxy. Application ports stay loopback/private. The public UI virtual host must never route `/internal/*`; a distinct source-allowlisted peer HTTPS virtual host may expose only the exact cluster operations documented in `docs/security.md`.
 - Prometheus remains the time-series source of truth and Grafana remains the detailed visualization surface. Do not copy arbitrary time-series into SQLite or accept browser-authored PromQL.
 - Product display text comes from `APP_NAME`; table names, Python namespaces, protocol fields, and event types do not.
 

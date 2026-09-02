@@ -62,14 +62,13 @@ Console fallback when GitHub or a runner is unavailable:
 export NODE_NAME=ru
 export NODE_IP=NODE_INVENTORY_VALUE
 export PUBLIC_DOMAIN=alerts.example.com
-export PEER_ADDRESS=10.0.0.10
 export GITHUB_REPOSITORY=OWNER/alert-hub
 export ALERT_HUB_COMPONENT=api
 export ALERT_HUB_ROLLBACK_VERSION=previous
 export ALERT_HUB_CONFIRMATION='ROLLBACK ru'
 # For a private package, also export GHCR_TOKEN and GITHUB_ACTOR without
 # placing the token in argv or shell tracing.
-sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,GITHUB_REPOSITORY,ALERT_HUB_COMPONENT,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR \
+sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,GITHUB_REPOSITORY,ALERT_HUB_COMPONENT,ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_CONFIRMATION,GHCR_TOKEN,GITHUB_ACTOR \
   /usr/local/sbin/docker-rollback-node.sh
 unset GHCR_TOKEN
 ```
@@ -102,19 +101,19 @@ forward release or rebuild the node from trusted material.
 | One complete node lost        | Disable its DNS/eligibility and revoke host credentials     | Rebuild host; restore verified node backup or bootstrap as a new node                      | Preserve old node ID only when restoring its history. New empty node gets a new ID. |
 | RU↔EU partition               | Keep both sides accepting; avoid destructive reconciliation | Restore network, observe cursor convergence and duplicates                                 | Target behavior permits duplicates, never disappearance.                            |
 | Push/provider failure         | Keep intake/UI healthy; retain queued deliveries            | Observe durable retry/backoff and ownership failover; disable `404/410` subscriptions      | Provider outage must not make local API readiness fail.                             |
-| Suspected host compromise     | Isolate host/private peer immediately                       | Rotate node/provider credentials and rebuild from trusted image/backup                     | Do not trust local rollback alone.                                                  |
+| Suspected host compromise     | Isolate the host and disable peer traffic immediately       | Rotate node/provider credentials and rebuild from trusted image/backup                     | Do not trust local rollback alone.                                                  |
 | Full cluster loss             | Stop senders from cycling uncontrolled retries              | Restore keys, choose newest verified DB, start one isolated node, validate, then add peers | Decide recovery point explicitly; peer replication is unavailable.                  |
 
 ## Complete node rebuild
 
 If the host is lost but a trusted node backup and key bundle exist:
 
-1. inventory/rebuild the host and private network;
+1. inventory/rebuild the host and its configured peer transport;
 2. install root-owned wrapper/config from a verified release;
 3. restore cluster/signing/encryption/VAPID secrets over the secret channel;
 4. restore SQLite while the container is stopped, preserving the backed-up node ID;
 5. deploy the compatible digest and validate locally with public traffic disabled;
-6. check vector cursors against peers, then enable private sync and observe;
+6. check vector cursors against peers, then enable the configured peer sync and observe;
 7. re-enable ingest, notification eligibility, and public routing one at a time.
 
 If no usable node DB exists, assign a new node ID and use snapshot/full-resync bootstrap after that feature is implemented. Never reuse another live node's ID or point two nodes at the same SQLite file.
@@ -144,7 +143,8 @@ differ. Pull-request CI includes a controlled three-container substitute that ex
 SQLite files, partitioned duplicate and reverse-order ingress, process loss, peer return, restart,
 cursor convergence, and re-fire.
 
-That test is not evidence that the installation's RU/EU private routes, host firewalls, proxies,
+That test is not evidence that the installation's RU/EU peer DNS/TLS or optional private routes,
+host firewalls, proxies,
 provider egress, or delivery-owner failure behave correctly. Run the same scenario against the
 real topology, capture the fields listed below, and link the dated artifacts from
 [acceptance evidence](../acceptance-evidence.md) before marking the production partition scenario

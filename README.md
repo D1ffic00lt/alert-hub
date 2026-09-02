@@ -33,7 +33,9 @@ The default Compose file builds and runs two independent containers:
 Only the web service is published, on `127.0.0.1:8080` by default. Put an
 existing HTTPS Nginx or Caddy instance in front of it. The supplied proxy
 examples deny public access to peer, metrics, deep-health, and API-documentation
-routes.
+routes. Production peer synchronization uses separate operator-managed HTTPS
+hostnames; dedicated Nginx/Caddy templates allowlist exact node `/32` sources
+and expose only the two required peer operations.
 
 The explicit split example is equivalent to the default:
 
@@ -73,7 +75,9 @@ ghcr.io/<owner>/alert-hub-web:vX.Y.Z
 The release manifest records both digest-qualified references and their API
 contract compatibility value. A release is complete only after both images are
 built, tested together, published, attested, and attached to the same GitHub
-Release.
+Release. The Release workflow may be started manually from `main` with a version
+and literal `RELEASE` confirmation; it creates the immutable tag after the gate.
+Pushing an existing version tag remains supported.
 
 The API image uses `backend/` as its complete build context. It cannot see or
 copy frontend files and contains no Node.js tooling. The web image uses
@@ -121,9 +125,10 @@ root-owned host rollback state machine remains a production-like installation dr
 
 Pull requests to `main` run read-only GitHub-hosted checks and never publish or
 deploy. A successful `main` build may publish only `sha-<commit>` candidates.
-Version tags publish the two release images, SBOMs, provenance attestations, and
-the compatible-pair manifest. Production deploy and rollback are separate,
-manual, protected workflows.
+Semver-like `v*.*.*` tags also run the normal CI matrix without publishing a
+candidate; the separate release workflow publishes the two release images,
+SBOMs, provenance attestations, and compatible-pair manifest. Production deploy
+and rollback are separate, manual, protected workflows.
 
 ## Repository layout
 

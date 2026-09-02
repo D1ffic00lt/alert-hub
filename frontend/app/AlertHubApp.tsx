@@ -1458,7 +1458,7 @@ async function apiFetch(path: string, init: RequestInit = {}) {
   const shouldFailOver =
     !primary || primary.status >= 500 || primary.headers.get("X-Alert-Hub-Cache") === "hit";
   if (canFailOver && shouldFailOver && typeof localStorage !== "undefined") {
-    let saved: unknown = [];
+    let saved: unknown;
     try {
       saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
     } catch {
@@ -5598,7 +5598,7 @@ function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boo
     const next = enabled
       ? enabledEndpoints.filter((entry) => entry !== item)
       : [...new Set([...enabledEndpoints, item])].slice(0, 8);
-    let disabled: string[] = [];
+    let disabled: string[];
     try {
       const saved = JSON.parse(localStorage.getItem("alert-hub-disabled-api-endpoints") ?? "[]");
       disabled = Array.isArray(saved)

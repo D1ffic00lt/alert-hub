@@ -12,19 +12,29 @@ remain useful when peers are unreachable.
 flowchart LR
     AM["Existing Alertmanager"] -->|"HTTPS webhook"| PX["Existing public reverse proxy"]
     UI["Installed browser PWA"] <-->|"HTTPS / API / SSE"| PX
-    PX -->|"127.0.0.1:8080"| WEB["Alert Hub web container"]
+    PX -->|"WEB_IP:8080\nmanaged edge"| WEB["Alert Hub web container"]
     WEB -->|"private bridge :8080"| API["Alert Hub API container"]
     API --> DB[("Node-local SQLite")]
-    API -. "private peer API\nWireGuard only" .-> PEER["Other Alert Hub nodes"]
+    API -. "HTTPS health/query\ncluster bearer" .-> PEERPX["Other node peer TLS vhost\nexact source /32"]
+    PEERPX --> PEER["Other Alert Hub API"]
     API -. "backend queries" .-> PROM["Existing Prometheus"]
     API -. "bounded provider delivery" .-> PUSH["Web Push / Telegram / SMTP / webhook"]
 ```
 
-Only the existing reverse proxy terminates public HTTPS. Compose binds the web service to
-loopback; the API is not host-published in split mode. Public proxy examples return `404` for `/internal/*`, `/metrics`, `/health/deep`,
-`/api/docs*`, `/api/redoc*`, and `/api/openapi.json`. A separate example can bind a peer listener
-to one explicit WireGuard address and allowlisted CIDR. Prometheus scraping, deep diagnostics, and
-API documentation stay on loopback/private operator paths rather than the public virtual host.
+Only operator-managed reverse proxies terminate public HTTPS. Production host
+proxies target fixed web/API addresses on the managed edge bridge; a
+containerized Caddy uses service DNS on that bridge. Loopback publishes are
+reserved for local smoke/operator checks. The ordinary UI proxy returns `404`
+for `/internal/*`, `/metrics`, `/health/deep`,
+`/api/docs*`, `/api/redoc*`, and `/api/openapi.json`. A separate peer hostname
+accepts only the other nodes' exact public `/32` sources and routes only
+`GET /internal/v1/nodes/health` and
+`POST /internal/v1/sync/events/query`; every other method/path fails closed.
+Prometheus scraping, deep diagnostics, and API documentation stay on
+loopback/private operator paths rather than either public virtual host.
+An operator may instead keep literal RFC1918/ULA HTTP peer origins inside an
+authenticated WireGuard/private network; that optional transport is not
+required by the standard HTTPS peer-hostname deployment.
 
 ## Independent image model
 
@@ -121,13 +131,18 @@ web image. Disabling a role must not silently broaden another network boundary.
 ## Deployment model
 
 The release workflow builds version-tagged API and web GHCR images, tests their exact compatible
-pair, and records both digest-qualified references in `release-manifest.json`. A release is not
-complete unless both artifacts, both SBOMs, and both provenance attestations succeed.
+pair, and records both digest-qualified references in `release-manifest.json`. It accepts either
+an existing version tag or a manually confirmed version on `main`; in the latter flow it creates
+the immutable tag in the same validated workflow. A release is not complete unless both artifacts,
+both SBOMs, and both provenance attestations succeed.
 
 Each node records current and historical component manifests beneath `/opt/alert-hub`. The
 root-owned deployment wrapper is the privileged interface used by a dedicated self-hosted runner.
 The API always has a separate outbound bridge and joins an existing monitoring Docker network only
-through an optional root-owned production override. Production accepts only a masqueraded,
+through an optional root-owned production override. Host proxies reach the fixed web/API addresses
+on the managed edge bridge; a containerized Caddy may instead add that bridge to its existing
+proxy-owned networks and use the service names. It must not join Alert Hub egress or monitoring.
+The loopback-published ports remain local smoke/operator endpoints. Production accepts only a masqueraded,
 non-internal user-defined local bridge and status enforces the exact expected network set. The
 root-owned provisioner and runtime wrappers share one lock, so a rollback-safe script/Compose
 refresh cannot overlap deployment work. The engine validates exact digest references and

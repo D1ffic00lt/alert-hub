@@ -5,8 +5,8 @@
 Alert Hub crosses five materially different boundaries:
 
 1. an untrusted browser and public webhook senders reach the existing HTTPS reverse proxy;
-2. the proxy reaches one loopback-only application port;
-3. peer nodes reach only a private/WireGuard listener and separate internal API policy;
+2. the proxy reaches a fixed private application address on the managed edge bridge;
+3. peer nodes reach a dedicated HTTPS hostname with exact source and internal API policy;
 4. the backend makes constrained outbound connections to providers and Prometheus;
 5. a repository-scoped GitHub runner asks a root-owned local wrapper to deploy an immutable image.
 
@@ -14,23 +14,23 @@ SQLite, secret files, Docker socket, proxy configuration, backup directory, and 
 
 ## Threat model
 
-| Threat                                 | Asset/impact                            | Current control                                                                                                                                                                                                                                              | Residual/follow-on work                                                                                                                                                         |
-| -------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Stolen source token                    | False incidents or ingest flood         | Random bearer token displayed once, only keyed hash stored, body limit, disabled/deleted source checks, optional per-source CIDRs, and bounded per-node ingest limiting                                                                                      | Limits are not cluster-global. Keep firewall/proxy controls and sender backoff; rotate a compromised source token.                                                              |
-| Credential stuffing/bootstrap attack   | Admin account/session                   | Bootstrap token file, Argon2id with a valid dummy-hash path for unknown users, rotating hashed refresh sessions, exact Origin/CSRF checks, replicated split-brain detection, and bounded per-node login/bootstrap limits                                     | Add an authenticated operator conflict-resolution workflow and a deliberate distributed lockout policy if operationally required.                                               |
-| Cookie/token theft                     | Account takeover                        | Short access lifetime, refresh rotation/revoke, exact trusted origins, secure cookie settings                                                                                                                                                                | Review shared cookie domain carefully; add WebAuthn/passkeys later.                                                                                                             |
-| Malicious webhook payload              | Memory/CPU/DB exhaustion, log injection | 1 MiB default limit, per-node pre-parse rate limiting, Pydantic/adapter validation, normalized enums/timestamps, unknown data kept as structured JSON                                                                                                        | Add row-retention controls and fuzz/property tests; never log authorization headers or raw secrets.                                                                             |
-| Public peer/operator endpoint          | Cluster forgery or diagnostics exposure | Public proxy denies `/internal/*`, `/metrics`, `/health/deep`, and API documentation; peer traffic uses a separate rotatable cluster secret, private listener examples, IP allowlist, strict transport timeouts/page limits/backoff, and failed-auth audit   | Validate the actual WireGuard/firewall boundary and public exposure on every host; automate secret-rotation drills.                                                             |
-| Compromised peer                       | Validly signed bad cluster events       | Append-only identity/cursors and deterministic validation boundary                                                                                                                                                                                           | There is no Byzantine consensus. Incident response must revoke the peer/key and rebuild projections from trusted evidence.                                                      |
-| SSRF through datasource/channel URL    | Cloud metadata/internal service access  | Prometheus defaults to HTTPS/public addresses, rejects embedded credentials and redirects, re-resolves immediately before bounded requests, ignores environment proxies, and requires explicit HTTP/private settings; generic webhooks validate destinations | DNS can change between validation and OS connect; retain egress firewall controls and allow only the intended monitoring network. Provider delivery needs equivalent exercises. |
-| Secret disclosure in image/Git/log     | Provider or cluster compromise          | Secret-file mounts, `.dockerignore`, pattern CI check, no token CLI argument in ingest smoke, no secret artifacts                                                                                                                                            | Add an organization secret scanner and validate application redaction with integration tests.                                                                                   |
-| SQLite theft                           | Incident/user/config disclosure         | Host permissions; channel/push material uses AES-256-GCM envelope storage; password/source/refresh tokens are hashes                                                                                                                                         | Full DB encryption is not provided. Labels, annotations, audit data, and incident history may themselves be sensitive.                                                          |
-| SQLite corruption/ransomware           | Lost history/availability               | WAL invariants, online verified backups, checksum, retention, isolated restore procedure                                                                                                                                                                     | Replicate backups off-node and perform scheduled restore drills; replication is not backup.                                                                                     |
-| Malicious PR on self-hosted runner     | Root/container takeover                 | PR CI uses GitHub-hosted runners; production node jobs do not check out code; sudo permits only a root-owned validating wrapper                                                                                                                              | Protect workflow changes with CODEOWNERS/branch rules; keep runner repository-scoped and ephemeral where practical.                                                             |
-| Mutable image/action tag               | Supply-chain substitution               | Production tag resolved to digest; all Actions pinned to full commits; tag releases include SBOM/provenance/attestation; no `latest`                                                                                                                         | Verify attestations and admission policy before rollout; review dependency lock updates.                                                                                        |
-| Proxy-header spoofing                  | IP allowlist/audit bypass               | One resolver ignores forwarding headers from untrusted immediate peers and walks an explicitly trusted chain right-to-left; the dedicated web proxy appends its observed peer address                                                                        | Trust only the web container's exact bridge address plus inventoried outer proxies; never put ordinary peer/sender networks in the proxy-trust list.                            |
-| XSS/service-worker compromise          | Long-lived client control               | CSP/frame/content-type/referrer/permissions headers, `script-src 'self'`, and no-store service-worker updates                                                                                                                                                | Add installation-level CSP reporting and replace the narrowly scoped inline-style allowance with a nonce/hash or equivalent design when the runtime UI permits it.              |
-| Duplicate notification under partition | User fatigue/action confusion           | Deterministic rendezvous ownership and delivery IDs use the logical incident event key; durable claims, failover delay, and replicated receipts map success onto each node's corresponding local event row                                                   | A true partition can still produce a duplicate by design. Validate owner loss with the real providers/topology; this is not exactly-once behavior.                              |
+| Threat                                 | Asset/impact                            | Current control                                                                                                                                                                                                                                                                                                        | Residual/follow-on work                                                                                                                                                         |
+| -------------------------------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stolen source token                    | False incidents or ingest flood         | Random bearer token displayed once, only keyed hash stored, body limit, disabled/deleted source checks, optional per-source CIDRs, and bounded per-node ingest limiting                                                                                                                                                | Limits are not cluster-global. Keep firewall/proxy controls and sender backoff; rotate a compromised source token.                                                              |
+| Credential stuffing/bootstrap attack   | Admin account/session                   | Bootstrap token file, Argon2id with a valid dummy-hash path for unknown users, rotating hashed refresh sessions, exact Origin/CSRF checks, replicated split-brain detection, and bounded per-node login/bootstrap limits                                                                                               | Add an authenticated operator conflict-resolution workflow and a deliberate distributed lockout policy if operationally required.                                               |
+| Cookie/token theft                     | Account takeover                        | Short access lifetime, refresh rotation/revoke, exact trusted origins, secure cookie settings                                                                                                                                                                                                                          | Review shared cookie domain carefully; add WebAuthn/passkeys later.                                                                                                             |
+| Malicious webhook payload              | Memory/CPU/DB exhaustion, log injection | 1 MiB default limit, per-node pre-parse rate limiting, Pydantic/adapter validation, normalized enums/timestamps, unknown data kept as structured JSON                                                                                                                                                                  | Add row-retention controls and fuzz/property tests; never log authorization headers or raw secrets.                                                                             |
+| Public peer/operator endpoint          | Cluster forgery or diagnostics exposure | The UI proxy denies `/internal/*`, metrics, deep health, and API docs; a distinct TLS peer vhost exposes only health/query with exact source `/32`, overwritten forwarding headers, cluster bearer, strict transport limits/backoff, and failed-auth audit                                                             | Validate real DNS/TLS/source preservation and exposure on every host; retain host firewall controls and automate secret-rotation drills.                                        |
+| Compromised peer                       | Validly signed bad cluster events       | Append-only identity/cursors and deterministic validation boundary                                                                                                                                                                                                                                                     | There is no Byzantine consensus. Incident response must revoke the peer/key and rebuild projections from trusted evidence.                                                      |
+| SSRF through datasource/channel URL    | Cloud metadata/internal service access  | Prometheus defaults to HTTPS/public addresses, rejects embedded credentials and redirects, re-resolves immediately before bounded requests, ignores environment proxies, and requires explicit HTTP/private settings; generic webhooks validate destinations                                                           | DNS can change between validation and OS connect; retain egress firewall controls and allow only the intended monitoring network. Provider delivery needs equivalent exercises. |
+| Secret disclosure in image/Git/log     | Provider or cluster compromise          | Secret-file mounts, `.dockerignore`, pattern CI check, no token CLI argument in ingest smoke, no secret artifacts                                                                                                                                                                                                      | Add an organization secret scanner and validate application redaction with integration tests.                                                                                   |
+| SQLite theft                           | Incident/user/config disclosure         | Host permissions; channel/push material uses AES-256-GCM envelope storage; password/source/refresh tokens are hashes                                                                                                                                                                                                   | Full DB encryption is not provided. Labels, annotations, audit data, and incident history may themselves be sensitive.                                                          |
+| SQLite corruption/ransomware           | Lost history/availability               | WAL invariants, online verified backups, checksum, retention, isolated restore procedure                                                                                                                                                                                                                               | Replicate backups off-node and perform scheduled restore drills; replication is not backup.                                                                                     |
+| Malicious PR on self-hosted runner     | Root/container takeover                 | PR CI uses GitHub-hosted runners; production node jobs do not check out code; sudo permits only a root-owned validating wrapper                                                                                                                                                                                        | Protect workflow changes with CODEOWNERS/branch rules; keep runner repository-scoped and ephemeral where practical.                                                             |
+| Mutable image/action tag               | Supply-chain substitution               | Production tag resolved to digest; all Actions pinned to full commits; tag releases include SBOM/provenance/attestation; no `latest`                                                                                                                                                                                   | Verify attestations and admission policy before rollout; review dependency lock updates.                                                                                        |
+| Proxy-header spoofing                  | IP allowlist/audit bypass               | One resolver ignores forwarding headers from untrusted immediate peers and walks an explicitly trusted chain right-to-left; production trusts only loopback and the root-controlled managed edge subnet containing the application and operator proxy; dedicated proxies overwrite or append observed source addresses | Keep the edge subnet isolated from unreviewed containers; never put ordinary peer/sender networks in the proxy-trust list.                                                      |
+| XSS/service-worker compromise          | Long-lived client control               | CSP/frame/content-type/referrer/permissions headers, `script-src 'self'`, and no-store service-worker updates                                                                                                                                                                                                          | Add installation-level CSP reporting and replace the narrowly scoped inline-style allowance with a nonce/hash or equivalent design when the runtime UI permits it.              |
+| Duplicate notification under partition | User fatigue/action confusion           | Deterministic rendezvous ownership and delivery IDs use the logical incident event key; durable claims, failover delay, and replicated receipts map success onto each node's corresponding local event row                                                                                                             | A true partition can still produce a duplicate by design. Validate owner loss with the real providers/topology; this is not exactly-once behavior.                              |
 
 ## Secrets
 
@@ -54,13 +54,19 @@ Application logging uses a fixed structured-field allowlist, excludes request he
 
 ## Network policy
 
-- Public inbound: existing HTTPS `443` only; SSH `22` only if already required and restricted.
-- Host application: only the inventoried `127.0.0.1:<HOST_PORT>` from the
-  root-owned node policy.
-- Peer: explicit literal RFC 1918/ULA WireGuard addresses at the application
-  protocol boundary, allowlisted peer CIDRs, never a public hostname or public
-  proxy. The current production host wrapper binds only literal RFC1918 IPv4;
-  ULA-only host deployment needs a separately reviewed extension.
+- Public inbound: steady-state HTTPS `443` only; SSH `22` only if already
+  required and restricted. Prefer DNS-01 certificate issuance; an HTTP-01 flow
+  needs an explicitly timed and monitored `80` exception that is removed after
+  issuance or renewal.
+- Host application: loopback-published web/API ports are for local smoke and
+  operator access only. Host proxies use the fixed private web/API addresses on
+  the managed edge bridge; neither application port may bind a public interface.
+- Peer: a dedicated operator-managed HTTPS hostname on `443`, DNS-resolved
+  directly to the node, proxy-allowlisted to the other nodes' exact public IPv4
+  `/32` values, and restricted to the health/query method-path pairs. The
+  cluster bearer and application CIDR policy remain mandatory second layers.
+  Literal RFC1918/ULA HTTP remains valid only as an optional WireGuard/private-
+  network mode; it must never traverse the public Internet.
 - SQLite: filesystem only, no network listener.
 - Prometheus/Alertmanager/Blackbox: existing private/local exposure unchanged.
 - Runner: outbound HTTPS to GitHub; no inbound deployment port.
@@ -71,9 +77,18 @@ The supplied public Nginx/Caddy examples return `404` for `/internal/*`, `/metri
 on loopback/private paths and verify the real virtual host from an external network; the static
 example check is not an exposure scan.
 
-Peer-sync clients ignore `HTTP_PROXY`/`HTTPS_PROXY`, do not follow redirects, apply finite connect/read/write/pool timeouts, cap decoded response bodies with `SYNC_MAX_RESPONSE_BYTES`, cap events/pages, and back off independently per peer. This keeps the private cluster bearer out of ambient proxies and prevents an oversized peer response from consuming unbounded worker memory or advancing a cursor.
+Peer-sync clients ignore `HTTP_PROXY`/`HTTPS_PROXY`, require exact HTTPS origins
+unless an operator deliberately selects literal RFC1918/ULA HTTP for a private
+network, do not follow redirects, apply finite connect/read/write/pool timeouts, cap
+decoded response bodies with `SYNC_MAX_RESPONSE_BYTES`, cap events/pages, and
+back off independently per peer. This keeps the cluster bearer out of ambient
+proxies and prevents an oversized peer response from consuming unbounded worker
+memory or advancing a cursor.
 
-Verify from an external host that application, peer, metrics, and monitoring ports are closed. Verify from each peer that only the intended private peer endpoint is reachable.
+Verify externally that only the intended `443` virtual hosts are reachable and
+that application, metrics, and monitoring ports remain closed. From each peer,
+verify the certificate and only the two permitted method/path pairs. From an
+unrelated address, verify the peer hostname fails closed.
 
 ## Authentication and browser policy
 
@@ -85,15 +100,26 @@ Shared parent-domain cookies reduce friction but expand the compromise boundary 
 
 `TRUSTED_PROXY_CIDRS` identifies only infrastructure allowed to speak for an earlier network hop. The immediate socket peer must match before `Forwarded`, `X-Forwarded-For`, or `X-Real-IP` is read. The resolver walks the resulting chain from the application outward and stops at the first untrusted address. Malformed or ambiguous forwarding values fall back to the immediate peer.
 
-The web container's Nginx uses `$proxy_add_x_forwarded_for`; it does not pass an inbound value
-through unchanged. FastAPI sees the web container's dedicated bridge address and then the address
-Nginx actually observed. Compose adds only the exact web `/32` to `TRUSTED_PROXY_CIDRS`. To recover
-an original public client behind an additional host proxy, add only the exact container-visible
-host-proxy/Docker-gateway address. Do not add a whole peer or monitoring network: a trusted member
-could then author an earlier address. Source and peer allowlists, rate-limit keys, and security
-audit entries all use this same resolved address.
+The web container's Nginx uses `$proxy_add_x_forwarded_for`; it does not pass an
+inbound value through unchanged. The dedicated peer templates are stricter:
+they overwrite `X-Forwarded-For` and `X-Real-IP` with the directly observed TCP
+source and remove `Forwarded`/`X-Forwarded-Host`. The API trusts the managed edge
+proxy hop before resolving that source. A containerized Caddy adds the managed
+edge network to any proxy-owned networks it already requires and must not join
+Alert Hub egress or monitoring; it proxies directly to `alert-hub:8080`. A host proxy uses
+the fixed `API_IP:8080` on that bridge. The public host proxy likewise uses the
+fixed `WEB_IP:8080`; loopback publishes are local smoke endpoints, not proxy
+upstreams. Do not put ordinary peer or sender networks in
+`TRUSTED_PROXY_CIDRS`: a trusted member could then author an earlier address.
+Source and peer allowlists, rate-limit keys, and audit entries use this same
+resolved address.
 
-`PEER_ALLOWED_CIDRS` is checked on every `/internal/*` request before cluster bearer validation. Production with sync enabled refuses an empty list; the default accepts loopback only, so remote peers stay fail-closed until their exact WireGuard/private CIDRs are configured. Keep the public proxy denial and host firewall allowlist as independent controls. Cluster auth/CIDR/rate failures are audited with the resolved address and request ID, never the bearer value.
+`PEER_ALLOWED_CIDRS` is checked on every `/internal/*` request before cluster
+bearer validation. Production with sync enabled refuses an empty list; configure
+only the other nodes' exact public IPv4 `/32` values. Keep the ordinary public
+vhost denial, dedicated peer-vhost path/method/source policy, and host firewall
+as independent controls. Cluster auth/CIDR/rate failures are audited with the
+resolved address and request ID, never the bearer value.
 
 Login, bootstrap, ingest, and internal peer traffic use bounded fixed-window limiters. Ingest has an IP-global node budget, so rotating arbitrary source IDs cannot create a fresh allowance. Limits/windows, memory capacity, and cleanup cadence are settings. At capacity, unseen keys share a throttled overflow bucket rather than growing memory without bound. A rejection is `429` with `Retry-After`. State is in one process and one node only: this protects local expensive work but is not a distributed lockout or cluster-global quota.
 

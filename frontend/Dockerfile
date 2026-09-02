@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
-ARG NODE_VERSION=22.14.0
-ARG NGINX_VERSION=1.28.0-alpine3.21
+ARG NODE_VERSION=22.23.2
+ARG NGINX_VERSION=1.28.3-alpine3.23
 
 FROM node:${NODE_VERSION}-bookworm-slim AS frontend-build
 
