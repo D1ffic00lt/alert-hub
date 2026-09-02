@@ -1155,9 +1155,14 @@ def test_manual_release_reserves_tag_and_publishes_assets_idempotently() -> None
     triggers = workflow["on"]
     assert set(triggers) == {"push", "workflow_dispatch"}
     dispatch_inputs = triggers["workflow_dispatch"]["inputs"]
-    assert set(dispatch_inputs) == {"version", "confirmation"}
-    assert dispatch_inputs["version"]["required"] == "true"
-    assert dispatch_inputs["confirmation"]["required"] == "true"
+    assert set(dispatch_inputs) == {"version"}
+    assert dispatch_inputs["version"]["required"] == "false"
+    backend_version = re.search(
+        r'(?m)^version = "([^"]+)"$',
+        (REPOSITORY / "backend" / "pyproject.toml").read_text(encoding="utf-8"),
+    )
+    assert backend_version is not None
+    assert dispatch_inputs["version"]["default"] == f"v{backend_version.group(1)}"
 
     release = _workflow("release.yml")["jobs"]["release"]
     steps = release["steps"]
@@ -1169,7 +1174,10 @@ def test_manual_release_reserves_tag_and_publishes_assets_idempotently() -> None
     assert tag_step["if"] == "github.event_name == 'workflow_dispatch'"
     run = _job_run(release)
     assert '[[ "${GITHUB_REF}" == refs/heads/main ]]' in run
-    assert '[[ "${RELEASE_CONFIRMATION}" == RELEASE ]]' in run
+    assert "RELEASE_CONFIRMATION" not in run
+    assert "requested_version=${RELEASE_VERSION_INPUT:-${backend_version}}" in run
+    assert 'release_version="v${requested_version#v}"' in run
+    assert "printf 'RELEASE_VERSION=%s\\n'" in run
     assert '[[ "${GITHUB_SHA}" == "$(git rev-parse refs/remotes/origin/main)" ]]' in run
     assert '"repos/${GITHUB_REPOSITORY}/git/tags"' in run
     assert '"repos/${GITHUB_REPOSITORY}/git/refs"' in run

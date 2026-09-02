@@ -7,13 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Immutable release version (vX.Y.Z)
+        description: Version as vX.Y.Z or X.Y.Z
         type: string
-        required: true
-      confirmation:
-        description: Type RELEASE to publish the version
-        type: string
-        required: true
+        required: false
+        default: v0.1.5
 
 permissions:
   contents: write
@@ -26,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+  RELEASE_VERSION_INPUT: ${{ inputs.version }}
 
 jobs:
   release:
@@ -39,27 +36,31 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Validate release version and source revision
-        env:
-          RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
         run: |
-          [[ "${RELEASE_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          backend_version=$(python3 -c 'import tomllib; print(tomllib.load(open("backend/pyproject.toml", "rb"))["project"]["version"])')
+          frontend_version=$(jq -er '.version' frontend/package.json)
+          if [[ "${GITHUB_EVENT_NAME}" == workflow_dispatch ]]; then
+            requested_version=${RELEASE_VERSION_INPUT:-${backend_version}}
+          else
+            requested_version=${GITHUB_REF_NAME}
+          fi
+          release_version="v${requested_version#v}"
+          [[ "${release_version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          printf 'RELEASE_VERSION=%s\n' "${release_version}" >>"${GITHUB_ENV}"
           git show-ref --verify --quiet refs/remotes/origin/main
           if [[ "${GITHUB_EVENT_NAME}" == workflow_dispatch ]]; then
             [[ "${GITHUB_REF}" == refs/heads/main ]]
-            [[ "${RELEASE_CONFIRMATION}" == RELEASE ]]
             [[ "${GITHUB_SHA}" == "$(git rev-parse refs/remotes/origin/main)" ]]
-            if git rev-parse --verify --quiet "refs/tags/${RELEASE_VERSION}^{commit}"; then
-              [[ "$(git rev-parse "refs/tags/${RELEASE_VERSION}^{commit}")" == "${GITHUB_SHA}" ]]
+            if git rev-parse --verify --quiet "refs/tags/${release_version}^{commit}"; then
+              [[ "$(git rev-parse "refs/tags/${release_version}^{commit}")" == "${GITHUB_SHA}" ]]
             fi
           else
-            tag_commit=$(git rev-parse "${RELEASE_VERSION}^{commit}")
+            tag_commit=$(git rev-parse "${release_version}^{commit}")
             [[ "${tag_commit}" == "${GITHUB_SHA}" ]]
             git merge-base --is-ancestor "${tag_commit}" refs/remotes/origin/main
           fi
-          backend_version=$(python3 -c 'import tomllib; print(tomllib.load(open("backend/pyproject.toml", "rb"))["project"]["version"])')
-          frontend_version=$(jq -er '.version' frontend/package.json)
-          [[ "${RELEASE_VERSION}" == "v${backend_version}" ]]
-          [[ "${RELEASE_VERSION}" == "v${frontend_version}" ]]
+          [[ "${release_version}" == "v${backend_version}" ]]
+          [[ "${release_version}" == "v${frontend_version}" ]]
       - name: Derive release compatibility from the reviewed API contract
         run: echo "ALERT_HUB_COMPATIBILITY=openapi-sha256:$(sha256sum docs/openapi-contract.json | cut -d' ' -f1)" >>"${GITHUB_ENV}"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

@@ -20,10 +20,6 @@ on:
         required: true
         default: all
         options: [all, ru, nl, de]
-      confirmation:
-        description: Type ROLLBACK PRODUCTION exactly
-        type: string
-        required: true
 
 permissions:
   contents: read
@@ -36,18 +32,16 @@ concurrency:
 
 jobs:
   prepare:
-    name: Validate explicit rollback request
+    name: Validate rollback request
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Fail closed on malformed input
         env:
           VERSION: ${{ inputs.version }}
-          CONFIRMATION: ${{ inputs.confirmation }}
         run: |
           set -Eeuo pipefail
           [[ "${VERSION}" == previous || "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
-          [[ "${CONFIRMATION}" == 'ROLLBACK PRODUCTION' ]]
 
   rollback_ru:
     name: Roll back RU
