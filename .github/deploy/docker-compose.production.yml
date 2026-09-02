@@ -1,0 +1,107 @@
+name: alert-hub
+
+services:
+  alert-hub:
+    container_name: alert-hub-api
+    image: ${ALERT_HUB_API_IMAGE:?set an immutable Alert Hub API digest}
+    pull_policy: never
+    restart: unless-stopped
+    env_file:
+      - ${ALERT_HUB_ENV_FILE:?set the root-owned application env file}
+    environment:
+      BACKEND_HOST: 0.0.0.0
+      BACKEND_PORT: "8080"
+      DATABASE_URL: sqlite:////data/alert-hub.db
+      UI_ENABLED: "false"
+      MIGRATE_ON_START: ${MIGRATE_ON_START:-false}
+      TRUSTED_PROXY_CIDRS: >-
+        127.0.0.0/8,::1/128,${ALERT_HUB_WEB_IP:?set the dedicated web address}/32
+    # Bind the API only to this node's inventoried RFC 1918/WireGuard address.
+    # The public reverse proxy targets the web container on loopback instead.
+    ports:
+      - "${ALERT_HUB_PEER_ADDRESS:?set the private peer bind address}:8080:8080"
+    volumes:
+      - type: bind
+        source: ${ALERT_HUB_DATA_DIR:?set the node data directory}
+        target: /data
+      - type: bind
+        source: ${ALERT_HUB_SECRETS_DIR:?set the node secrets directory}
+        target: /run/secrets
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test:
+        ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/health/ready"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 6
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      edge:
+        ipv4_address: ${ALERT_HUB_API_IP:?set the dedicated API address}
+      monitoring: {}
+
+  alert-hub-web:
+    container_name: alert-hub-web
+    image: ${ALERT_HUB_WEB_IMAGE:?set an immutable Alert Hub Web digest}
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      APP_NAME: ${APP_NAME:-Alert Hub}
+    depends_on:
+      alert-hub:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${ALERT_HUB_HOST_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=101,gid=101,mode=0700
+      - /run/alert-hub:rw,noexec,nosuid,nodev,size=4m,uid=101,gid=101,mode=0755
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -T 2 -t 1 -O /dev/null http://127.0.0.1:8080/health/ready &&
+          wget -q -T 2 -t 1 -O /dev/null http://127.0.0.1:8080/ &&
+          wget -q -T 2 -t 1 -O /dev/null http://127.0.0.1:8080/runtime-config.js
+      interval: 10s
+      timeout: 7s
+      start_period: 20s
+      retries: 3
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      edge:
+        ipv4_address: ${ALERT_HUB_WEB_IP:?set the dedicated web address}
+      ingress: {}
+
+networks:
+  edge:
+    name: alert-hub-edge
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: ${ALERT_HUB_EDGE_SUBNET:?set the dedicated edge subnet}
+  ingress:
+    name: alert-hub-ingress
+    driver: bridge
+  monitoring:
+    external: true
+    name: ${MONITORING_NETWORK:?set the existing monitoring network}

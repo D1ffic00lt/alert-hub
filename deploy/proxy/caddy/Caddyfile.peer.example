@@ -1,0 +1,14 @@
+# Bind this site only to an exact private/WireGuard address. Do not use :8443
+# without an address because that would listen on every interface.
+https://__WIREGUARD_IP__:8443 {
+    tls /etc/ssl/alert-hub-peer/fullchain.pem /etc/ssl/alert-hub-peer/privkey.pem
+
+    @not_peer not path /internal/*
+    respond @not_peer 404
+
+    @allowed remote_ip __PEER_CIDR__
+    handle @allowed {
+        reverse_proxy 127.0.0.1:8080
+    }
+    respond 403
+}

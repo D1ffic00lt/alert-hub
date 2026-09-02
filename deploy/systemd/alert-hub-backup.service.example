@@ -1,0 +1,16 @@
+[Unit]
+Description=Create and verify an online Alert Hub SQLite backup
+After=local-fs.target
+ConditionPathExists=/etc/alert-hub/backup.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/alert-hub-backup backup --label scheduled
+User=root
+Group=root
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/alert-hub/backups
+ReadOnlyPaths=/opt/alert-hub/data /etc/alert-hub/backup.env
+NoNewPrivileges=true

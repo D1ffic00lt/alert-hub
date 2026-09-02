@@ -1,0 +1,220 @@
+name: alert-hub-ci-three-node
+
+x-node-environment: &node-environment
+  ENVIRONMENT: production
+  APP_NAME: Alert Hub controlled three-node CI
+  DATABASE_URL: sqlite:////data/alert-hub.db
+  AUTO_CREATE_SCHEMA: "false"
+  MIGRATE_ON_START: "true"
+  COOKIE_SECURE: "true"
+  SIGNING_KEY_FILE: /run/secrets/token-signing-key
+  CLUSTER_SECRET_FILE: /run/secrets/cluster-bearer-secret
+  MASTER_ENCRYPTION_KEY_FILE: /run/secrets/master-encryption-key
+  VAPID_PRIVATE_KEY_FILE: /run/secrets/vapid-private-key.pem
+  VAPID_SUBJECT: mailto:ci@example.invalid
+  BOOTSTRAP_TOKEN_FILE: /data/bootstrap-token
+  INGEST_ENABLED: "true"
+  NOTIFY_ENABLED: "true"
+  SYNC_ENABLED: "true"
+  UI_ENABLED: "false"
+  ALLOW_HTTP_WEBHOOKS: "true"
+  ALLOW_PRIVATE_WEBHOOKS: "true"
+  HEARTBEAT_SCAN_SECONDS: "0"
+  TRUSTED_PROXY_CIDRS: 127.0.0.0/8,::1/128
+  PEER_ALLOWED_CIDRS: ${ALERT_HUB_CI_SUBNET:?set ALERT_HUB_CI_SUBNET}
+  SYNC_PAGE_SIZE: "2"
+  SYNC_INTERVAL_SECONDS: "1"
+  SYNC_CONNECT_TIMEOUT_SECONDS: "0.5"
+  SYNC_READ_TIMEOUT_SECONDS: "2"
+  SYNC_WRITE_TIMEOUT_SECONDS: "2"
+  SYNC_POOL_TIMEOUT_SECONDS: "0.5"
+  SYNC_BACKOFF_INITIAL_SECONDS: "0.25"
+  SYNC_BACKOFF_MAX_SECONDS: "1"
+  SYNC_BACKOFF_JITTER_RATIO: "0"
+  SYNC_MAX_PAGES_PER_CYCLE: "100"
+  PEER_RATE_LIMIT_ATTEMPTS: "10000"
+  CLOCK_SKEW_THRESHOLD_SECONDS: "86400"
+  NOTIFICATION_POLL_SECONDS: "0.1"
+  NOTIFICATION_FAILOVER_BASE_SECONDS: "3"
+  NOTIFICATION_PROVIDER_TIMEOUT_SECONDS: "2"
+
+x-node: &node
+  image: ${ALERT_HUB_API_IMAGE:?set ALERT_HUB_API_IMAGE to the prebuilt API test image}
+  pull_policy: never
+  restart: "no"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+    - /run/alert-hub:rw,noexec,nosuid,nodev,size=4m,uid=10001,gid=10001,mode=0755
+  expose: ["8080"]
+  healthcheck:
+    test:
+      ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/health/ready"]
+    interval: 2s
+    timeout: 2s
+    start_period: 20s
+    retries: 20
+  networks: [cluster]
+
+services:
+  webhook-sink:
+    image: ${ALERT_HUB_API_IMAGE:?set ALERT_HUB_API_IMAGE to the prebuilt API test image}
+    pull_policy: never
+    restart: "no"
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    entrypoint:
+      - python
+      - -u
+      - -c
+      - |
+        import json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            server_version = "AlertHubCIWebhook/1"
+
+            def respond(self, status, body=b""):
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/health":
+                    self.respond(200, b'{"status":"ok"}')
+                else:
+                    self.respond(404, b'{"detail":"not found"}')
+
+            def do_POST(self):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = -1
+                payload = None
+                status = 404
+                if self.path == "/hook" and 0 <= length <= 1048576:
+                    try:
+                        payload = json.loads(self.rfile.read(length))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        status = 400
+                    else:
+                        status = 204 if isinstance(payload, dict) else 422
+                elif self.path == "/hook":
+                    status = 413
+                print(json.dumps({
+                    "event": "ci_webhook_received",
+                    "method": "POST",
+                    "path": self.path,
+                    "status": status,
+                    "event_id": payload.get("event_id") if isinstance(payload, dict) else None,
+                }, separators=(",", ":")), flush=True)
+                self.respond(status)
+
+            def log_message(self, format, *args):
+                pass
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+
+        Server(("0.0.0.0", 8081), Handler).serve_forever()
+    expose: ["8081"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8081/health"]
+      interval: 2s
+      timeout: 2s
+      start_period: 5s
+      retries: 10
+    networks:
+      cluster:
+        ipv4_address: ${ALERT_HUB_CI_SINK_IP:?set ALERT_HUB_CI_SINK_IP}
+
+  node-ru:
+    <<: *node
+    environment:
+      <<: *node-environment
+      NODE_ID: node-ru
+      NODE_NAME: Controlled CI node RU
+      NODE_REGION: ru
+      PUBLIC_API_URL: https://node-ru.ci.example.invalid
+      PRIVATE_PEER_URL: http://${ALERT_HUB_CI_RU_IP:?set ALERT_HUB_CI_RU_IP}:8080
+      TRUSTED_ORIGINS: https://node-ru.ci.example.invalid
+      PEER_URLS: >-
+        http://${ALERT_HUB_CI_NL_IP:?set ALERT_HUB_CI_NL_IP}:8080,
+        http://${ALERT_HUB_CI_DE_IP:?set ALERT_HUB_CI_DE_IP}:8080
+    networks:
+      cluster:
+        ipv4_address: ${ALERT_HUB_CI_RU_IP:?set ALERT_HUB_CI_RU_IP}
+    volumes:
+      - type: bind
+        source: ${ALERT_HUB_CI_ROOT:?set ALERT_HUB_CI_ROOT}/node-ru
+        target: /data
+      - type: bind
+        source: ${ALERT_HUB_CI_ROOT:?set ALERT_HUB_CI_ROOT}/secrets
+        target: /run/secrets
+        read_only: true
+
+  node-nl:
+    <<: *node
+    environment:
+      <<: *node-environment
+      NODE_ID: node-nl
+      NODE_NAME: Controlled CI node NL
+      NODE_REGION: nl
+      PUBLIC_API_URL: https://node-nl.ci.example.invalid
+      PRIVATE_PEER_URL: http://${ALERT_HUB_CI_NL_IP:?set ALERT_HUB_CI_NL_IP}:8080
+      TRUSTED_ORIGINS: https://node-nl.ci.example.invalid
+      PEER_URLS: >-
+        http://${ALERT_HUB_CI_RU_IP:?set ALERT_HUB_CI_RU_IP}:8080,
+        http://${ALERT_HUB_CI_DE_IP:?set ALERT_HUB_CI_DE_IP}:8080
+    networks:
+      cluster:
+        ipv4_address: ${ALERT_HUB_CI_NL_IP:?set ALERT_HUB_CI_NL_IP}
+    volumes:
+      - type: bind
+        source: ${ALERT_HUB_CI_ROOT:?set ALERT_HUB_CI_ROOT}/node-nl
+        target: /data
+      - type: bind
+        source: ${ALERT_HUB_CI_ROOT:?set ALERT_HUB_CI_ROOT}/secrets
+        target: /run/secrets
+        read_only: true
+
+  node-de:
+    <<: *node
+    environment:
+      <<: *node-environment
+      NODE_ID: node-de
+      NODE_NAME: Controlled CI node DE
+      NODE_REGION: de
+      PUBLIC_API_URL: https://node-de.ci.example.invalid
+      PRIVATE_PEER_URL: http://${ALERT_HUB_CI_DE_IP:?set ALERT_HUB_CI_DE_IP}:8080
+      TRUSTED_ORIGINS: https://node-de.ci.example.invalid
+      PEER_URLS: >-
+        http://${ALERT_HUB_CI_RU_IP:?set ALERT_HUB_CI_RU_IP}:8080,
+        http://${ALERT_HUB_CI_NL_IP:?set ALERT_HUB_CI_NL_IP}:8080
+    networks:
+      cluster:
+        ipv4_address: ${ALERT_HUB_CI_DE_IP:?set ALERT_HUB_CI_DE_IP}
+    volumes:
+      - type: bind
+        source: ${ALERT_HUB_CI_ROOT:?set ALERT_HUB_CI_ROOT}/node-de
+        target: /data
+      - type: bind
+        source: ${ALERT_HUB_CI_ROOT:?set ALERT_HUB_CI_ROOT}/secrets
+        target: /run/secrets
+        read_only: true
+
+networks:
+  cluster:
+    internal: true
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${ALERT_HUB_CI_SUBNET:?set ALERT_HUB_CI_SUBNET}

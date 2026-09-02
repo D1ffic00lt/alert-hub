@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Alert Hub SQLite backup
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+Unit=alert-hub-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,304 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Released version to deploy (vX.Y.Z)
+        type: string
+        required: true
+      component:
+        description: Component to replace independently, or the compatible pair
+        type: choice
+        required: true
+        default: all
+        options: [api, web, all]
+      target:
+        description: Protected production node or sequential RU/NL/DE rollout
+        type: choice
+        required: true
+        default: all
+        options: [all, ru, nl, de]
+
+permissions:
+  contents: read
+  packages: read
+  deployments: write
+
+concurrency:
+  group: alert-hub-production-rollout
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve the signed-off release manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      api_ref: ${{ steps.manifest.outputs.api_ref }}
+      web_ref: ${{ steps.manifest.outputs.web_ref }}
+      compatibility: ${{ steps.manifest.outputs.compatibility }}
+    steps:
+      - id: manifest
+        name: Download and validate immutable release references
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          temporary=$(mktemp -d)
+          trap 'find "${temporary}" -type f -delete; rmdir "${temporary}"' EXIT
+          api_url="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}"
+          printf 'header = "Authorization: Bearer %s"\n' "${GH_TOKEN}" >"${temporary}/curl-auth.conf"
+          chmod 0600 "${temporary}/curl-auth.conf"
+          curl_args=(
+            --config "${temporary}/curl-auth.conf"
+            --proto '=https'
+            --tlsv1.2
+            --fail
+            --silent
+            --show-error
+            --location
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          curl "${curl_args[@]}" --header 'Accept: application/vnd.github+json' \
+            --output "${temporary}/release.json" \
+            "${api_url}/releases/tags/${VERSION}"
+          manifest_id=$(jq -er '[.assets[] | select(.name == "release-manifest.json")] | if length == 1 then .[0].id else error("manifest asset missing or duplicated") end' "${temporary}/release.json")
+          checksum_id=$(jq -er '[.assets[] | select(.name == "release-manifest.json.sha256")] | if length == 1 then .[0].id else error("checksum asset missing or duplicated") end' "${temporary}/release.json")
+          [[ ${manifest_id} =~ ^[0-9]+$ && ${checksum_id} =~ ^[0-9]+$ ]]
+          curl "${curl_args[@]}" --header 'Accept: application/octet-stream' \
+            --output "${temporary}/release-manifest.json" "${api_url}/releases/assets/${manifest_id}"
+          curl "${curl_args[@]}" --header 'Accept: application/octet-stream' \
+            --output "${temporary}/release-manifest.json.sha256" "${api_url}/releases/assets/${checksum_id}"
+          (
+            cd "${temporary}"
+            sha256sum --check --strict release-manifest.json.sha256
+          )
+
+          registry="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
+          expected_api="${registry}/alert-hub-api"
+          expected_web="${registry}/alert-hub-web"
+          jq -e \
+            --arg version "${VERSION}" \
+            --arg api_name "${expected_api}" \
+            --arg web_name "${expected_web}" '
+              . as $root |
+              .schema_version == 1 and
+              .version == $version and
+              (.revision | test("^[0-9a-f]{40}$")) and
+              (.compatibility | test("^openapi-sha256:[0-9a-f]{64}$")) and
+              ((.images | keys) == ["api", "web"]) and
+              .images.api.component == "api" and
+              .images.web.component == "web" and
+              .images.api.name == $api_name and
+              .images.web.name == $web_name and
+              ([.images.api, .images.web] | all(
+                .version == $version and
+                .revision == $root.revision and
+                .compatibility == $root.compatibility and
+                (.digest | test("^sha256:[0-9a-f]{64}$")) and
+                .reference == (.name + "@" + .digest)
+              )) and
+              (.compatible_pairs | length == 1) and
+              .compatible_pairs[0].api == .images.api.reference and
+              .compatible_pairs[0].web == .images.web.reference and
+              .compatible_pairs[0].compatibility == .compatibility
+            ' "${temporary}/release-manifest.json" >/dev/null
+          api_ref=$(jq -r '.images.api.reference' "${temporary}/release-manifest.json")
+          web_ref=$(jq -r '.images.web.reference' "${temporary}/release-manifest.json")
+          compatibility=$(jq -r '.compatibility' "${temporary}/release-manifest.json")
+          printf 'api_ref=%s\n' "${api_ref}" >>"${GITHUB_OUTPUT}"
+          printf 'web_ref=%s\n' "${web_ref}" >>"${GITHUB_OUTPUT}"
+          printf 'compatibility=%s\n' "${compatibility}" >>"${GITHUB_OUTPUT}"
+
+  deploy_ru:
+    name: Deploy RU
+    needs: prepare
+    if: inputs.target == 'all' || inputs.target == 'ru'
+    runs-on: [self-hosted, alert-hub-ru]
+    environment:
+      name: production-ru
+    timeout-minutes: 30
+    steps:
+      - name: Deploy web through the pre-provisioned root-owned boundary
+        if: inputs.component == 'web'
+        env:
+          NODE_NAME: ru
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          ALERT_HUB_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
+          ALERT_HUB_WEB_IMAGE: ${{ needs.prepare.outputs.web_ref }}
+          ALERT_HUB_RELEASE_COMPATIBILITY: ${{ needs.prepare.outputs.compatibility }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
+
+      - name: Deploy API or compatible pair through the pre-provisioned root-owned boundary
+        if: inputs.component != 'web'
+        env:
+          NODE_NAME: ru
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          ALERT_HUB_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
+          ALERT_HUB_WEB_IMAGE: ${{ needs.prepare.outputs.web_ref }}
+          ALERT_HUB_RELEASE_COMPATIBILITY: ${{ needs.prepare.outputs.compatibility }}
+          CLUSTER_MASTER_KEY: ${{ secrets.CLUSTER_MASTER_KEY }}
+          SESSION_SIGNING_KEY: ${{ secrets.SESSION_SIGNING_KEY }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          PEER_URLS: ${{ vars.PEER_URLS }}
+          PEER_ALLOWED_CIDRS: ${{ vars.PEER_ALLOWED_CIDRS }}
+          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY /usr/local/sbin/docker-deploy-node.sh
+
+      - name: Verify recorded deployment status
+        run: |
+          sudo /usr/local/sbin/docker-status-node.sh
+
+  deploy_nl:
+    name: Deploy NL
+    needs: [prepare, deploy_ru]
+    if: >-
+      always() && needs.prepare.result == 'success' &&
+      (needs.deploy_ru.result == 'success' || needs.deploy_ru.result == 'skipped') &&
+      (inputs.target == 'all' || inputs.target == 'nl')
+    runs-on: [self-hosted, alert-hub-nl]
+    environment:
+      name: production-nl
+    timeout-minutes: 30
+    steps:
+      - name: Deploy web through the pre-provisioned root-owned boundary
+        if: inputs.component == 'web'
+        env:
+          NODE_NAME: nl
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          ALERT_HUB_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
+          ALERT_HUB_WEB_IMAGE: ${{ needs.prepare.outputs.web_ref }}
+          ALERT_HUB_RELEASE_COMPATIBILITY: ${{ needs.prepare.outputs.compatibility }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
+
+      - name: Deploy API or compatible pair through the pre-provisioned root-owned boundary
+        if: inputs.component != 'web'
+        env:
+          NODE_NAME: nl
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          ALERT_HUB_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
+          ALERT_HUB_WEB_IMAGE: ${{ needs.prepare.outputs.web_ref }}
+          ALERT_HUB_RELEASE_COMPATIBILITY: ${{ needs.prepare.outputs.compatibility }}
+          CLUSTER_MASTER_KEY: ${{ secrets.CLUSTER_MASTER_KEY }}
+          SESSION_SIGNING_KEY: ${{ secrets.SESSION_SIGNING_KEY }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          PEER_URLS: ${{ vars.PEER_URLS }}
+          PEER_ALLOWED_CIDRS: ${{ vars.PEER_ALLOWED_CIDRS }}
+          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY /usr/local/sbin/docker-deploy-node.sh
+
+      - name: Verify recorded deployment status
+        run: |
+          sudo /usr/local/sbin/docker-status-node.sh
+
+  deploy_de:
+    name: Deploy DE
+    needs: [prepare, deploy_ru, deploy_nl]
+    if: >-
+      always() && needs.prepare.result == 'success' &&
+      (needs.deploy_ru.result == 'success' || needs.deploy_ru.result == 'skipped') &&
+      (needs.deploy_nl.result == 'success' || needs.deploy_nl.result == 'skipped') &&
+      (inputs.target == 'all' || inputs.target == 'de')
+    runs-on: [self-hosted, alert-hub-de]
+    environment:
+      name: production-de
+    timeout-minutes: 30
+    steps:
+      - name: Deploy web through the pre-provisioned root-owned boundary
+        if: inputs.component == 'web'
+        env:
+          NODE_NAME: de
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          ALERT_HUB_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
+          ALERT_HUB_WEB_IMAGE: ${{ needs.prepare.outputs.web_ref }}
+          ALERT_HUB_RELEASE_COMPATIBILITY: ${{ needs.prepare.outputs.compatibility }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
+
+      - name: Deploy API or compatible pair through the pre-provisioned root-owned boundary
+        if: inputs.component != 'web'
+        env:
+          NODE_NAME: de
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_ADDRESS: ${{ vars.PEER_ADDRESS }}
+          ALERT_HUB_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
+          ALERT_HUB_WEB_IMAGE: ${{ needs.prepare.outputs.web_ref }}
+          ALERT_HUB_RELEASE_COMPATIBILITY: ${{ needs.prepare.outputs.compatibility }}
+          CLUSTER_MASTER_KEY: ${{ secrets.CLUSTER_MASTER_KEY }}
+          SESSION_SIGNING_KEY: ${{ secrets.SESSION_SIGNING_KEY }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          PEER_URLS: ${{ vars.PEER_URLS }}
+          PEER_ALLOWED_CIDRS: ${{ vars.PEER_ALLOWED_CIDRS }}
+          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_ADDRESS,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY /usr/local/sbin/docker-deploy-node.sh
+
+      - name: Verify recorded deployment status
+        run: |
+          sudo /usr/local/sbin/docker-status-node.sh
