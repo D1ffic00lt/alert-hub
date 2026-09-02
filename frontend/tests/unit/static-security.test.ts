@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 describe("static SPA security contract", () => {
   it("loads runtime configuration and application code only from external scripts", () => {
     const html = readFileSync("index.html", "utf8");
-    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)];
+    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
     expect(scripts).toHaveLength(2);
     for (const [, attributes, body] of scripts) {
       expect(attributes).toMatch(/\bsrc="\/[^"]+"/);

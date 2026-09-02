@@ -8,7 +8,7 @@ fi
 api_readiness_url=http://alert-hub:8080/health/ready
 nginx_pid=""
 
-# shellcheck disable=SC2329 # Invoked by the EXIT trap.
+# shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap.
 cleanup() {
   status=$?
   trap - EXIT TERM INT

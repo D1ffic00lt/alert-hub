@@ -254,7 +254,9 @@ test("bootstrap, deep-link navigation, live source creation, failover trust, and
   };
   const evilRequests: string[] = [];
   page.on("request", (request) => {
-    if (request.url().startsWith("https://evil.invalid")) evilRequests.push(request.url());
+    if (new URL(request.url()).origin === "https://evil.invalid") {
+      evilRequests.push(request.url());
+    }
   });
   await installApi(page, state);
 

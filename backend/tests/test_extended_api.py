@@ -299,6 +299,30 @@ def test_auth_sets_dedicated_stream_cookie(client: TestClient, auth: dict[str, s
     assert client.cookies.get("alert_hub_stream")
 
 
+def test_only_double_submit_cookie_is_browser_readable(
+    client: TestClient, auth: dict[str, str]
+) -> None:
+    del auth
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "username": "admin",
+            "password": "a-strong-test-password",
+            "device_name": "cookie attribute test",
+        },
+    )
+    assert response.status_code == 200, response.text
+    cookies = {
+        header.partition("=")[0]: header for header in response.headers.get_list("set-cookie")
+    }
+
+    assert "HttpOnly" in cookies["alert_hub_refresh"]
+    assert "HttpOnly" in cookies["alert_hub_stream"]
+    assert "HttpOnly" not in cookies["alert_hub_csrf"]
+    assert "SameSite=strict" in cookies["alert_hub_csrf"]
+    assert "Path=/" in cookies["alert_hub_csrf"]
+
+
 def test_stream_cookie_authenticates_initial_sse_event(
     client: TestClient, auth: dict[str, str], app
 ) -> None:

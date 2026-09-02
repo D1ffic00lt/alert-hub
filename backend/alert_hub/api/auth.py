@@ -43,6 +43,10 @@ def _set_auth_cookies(response: Response, issued: IssuedSession, settings: Setti
         samesite="strict",
         domain=settings.cookie_domain,
     )
+    # This random double-submit value must remain readable by the same-origin
+    # client. It cannot authenticate a request: the API also requires the
+    # HttpOnly refresh cookie, one exact trusted Origin, and an equal header.
+    # codeql[py/insecure-cookie]
     response.set_cookie(
         settings.csrf_cookie_name,
         issued.csrf_token,

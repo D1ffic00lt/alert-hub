@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ import yaml
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 CHECKER_PATH = REPOSITORY / "deploy" / "scripts" / "check-ci-policy.py"
+CODEQL_GATE_PATH = REPOSITORY / "deploy" / "scripts" / "check-codeql-sarif.py"
 DEPLOY_ENGINE_PATH = REPOSITORY / ".github" / "deploy" / "scripts" / "docker-deploy-node.sh"
 PROVISIONER_PATH = REPOSITORY / ".github" / "deploy" / "scripts" / "docker-provision-node.sh"
 PROXY_INSTALLER_PATH = REPOSITORY / "deploy" / "scripts" / "install-proxy-config.sh"
@@ -20,6 +22,14 @@ PIN = "0123456789abcdef0123456789abcdef01234567"
 
 def _checker() -> ModuleType:
     spec = importlib.util.spec_from_file_location("check_ci_policy", CHECKER_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _codeql_gate() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("check_codeql_sarif", CODEQL_GATE_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -532,6 +542,155 @@ jobs:
     assert any("must not check out repository code" in failure for failure in failures)
     assert any("must not install or execute repository" in failure for failure in failures)
     assert any("may sudo only" in failure for failure in failures)
+
+
+def test_ci_policy_accepts_only_exact_no_argument_root_wrappers() -> None:
+    checker = _checker()
+    accepted = [
+        "sudo /usr/local/sbin/docker-status-node.sh",
+        "sudo --preserve-env=NODE_NAME,NODE_IP /usr/local/sbin/docker-deploy-node.sh",
+        "sudo --preserve-env=ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_CONFIRMATION "
+        "/usr/local/sbin/docker-rollback-node.sh",
+    ]
+    rejected = [
+        "sudo /bin/sh",
+        "sudo -u root /usr/local/sbin/docker-status-node.sh",
+        "sudo --preserve-env=BASH_ENV /usr/local/sbin/docker-deploy-node.sh",
+        "sudo --preserve-env=NODE_NAME,NODE_NAME /usr/local/sbin/docker-deploy-node.sh",
+        "sudo --preserve-env= /usr/local/sbin/docker-deploy-node.sh",
+        "sudo /usr/local/sbin/docker-deploy-node.sh --force",
+        "sudo /usr/local/sbin/docker-status-node.sh; /bin/sh",
+        "sudo /usr/local/sbin/docker-status-node.sh$(id)",
+        "sudo ./docker-deploy-node.sh",
+    ]
+
+    assert all(checker._is_allowed_root_wrapper(command) for command in accepted)
+    assert not any(checker._is_allowed_root_wrapper(command) for command in rejected)
+
+
+def test_ci_policy_rejects_obfuscated_commands_on_self_hosted_runners() -> None:
+    checker = _checker()
+    environment = {
+        "NODE_IP": "fixture",
+        "PUBLIC_DOMAIN": "fixture",
+        "PEER_ADDRESS": "fixture",
+    }
+    prologue = (
+        f"{checker.SELF_HOSTED_SHELL_OPTIONS}\n"
+        "for required in NODE_IP PUBLIC_DOMAIN PEER_ADDRESS; do\n"
+        f"  {checker.REQUIRED_VALUE_CHECK}\n"
+        "done\n"
+    )
+    assert checker._is_allowed_self_hosted_run(
+        prologue + "sudo /usr/local/sbin/docker-deploy-node.sh\n",
+        environment,
+    )
+    assert checker._is_allowed_self_hosted_run(
+        "sudo /usr/local/sbin/docker-status-node.sh\n",
+        {},
+    )
+
+    rejected = [
+        prologue + "sud''o /bin/sh\n" + "sudo /usr/local/sbin/docker-deploy-node.sh\n",
+        "echo sudo /usr/local/sbin/docker-status-node.sh\n",
+        "# sudo /usr/local/sbin/docker-status-node.sh\n",
+        prologue + "sudo /usr/local/sbin/docker-deploy-node.sh; /bin/sh\n",
+        prologue.replace("done\n", "done\ncurl https://evil.invalid\n")
+        + "sudo /usr/local/sbin/docker-deploy-node.sh\n",
+    ]
+    assert not any(checker._is_allowed_self_hosted_run(run, environment) for run in rejected)
+
+
+def test_ci_policy_rejects_shell_and_environment_injection_on_self_hosted_runner(
+    tmp_path: Path,
+) -> None:
+    repository = _write_ci(
+        tmp_path,
+        """\
+name: CI
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs: {}
+""",
+    )
+    (repository / ".github" / "workflows" / "deploy.yml").write_text(
+        """\
+name: Unsafe deploy shell
+on:
+  workflow_dispatch:
+defaults:
+  run:
+    shell: bash -c 'curl https://evil.invalid' _ {0}
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: [self-hosted, alert-hub-ru]
+    defaults:
+      run:
+        shell: bash -c 'id' _ {0}
+    steps:
+      - shell: bash -c 'env' _ {0}
+        env:
+          BASH_ENV: /tmp/runner-persistence
+        run: sudo /usr/local/sbin/docker-status-node.sh
+""",
+        encoding="utf-8",
+    )
+
+    failures = _checker().check_repository(repository)
+
+    assert any("workflow-level defaults.run.shell" in failure for failure in failures)
+    assert any("must not override defaults.run.shell" in failure for failure in failures)
+    assert any("untrusted step shell" in failure for failure in failures)
+    assert any("unsupported step environment: BASH_ENV" in failure for failure in failures)
+
+
+def test_ci_policy_rejects_dynamic_or_out_of_boundary_self_hosted_runners(
+    tmp_path: Path,
+) -> None:
+    repository = _write_ci(
+        tmp_path,
+        """\
+name: CI
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs: {}
+""",
+    )
+    (repository / ".github" / "workflows" / "rogue.yml").write_text(
+        """\
+name: Rogue runners
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dynamic:
+    strategy:
+      matrix:
+        runner: [self-hosted]
+    runs-on: ${{ matrix.runner }}
+    steps: []
+  direct:
+    runs-on: [self-hosted, alert-hub-ru]
+    steps: []
+""",
+        encoding="utf-8",
+    )
+
+    failures = _checker().check_repository(repository)
+
+    runner_failures = [failure for failure in failures if "approved static" in failure]
+    assert len(runner_failures) == 2
+    assert any("dynamic" in failure for failure in runner_failures)
+    assert any("direct" in failure for failure in runner_failures)
 
 
 def test_public_proxy_examples_hide_operator_only_endpoints() -> None:
@@ -1075,8 +1234,69 @@ def test_pr_codeql_is_a_read_only_failing_sarif_gate() -> None:
     assert codeql_step["with"]["output"] == "codeql-results"
     run = _job_run(analyze)
     assert "files=(codeql-results/*.sarif)" in run
-    assert "if ((findings > 0))" in run
+    assert 'python3 deploy/scripts/check-codeql-sarif.py "${files[@]}"' in run
     assert any(action.startswith("actions/upload-artifact@") for action in _job_actions(analyze))
+
+
+def test_codeql_gate_allows_only_the_reviewed_source_suppression(tmp_path: Path) -> None:
+    gate = _codeql_gate()
+
+    def result(
+        *,
+        rule_id: str = "py/insecure-cookie",
+        uri: str = "backend/alert_hub/api/auth.py",
+        line: int = 50,
+        kind: str = "inSource",
+        status: str | None = "accepted",
+        include_status: bool = True,
+    ) -> dict[str, Any]:
+        suppression: dict[str, Any] = {"kind": kind}
+        if include_status:
+            suppression["status"] = status
+        return {
+            "ruleId": rule_id,
+            "message": {"text": "fixture"},
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": uri},
+                        "region": {"startLine": line},
+                    }
+                }
+            ],
+            "suppressions": [suppression],
+        }
+
+    accepted = result()
+    codeql_default_accepted = result(include_status=False)
+    rejected = [
+        result(status="underReview"),
+        result(status="rejected"),
+        result(status=None),
+        result(kind="external"),
+        result(rule_id="py/other"),
+        result(uri="backend/alert_hub/api/other.py"),
+        result(line=51),
+    ]
+
+    assert gate._is_approved_suppression(accepted)
+    assert gate._is_approved_suppression(codeql_default_accepted)
+    assert not any(gate._is_approved_suppression(item) for item in rejected)
+
+    sarif = tmp_path / "results.sarif"
+    sarif.write_text(
+        json.dumps({"runs": [{"results": [accepted, codeql_default_accepted, *rejected]}]}),
+        encoding="utf-8",
+    )
+    assert gate.main([str(sarif)]) == 1
+
+    auth_lines = (
+        (REPOSITORY / "backend" / "alert_hub" / "api" / "auth.py")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert auth_lines[48].strip() == "# codeql[py/insecure-cookie]"
+    assert auth_lines[49].strip() == "response.set_cookie("
 
 
 def test_deployment_state_binds_runtime_config_by_checksum_not_path() -> None:

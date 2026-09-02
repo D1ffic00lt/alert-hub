@@ -22,6 +22,7 @@ SH_SCRIPTS := \
 	frontend/container/entrypoint.sh \
 	frontend/container/render-ui-runtime.sh
 DEPLOY_PYTHON := \
+	deploy/scripts/check-codeql-sarif.py \
 	deploy/scripts/check-ci-policy.py \
 	deploy/scripts/check-openapi.py
 override RUNTIME_ROOT := $(abspath runtime)

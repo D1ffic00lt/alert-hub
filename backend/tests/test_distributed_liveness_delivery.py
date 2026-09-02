@@ -162,10 +162,15 @@ def test_heartbeat_observations_prevent_false_misses_and_resolve_out_of_order(
         _pull(apps["node-b"], settings["node-b"], apps["node-a"])
         _pull(apps["node-c"], settings["node-c"], apps["node-a"])
 
-        base = datetime(2026, 9, 2, 10, 0, tzinfo=UTC)
         with apps["node-a"].state.session_factory.begin() as db:
             source = db.get(Source, source_id)
             assert source is not None
+            state = db.get(HeartbeatState, source_id)
+            assert state is not None
+            # Anchor the synthetic observation after the persisted heartbeat epoch.
+            # A wall-clock constant eventually becomes older than created_at and
+            # correctly gets ignored as a stale replicated observation.
+            base = max(source.created_at, state.last_received_at) + timedelta(seconds=1)
             record_heartbeat_observation(db, source, settings["node-a"], base)
         _pull(apps["node-b"], settings["node-b"], apps["node-a"])
 
