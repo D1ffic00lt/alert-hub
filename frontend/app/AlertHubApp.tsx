@@ -172,6 +172,7 @@ type PrometheusDatasource = {
   url: string;
   nodeId: string | null;
   region: string | null;
+  reachabilityLabelMode: "canonical" | "server";
   enabled: boolean;
   authType: "none" | "bearer" | "basic" | "unknown";
   credentialsConfigured: boolean;
@@ -715,6 +716,7 @@ function createDemoData(): HubData {
         url: "https://prometheus.demo.invalid",
         nodeId: null,
         region: "DEMO",
+        reachabilityLabelMode: "canonical",
         enabled: true,
         authType: "none",
         credentialsConfigured: false,
@@ -1513,12 +1515,14 @@ function normalizeRoute(item: unknown, index: number): NotificationRoute {
 function normalizeDatasource(item: unknown, index: number): PrometheusDatasource {
   const row = asRecord(item);
   const authType = String(row.auth_type ?? "unknown");
+  const reachabilityLabelMode = String(row.reachability_label_mode ?? "canonical");
   return {
     id: String(row.id ?? `datasource-${index}`),
     name: String(row.name ?? tr(`Источник данных ${index + 1}`, `Datasource ${index + 1}`)),
     url: String(row.url ?? ""),
     nodeId: typeof row.node_id === "string" && row.node_id ? row.node_id : null,
     region: typeof row.region === "string" && row.region ? row.region : null,
+    reachabilityLabelMode: reachabilityLabelMode === "server" ? "server" : "canonical",
     enabled: row.enabled !== false,
     authType: (["none", "bearer", "basic", "unknown"].includes(authType)
       ? authType
@@ -5162,6 +5166,33 @@ function ReachabilityPage({
       setBusy(null);
     }
   };
+  const setDatasourceLabelMode = async (
+    datasource: PrometheusDatasource,
+    reachabilityLabelMode: PrometheusDatasource["reachabilityLabelMode"],
+  ) => {
+    if (reachabilityLabelMode === datasource.reachabilityLabelMode) return;
+    setBusy(datasource.id);
+    setActionError(null);
+    try {
+      const body = await mutationJson(
+        `/prometheus-datasources/${encodeURIComponent(datasource.id)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ reachability_label_mode: reachabilityLabelMode }),
+        },
+      );
+      updateDatasource(normalizeDatasource(body, 0));
+      onRefresh();
+    } catch (reason) {
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось обновить режим меток.", "Unable to update the label mode."),
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
   const removeDatasource = async (datasource: PrometheusDatasource) => {
     if (
       !window.confirm(
@@ -5402,11 +5433,35 @@ function ReachabilityPage({
                     <b>{datasource.name}</b>
                     <small>
                       {datasource.url} · {datasource.region ?? tr("Без региона", "No region")} ·{" "}
-                      {datasource.authType}
+                      {datasource.authType} ·{" "}
+                      {datasource.reachabilityLabelMode === "server"
+                        ? "source_server × target_server"
+                        : "source_region × target_name"}
                     </small>
                   </span>
                   <StatusDot health={datasource.enabled ? "unknown" : "paused"} />
                   <span className="live-resource-actions">
+                    <label className="compact-select">
+                      <span className="sr-only">
+                        {tr(
+                          `Метки матрицы для ${datasource.name}`,
+                          `Matrix labels for ${datasource.name}`,
+                        )}
+                      </span>
+                      <select
+                        value={datasource.reachabilityLabelMode}
+                        onChange={(event) =>
+                          void setDatasourceLabelMode(
+                            datasource,
+                            event.target.value === "server" ? "server" : "canonical",
+                          )
+                        }
+                        disabled={readOnly || busy === datasource.id}
+                      >
+                        <option value="canonical">source_region × target_name</option>
+                        <option value="server">source_server × target_server</option>
+                      </select>
+                    </label>
                     <button
                       className="button button--quiet button--small"
                       onClick={() => void testDatasource(datasource)}
@@ -8371,6 +8426,9 @@ function DatasourceWizard({
   const [url, setUrl] = useState("");
   const [nodeId, setNodeId] = useState("");
   const [region, setRegion] = useState("");
+  const [reachabilityLabelMode, setReachabilityLabelMode] = useState<"canonical" | "server">(
+    "canonical",
+  );
   const [authType, setAuthType] = useState<"none" | "bearer" | "basic">("none");
   const [bearerToken, setBearerToken] = useState("");
   const [username, setUsername] = useState("");
@@ -8395,6 +8453,7 @@ function DatasourceWizard({
           url,
           node_id: nodeId.trim() || null,
           region: region.trim() || null,
+          reachability_label_mode: reachabilityLabelMode,
           enabled: true,
           credentials,
         }),
@@ -8462,6 +8521,18 @@ function DatasourceWizard({
           <label>
             <span>{tr("Регион · необязательно", "Region · optional")}</span>
             <input value={region} onChange={(event) => setRegion(event.target.value)} />
+          </label>
+          <label>
+            <span>{tr("Метки матрицы доступности", "Reachability matrix labels")}</span>
+            <select
+              value={reachabilityLabelMode}
+              onChange={(event) =>
+                setReachabilityLabelMode(event.target.value === "server" ? "server" : "canonical")
+              }
+            >
+              <option value="canonical">source_region × target_name</option>
+              <option value="server">source_server × target_server</option>
+            </select>
           </label>
           <label>
             <span>{tr("Аутентификация", "Authentication")}</span>

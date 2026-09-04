@@ -83,6 +83,7 @@ class PrometheusDatasourceCreate(BaseModel):
     url: str = Field(min_length=1, max_length=2_048)
     node_id: str | None = Field(default=None, max_length=128)
     region: str | None = Field(default=None, max_length=128)
+    reachability_label_mode: Literal["canonical", "server"] = "canonical"
     enabled: bool = True
     credentials: DatasourceCredentials | None = Field(
         default=None,
@@ -97,6 +98,7 @@ class PrometheusDatasourcePatch(BaseModel):
     url: str | None = Field(default=None, min_length=1, max_length=2_048)
     node_id: str | None = Field(default=None, max_length=128)
     region: str | None = Field(default=None, max_length=128)
+    reachability_label_mode: Literal["canonical", "server"] | None = None
     enabled: bool | None = None
     credentials: DatasourceCredentials | None = Field(
         default=None,
@@ -153,6 +155,7 @@ def datasource_response(
         "url": datasource.url,
         "node_id": datasource.node_id,
         "region": datasource.region,
+        "reachability_label_mode": datasource.reachability_label_mode,
         "enabled": datasource.enabled,
         "auth_type": auth_type,
         "credentials_configured": configured,
@@ -169,6 +172,7 @@ def _replicated_payload(datasource: PrometheusDatasource) -> dict[str, Any]:
         "url": datasource.url,
         "node_id": datasource.node_id,
         "region": datasource.region,
+        "reachability_label_mode": datasource.reachability_label_mode,
         "enabled": datasource.enabled,
         "encrypted_credentials": (
             base64.b64encode(datasource.encrypted_credentials).decode()
@@ -234,6 +238,7 @@ def create_prometheus_datasource(
         url=url,
         node_id=payload.node_id,
         region=payload.region,
+        reachability_label_mode=payload.reachability_label_mode,
         enabled=payload.enabled,
         encrypted_credentials=_encrypted_credentials(datasource_id, payload.credentials, cipher),
     )
@@ -285,6 +290,8 @@ def update_prometheus_datasource(
         datasource.node_id = payload.node_id
     if "region" in payload.model_fields_set:
         datasource.region = payload.region
+    if payload.reachability_label_mode is not None:
+        datasource.reachability_label_mode = payload.reachability_label_mode
     if payload.enabled is not None:
         datasource.enabled = payload.enabled
     if "credentials" in payload.model_fields_set:

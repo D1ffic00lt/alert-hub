@@ -40,6 +40,7 @@ def decrypt_credentials(
 class DatasourceQueryResult:
     datasource_id: str
     datasource_name: str
+    reachability_label_mode: str
     samples: list[VectorSample]
 
 
@@ -56,6 +57,7 @@ class DatasourceQueryTarget:
     datasource_id: str
     datasource_name: str
     url: str
+    reachability_label_mode: str
     credentials: dict[str, Any]
 
 
@@ -104,6 +106,7 @@ def prepare_enabled_datasources(
                 datasource.id,
                 datasource.name,
                 datasource.url,
+                datasource.reachability_label_mode,
                 credentials,
             )
         )
@@ -127,7 +130,12 @@ async def query_datasource_targets(
                 exc.code,
                 exc.detail,
             )
-        return DatasourceQueryResult(target.datasource_id, target.datasource_name, samples)
+        return DatasourceQueryResult(
+            target.datasource_id,
+            target.datasource_name,
+            target.reachability_label_mode,
+            samples,
+        )
 
     raw_results = await asyncio.gather(*(query_one(target) for target in targets))
     successes = [item for item in raw_results if isinstance(item, DatasourceQueryResult)]

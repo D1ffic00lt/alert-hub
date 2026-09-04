@@ -550,6 +550,10 @@ def _project_prometheus_datasource(db: Session, entity_id: str) -> None:
     datasource.url = url[:2048]
     datasource.node_id = str(payload["node_id"])[:128] if payload.get("node_id") else None
     datasource.region = str(payload["region"])[:128] if payload.get("region") else None
+    label_mode = str(payload.get("reachability_label_mode") or "canonical")
+    datasource.reachability_label_mode = (
+        label_mode if label_mode in {"canonical", "server"} else "canonical"
+    )
     datasource.enabled = bool(payload.get("enabled", True))
     datasource.encrypted_credentials = encrypted_credentials
     datasource.updated_at = updated_at or event.occurred_at

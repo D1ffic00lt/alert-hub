@@ -701,6 +701,7 @@ def test_repeated_state_upserts_in_same_sync_page_project_once(tmp_path: Path) -
             assert len(datasources) == 1
             assert datasources[0].name == "Latest Prometheus"
             assert datasources[0].url == "https://new.example.test"
+            assert datasources[0].reachability_label_mode == "canonical"
 
 
 def test_same_page_bootstrap_conflict_records_one_audit_entry(tmp_path: Path) -> None:

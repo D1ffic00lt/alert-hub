@@ -191,7 +191,7 @@ up{job=~"prometheus|alertmanager|blackbox.*"}
 up{job=~"alert[-_]?hub.*"}
 ```
 
-`GET /api/v1/metrics/reachability` merges the latest `probe_success` samples using the installation's actual `source_region` and `target_name` labels. For compatibility with existing Grafana installations that retain geographic `source_region` grouping, a sample without `target_name` may instead use the more specific `source_server` and `target_server` pair; canonical `source_region`/`target_name` labels still take precedence. It returns `partial` with per-datasource errors when some Prometheus instances fail. `GET /api/v1/metrics/queries/{query_name}` exposes the other fixed vectors, and `POST /api/v1/prometheus-datasources/{id}/test` uses a fixed `vector(1)` probe.
+`GET /api/v1/metrics/reachability` merges the latest `probe_success` samples using the label pair selected on each datasource. The default `canonical` mode reads `source_region` and `target_name`. An explicit `server` mode reads `source_server` and `target_server` for existing installations that retain geographic `source_region` grouping for Grafana. Modes never fall back into one another, so adding the compatibility option cannot silently change an existing datasource's matrix identity. It returns `partial` with per-datasource errors when some Prometheus instances fail. `GET /api/v1/metrics/queries/{query_name}` exposes the other fixed vectors, and `POST /api/v1/prometheus-datasources/{id}/test` uses a fixed `vector(1)` probe.
 
 Set optional `GRAFANA_URL` to an HTTPS dashboard when operators should get a detailed-view link.
 The backend validates it, rejects embedded credentials, and returns it in the authenticated
