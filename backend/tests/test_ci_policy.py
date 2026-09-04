@@ -597,7 +597,7 @@ jobs:
     assert any("full commit SHA" in failure for failure in failures)
 
 
-def test_ci_policy_rejects_pr_write_but_allows_push_only_write(tmp_path: Path) -> None:
+def test_ci_policy_rejects_pr_write_and_non_release_package_write(tmp_path: Path) -> None:
     repository = _write_ci(
         tmp_path,
         """\
@@ -624,9 +624,36 @@ jobs:
 
     failures = _checker().check_repository(repository)
 
-    assert len(failures) == 1
-    assert "unsafe" in failures[0]
-    assert "contents" in failures[0]
+    assert len(failures) == 2
+    assert any("unsafe" in failure and "contents" in failure for failure in failures)
+    assert any(
+        "only release.yml may request packages: write" in failure and "publish" in failure
+        for failure in failures
+    )
+
+
+def test_ci_policy_rejects_docker_push_outside_release(tmp_path: Path) -> None:
+    repository = _write_ci(
+        tmp_path,
+        """\
+name: CI
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  publish:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - run: docker push ghcr.io/example/alert-hub-api:sha-deadbeef
+""",
+    )
+
+    failures = _checker().check_repository(repository)
+
+    assert any("only release.yml may execute docker push" in failure for failure in failures)
 
 
 def test_ci_policy_fails_closed_on_ambiguous_pr_job_conditions(tmp_path: Path) -> None:
@@ -1048,18 +1075,21 @@ def test_peer_proxy_installer_rejects_public_upstream(tmp_path: Path) -> None:
     assert destination.read_text(encoding="utf-8") == original
 
 
-def test_publish_flows_reuse_both_exact_tested_images() -> None:
+def test_ci_keeps_images_local_and_release_publishes_exact_pair() -> None:
     ci = _workflow("ci.yml")
     jobs = ci["jobs"]
+    ci_source = (REPOSITORY / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "bundle-image" not in jobs
+    assert "candidate" not in jobs
+    assert "packages: write" not in ci_source
+    assert "docker login" not in ci_source
+    assert "docker push" not in ci_source
     api = jobs["api-image"]
     web = jobs["web-image"]
     integration = jobs["container-integration"]
-    candidate = ci["jobs"]["candidate"]
     api_run = _job_run(api)
     web_run = _job_run(web)
     integration_run = _job_run(integration)
-    candidate_run = _job_run(candidate)
 
     api_needs = api["needs"] if isinstance(api["needs"], list) else [api["needs"]]
     assert "frontend" not in api_needs
@@ -1072,21 +1102,6 @@ def test_publish_flows_reuse_both_exact_tested_images() -> None:
     assert "ci-image-matrix-smoke.sh" in integration_run
     assert "alert-hub-api:ci alert-hub-web:ci" in integration_run
     assert "ci-three-node-failure.sh alert-hub-api:ci" in integration_run
-    assert not re.search(r"(?m)^\s*docker build(?:x)?(?:\s|$)", candidate_run)
-    for local_image in ("alert-hub-api:ci", "alert-hub-web:ci"):
-        assert f"docker tag {local_image}" in candidate_run
-    assert candidate_run.count("docker push") == 2
-    assert "docker manifest inspect" in candidate_run
-    assert "Refusing to move immutable candidate tag" in candidate_run
-    assert "Could not prove candidate tag is absent" in candidate_run
-    assert "*'manifest unknown'*|*'no such manifest'*|*'name unknown'*)" in candidate_run
-    assert "not found" not in candidate_run
-    assert 'api_state=$(candidate_state "${api_candidate}"' in candidate_run
-    assert 'web_state=$(candidate_state "${web_candidate}"' in candidate_run
-    assert "alert-hub:ci" not in candidate_run
-    assert any(
-        action.startswith("actions/download-artifact@") for action in _job_actions(candidate)
-    )
     release = _workflow("release.yml")["jobs"]["release"]
     release_run = _job_run(release)
     build_commands = re.findall(r"(?m)^\s*docker build(?:x)?(?:\s|$)", release_run)
@@ -1136,6 +1151,12 @@ def test_publish_flows_reuse_both_exact_tested_images() -> None:
     actions = _job_actions(release)
     assert sum(action.startswith("anchore/sbom-action@") for action in actions) == 2
     assert sum(action.startswith("actions/attest-build-provenance@") for action in actions) == 2
+    attestation_steps = [
+        step
+        for step in release["steps"]
+        if str(step.get("uses", "")).startswith("actions/attest-build-provenance@")
+    ]
+    assert all(step["with"]["push-to-registry"] is False for step in attestation_steps)
 
 
 def test_ci_runs_for_main_and_release_tags() -> None:

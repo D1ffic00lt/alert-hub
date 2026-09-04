@@ -125,12 +125,13 @@ branch-coverage floor in addition to migrations, OpenAPI, browser, security,
 Compose, backup/restore, and static deployment/rollback policy checks. The full
 root-owned host rollback state machine remains a production-like installation drill.
 
-Pull requests to `main` run read-only GitHub-hosted checks and never publish or
-deploy. A successful `main` build may publish only `sha-<commit>` candidates.
-Semver-like `v*.*.*` tags also run the normal CI matrix without publishing a
-candidate; the separate release workflow publishes the two release images,
-SBOMs, provenance attestations, and compatible-pair manifest. Production deploy
-and rollback are separate, manual, protected workflows.
+Pull requests and pushes to `main` run read-only GitHub-hosted checks and never
+publish or deploy. Semver-like `v*.*.*` tags also run the normal CI matrix
+without publishing images; the separate release workflow is the only workflow
+that pushes the two `vX.Y.Z` images. It publishes SBOMs, GitHub-hosted provenance
+attestations, and the compatible-pair manifest without adding synthetic
+`sha256-*` tags to GHCR. Production deploy and rollback are separate, manual,
+protected workflows.
 
 ## Repository layout
 
