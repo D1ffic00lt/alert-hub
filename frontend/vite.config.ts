@@ -22,8 +22,8 @@ function runtimeManifest(appName: string) {
     display: "standalone",
     display_override: ["window-controls-overlay", "standalone", "minimal-ui"],
     orientation: "any",
-    background_color: "#0b0f0e",
-    theme_color: "#0b0f0e",
+    background_color: "#0A0A0B",
+    theme_color: "#0A0A0B",
     categories: ["productivity", "utilities"],
     icons: [
       { src: "/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },

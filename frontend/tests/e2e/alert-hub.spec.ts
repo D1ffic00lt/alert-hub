@@ -6,6 +6,12 @@ const TEST_TOKEN_EXPIRY_SECONDS = Math.floor(Date.now() / 1000) + 60 * 60;
 const TEST_VAPID_PUBLIC_KEY =
   "BHqKzvWvL4jD7SjGmLTrgV9eQYB3sE0JQF3mVZl-B4gtUJvrYJJaM7_zsY4ErX5L5E8cTDPb5i7-pwQ6S2K4h3A";
 
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("alert-hub-ui-language", "ru");
+  });
+});
+
 function token(sessionId: string) {
   const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
   return `${encode({ alg: "none", typ: "JWT" })}.${encode({ sid: sessionId, exp: TEST_TOKEN_EXPIRY_SECONDS })}.test`;
@@ -738,16 +744,16 @@ test("bootstrap, deep-link navigation, live source creation, failover trust, and
     return response.json() as Promise<Record<string, unknown>>;
   });
   expect(manifest).toMatchObject({
-    background_color: "#0b0f0e",
+    background_color: "#0A0A0B",
     description: "Распределённый мониторинг инцидентов и отказоустойчивая доставка оповещений.",
     name: "E2E Operations",
     shortcuts: [
       { name: "Активные инциденты", short_name: "Инциденты", url: "/incidents" },
       { name: "Состояние кластера", short_name: "Кластер", url: "/cluster" },
     ],
-    theme_color: "#0b0f0e",
+    theme_color: "#0A0A0B",
   });
-  await expect(page).toHaveTitle("E2E Operations — консоль мониторинга");
+  await expect(page).toHaveTitle("E2E Operations — центр мониторинга");
   await expect(page.getByRole("heading", { name: "Запуск кластера" })).toBeVisible();
   await page.getByLabel("Токен первичной настройки").fill("one-time-bootstrap-token");
   await page.getByLabel("Имя пользователя").fill("admin");
@@ -1262,9 +1268,10 @@ test("discards a delayed audit page after the authenticated session changes", as
 });
 
 test("demo shell is accessible and responsive on a phone viewport", async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 1280, height: 768 });
   await page.addInitScript(() => {
     Object.defineProperty(window, "EventSource", { configurable: true, value: undefined });
+    window.localStorage.setItem("alert-hub-ui-theme", "dark");
   });
   await page.route("**/api/v1/auth/refresh", (route) => fulfill(route, {}, 401));
   await page.route("**/api/v1/auth/bootstrap/status", (route) =>
@@ -1272,8 +1279,72 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
   );
 
   await page.goto("/");
+  await expect(
+    page.getByRole("img", { name: "Три автономных узла с синхронизацией журнала событий" }),
+  ).toBeVisible();
+  await expect(page.getByText("append-only синхронизация")).toBeVisible();
+  const authVisuals = await page.evaluate(() => {
+    const center = (selector: string) => {
+      const rect = document.querySelector<HTMLElement>(selector)!.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    };
+    const left = center(".auth-node--1 > span");
+    const right = center(".auth-node--2 > span");
+    const bottom = center(".auth-node--3 > span");
+    const hub = center(".auth-topology__center .brand-mark");
+    const bottomNode = document.querySelector<HTMLElement>(".auth-node--3 > span")!;
+    const centerLabel = document.querySelector<HTMLElement>(".auth-topology__center small")!;
+    const brand = document.querySelector<HTMLElement>(".auth-story > .brand")!;
+    const languageSwitch = document.querySelector<HTMLElement>(".auth-language-switch")!;
+    return {
+      brandLanguageTopOffset: Math.abs(
+        brand.getBoundingClientRect().top - languageSwitch.getBoundingClientRect().top,
+      ),
+      bottomOffset: Math.abs(bottom.x - (left.x + right.x) / 2),
+      centerLabelGap:
+        bottomNode.getBoundingClientRect().top - centerLabel.getBoundingClientRect().bottom,
+      hubOffset: Math.abs(hub.x - bottom.x),
+      nodeTopOffset: Math.abs(left.y - right.y),
+      signInTabBackground: getComputedStyle(
+        document.querySelector<HTMLElement>(".auth-tabs button.active")!,
+      ).backgroundColor,
+      submitBackground: getComputedStyle(document.querySelector<HTMLElement>(".auth-submit")!)
+        .backgroundColor,
+    };
+  });
+  expect(authVisuals).toMatchObject({
+    signInTabBackground: "rgb(35, 35, 39)",
+    submitBackground: "rgb(228, 228, 231)",
+  });
+  expect(authVisuals.nodeTopOffset).toBeLessThan(1);
+  expect(authVisuals.brandLanguageTopOffset).toBeLessThan(1);
+  expect(authVisuals.bottomOffset).toBeLessThan(1);
+  expect(authVisuals.hubOffset).toBeLessThan(1);
+  expect(authVisuals.centerLabelGap).toBeGreaterThan(8);
+  const authLayout = await page.evaluate(() => ({
+    clientHeight: document.documentElement.clientHeight,
+    demoButtonWhiteSpace: getComputedStyle(
+      document.querySelector<HTMLElement>(".auth-demo button")!,
+    ).whiteSpace,
+    rootLocked: document.documentElement.classList.contains("auth-open"),
+    scrollHeight: document.documentElement.scrollHeight,
+  }));
+  expect(authLayout).toMatchObject({
+    clientHeight: authLayout.scrollHeight,
+    demoButtonWhiteSpace: "nowrap",
+    rootLocked: true,
+  });
+  await expect(page.locator(".auth-screen .language-switch")).toBeVisible();
+  await expect(page.getByRole("button", { name: "RU", exact: true })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+
+  await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole("button", { name: /Открыть демо/ }).click();
   await expect(page.getByRole("main")).toBeVisible();
+  await expect(page.getByRole("status").getByText("демо-режим", { exact: true })).toBeVisible();
+  await expect(page.locator("html")).not.toHaveClass(/auth-open/);
   await expect(page.getByLabel("Grafana не настроена")).toBeVisible();
   await expect(page.getByRole("link", { name: "Открыть Grafana" })).toHaveCount(0);
   await expect(page.locator(".mobile-nav")).toBeVisible();
@@ -1298,6 +1369,88 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
     ["serious", "critical"].includes(violation.impact ?? ""),
   );
   expect(serious).toEqual([]);
+
+  await page.getByRole("button", { name: "Ещё" }).click();
+  await page.getByRole("button", { name: "Каналы", exact: true }).click();
+  await expect(page.locator(".delivery-ring")).toBeVisible();
+  const deliveryRingLayout = await page.evaluate(() => {
+    const ring = document.querySelector<HTMLElement>(".delivery-ring")!.getBoundingClientRect();
+    const label = document
+      .querySelector<HTMLElement>(".delivery-ring > span")!
+      .getBoundingClientRect();
+    return {
+      bottomFits: label.bottom <= ring.bottom,
+      leftFits: label.left >= ring.left,
+      rightFits: label.right <= ring.right,
+      topFits: label.top >= ring.top,
+    };
+  });
+  expect(deliveryRingLayout).toEqual({
+    bottomFits: true,
+    leftFits: true,
+    rightFits: true,
+    topFits: true,
+  });
+  const deliveryRingAtOneHundred = await page.locator(".delivery-ring > span").evaluate((label) => {
+    label.firstChild!.textContent = "100.0";
+    const ring = label.parentElement!.getBoundingClientRect();
+    const value = label.getBoundingClientRect();
+    return {
+      bottomFits: value.bottom <= ring.bottom - 10,
+      leftFits: value.left >= ring.left + 10,
+      rightFits: value.right <= ring.right - 10,
+      topFits: value.top >= ring.top + 10,
+    };
+  });
+  expect(deliveryRingAtOneHundred).toEqual({
+    bottomFits: true,
+    leftFits: true,
+    rightFits: true,
+    topFits: true,
+  });
+
+  await page.getByRole("button", { name: "Ещё" }).click();
+  await page.getByRole("button", { name: "Настройки", exact: true }).click();
+  await expect(page.getByRole("group", { name: "Тема интерфейса" })).toBeVisible();
+  await expect(page.locator(".app-header .language-switch")).toHaveCount(0);
+  await page.getByRole("button", { name: "Светлая", exact: true }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute("content", "#FFFFFF");
+  expect(await page.evaluate(() => localStorage.getItem("alert-hub-ui-theme"))).toBe("light");
+
+  await page.locator(".mobile-nav").getByRole("button", { name: "Инциденты" }).click();
+  await expect(page.locator(".search-field")).toHaveCSS("background-color", "rgb(255, 255, 255)");
+  await page.locator(".mobile-nav").getByRole("button", { name: "Ещё" }).click();
+  await page.getByRole("button", { name: "Источники", exact: true }).click();
+  await expect(page.locator(".section-summary-bar")).toHaveCSS(
+    "background-color",
+    "rgb(248, 250, 252)",
+  );
+  await page.locator(".mobile-nav").getByRole("button", { name: "Кластер" }).click();
+  await expect(page.locator(".cluster-summary-bar")).toHaveCSS(
+    "background-color",
+    "rgb(248, 250, 252)",
+  );
+  await page.locator(".mobile-nav").getByRole("button", { name: "Ещё" }).click();
+  await page.getByRole("button", { name: "Журнал действий", exact: true }).click();
+  await expect(page.locator(".audit-panel .search-field")).toHaveCSS(
+    "background-color",
+    "rgb(255, 255, 255)",
+  );
+  await expect(page.locator(".audit-panel .search-field")).toHaveCSS("overflow", "hidden");
+  await expect(page.locator(".audit-panel .search-field input")).toHaveCSS(
+    "text-overflow",
+    "ellipsis",
+  );
+  await expect(page.locator(".segmented")).toHaveCSS("background-color", "rgb(248, 250, 252)");
+  await page.locator(".mobile-nav").getByRole("button", { name: "Ещё" }).click();
+  await page.getByRole("button", { name: "Настройки", exact: true }).click();
+  await page.getByRole("button", { name: "EN", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
+  await expect(page.getByRole("button", { name: "EN", exact: true })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
 });
 
 test.describe("service-worker offline lifecycle", () => {
@@ -1341,7 +1494,7 @@ test.describe("service-worker offline lifecycle", () => {
         JSON.stringify({ partition, savedAt: Date.now(), version: 1 }),
       );
       localStorage.removeItem("alert-hub-local-logout-v1");
-      const shell = await caches.open("alert-hub-v3-shell");
+      const shell = await caches.open("alert-hub-v6-shell");
       const shellUrls = [
         "/",
         ...[...document.querySelectorAll<HTMLScriptElement>("script[src]")].map(

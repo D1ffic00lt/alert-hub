@@ -12,6 +12,7 @@ import {
 } from "react";
 import { useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
 
+import { mergeIncidentSummariesWithHistory } from "./incidents";
 import {
   applicationServerKeyMatches,
   blockedPermissionHelp,
@@ -20,6 +21,14 @@ import {
   decodeApplicationServerKey,
   withPushTimeout,
 } from "./push";
+import {
+  applyThemePreference,
+  readThemePreference,
+  resolveThemePreference,
+  THEME_STORAGE_KEY,
+  type ResolvedTheme,
+  type ThemePreference,
+} from "./theme";
 
 const API_BASE = "/api/v1";
 const AppNameContext = createContext("Alert Hub");
@@ -29,16 +38,21 @@ const LanguageContext = createContext<{
   language: UiLanguage;
   setLanguage: (language: UiLanguage) => void;
 }>({ language: "ru", setLanguage: () => undefined });
+const ThemeContext = createContext<{
+  preference: ThemePreference;
+  resolved: ResolvedTheme;
+  setPreference: (preference: ThemePreference) => void;
+}>({ preference: "dark", resolved: "dark", setPreference: () => undefined });
 
 function currentUiLanguage(): UiLanguage {
-  if (typeof window === "undefined") return "ru";
+  if (typeof window === "undefined") return "en";
   try {
     const stored = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
     if (stored === "ru" || stored === "en") return stored;
   } catch {
     // Storage can be blocked in hardened browser contexts; the document language remains usable.
   }
-  return document.documentElement.lang === "en" ? "en" : "ru";
+  return document.documentElement.lang === "ru" ? "ru" : "en";
 }
 
 function tr(russian: string, english: string) {
@@ -984,7 +998,7 @@ const NAV_ITEMS = [
       return tr("Обзор", "Overview");
     },
     path: "/",
-    icon: "◫",
+    icon: "overview",
   },
   {
     id: "incidents",
@@ -992,7 +1006,7 @@ const NAV_ITEMS = [
       return tr("Инциденты", "Incidents");
     },
     path: "/incidents",
-    icon: "!",
+    icon: "incidents",
   },
   {
     id: "reachability",
@@ -1000,7 +1014,7 @@ const NAV_ITEMS = [
       return tr("Доступность", "Regional reachability");
     },
     path: "/reachability",
-    icon: "∿",
+    icon: "reachability",
   },
   {
     id: "sources",
@@ -1008,7 +1022,7 @@ const NAV_ITEMS = [
       return tr("Источники", "Sources");
     },
     path: "/sources",
-    icon: "→",
+    icon: "sources",
   },
   {
     id: "channels",
@@ -1016,7 +1030,7 @@ const NAV_ITEMS = [
       return tr("Каналы", "Channels");
     },
     path: "/channels",
-    icon: "≫",
+    icon: "channels",
   },
   {
     id: "devices",
@@ -1024,7 +1038,7 @@ const NAV_ITEMS = [
       return tr("Устройства", "Devices");
     },
     path: "/devices",
-    icon: "▣",
+    icon: "devices",
   },
   {
     id: "cluster",
@@ -1032,7 +1046,7 @@ const NAV_ITEMS = [
       return tr("Кластер", "Cluster");
     },
     path: "/cluster",
-    icon: "⌘",
+    icon: "cluster",
   },
   {
     id: "audit",
@@ -1040,7 +1054,7 @@ const NAV_ITEMS = [
       return tr("Журнал действий", "Audit log");
     },
     path: "/audit",
-    icon: "≡",
+    icon: "audit",
   },
   {
     id: "settings",
@@ -1048,7 +1062,7 @@ const NAV_ITEMS = [
       return tr("Настройки", "Settings");
     },
     path: "/settings",
-    icon: "⚙",
+    icon: "settings",
   },
 ] as const;
 
@@ -2357,7 +2371,7 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
         ).length;
         if (requests[7]?.status === "fulfilled") setAuditLoadError(null);
 
-        setData(() => {
+        setData((current) => {
           const next: HubData = { ...(verifiedData.current ?? EMPTY_DATA) };
           const [
             incidents,
@@ -2375,7 +2389,8 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
             summary,
           ] = requests;
           if (incidents.status === "fulfilled") {
-            next.incidents = listFrom(incidents.value.payload, "incidents").map(normalizeIncident);
+            const summaries = listFrom(incidents.value.payload, "incidents").map(normalizeIncident);
+            next.incidents = mergeIncidentSummariesWithHistory(summaries, current.incidents);
           }
           if (clusterEpoch === clusterRequestEpoch.current) {
             if (nodes.status === "fulfilled") {
@@ -2957,10 +2972,129 @@ function useRoute() {
   return { route, navigate };
 }
 
+function iconArtwork(name: string): ReactNode | null {
+  switch (name) {
+    case "overview":
+      return (
+        <>
+          <rect x="3" y="3" width="7" height="7" rx="1.5" />
+          <rect x="14" y="3" width="7" height="7" rx="1.5" />
+          <rect x="3" y="14" width="7" height="7" rx="1.5" />
+          <rect x="14" y="14" width="7" height="7" rx="1.5" />
+        </>
+      );
+    case "incidents":
+      return (
+        <>
+          <path d="M10.3 3.8 2.8 17a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 3.8a2 2 0 0 0-3.4 0Z" />
+          <path d="M12 9v4" />
+          <path d="M12 17h.01" />
+        </>
+      );
+    case "reachability":
+      return <path d="M3 12h3l2.2-5 3.4 10 2.6-7 1.8 2h5" />;
+    case "sources":
+      return (
+        <>
+          <path d="M12 3v11" />
+          <path d="m8 10 4 4 4-4" />
+          <path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+        </>
+      );
+    case "channels":
+      return (
+        <>
+          <path d="m21 3-7.2 18-4.1-7.2L3 10.5 21 3Z" />
+          <path d="m9.7 13.8 4.5-4.4" />
+        </>
+      );
+    case "devices":
+      return (
+        <>
+          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
+          <path d="M10 18.5h4" />
+        </>
+      );
+    case "cluster":
+      return (
+        <>
+          <circle cx="12" cy="5" r="2.5" />
+          <circle cx="5" cy="18" r="2.5" />
+          <circle cx="19" cy="18" r="2.5" />
+          <path d="m10.8 7.2-4.6 8.6M13.2 7.2l4.6 8.6M7.5 18h9" />
+        </>
+      );
+    case "server":
+      return (
+        <>
+          <rect x="4" y="3" width="16" height="7" rx="1.5" />
+          <rect x="4" y="14" width="16" height="7" rx="1.5" />
+          <path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5" />
+        </>
+      );
+    case "audit":
+      return (
+        <>
+          <path d="M7 3.5h10a2 2 0 0 1 2 2v15H5v-15a2 2 0 0 1 2-2Z" />
+          <path d="M9 3.5v-1h6v1M8.5 9h7M8.5 13h7M8.5 17H13" />
+        </>
+      );
+    case "settings":
+      return (
+        <>
+          <path d="M4 7h10M18 7h2M4 17h2M10 17h10" />
+          <circle cx="16" cy="7" r="2" />
+          <circle cx="8" cy="17" r="2" />
+        </>
+      );
+    case "more":
+      return (
+        <>
+          <circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" />
+          <circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" />
+          <circle cx="19" cy="12" r="1" fill="currentColor" stroke="none" />
+        </>
+      );
+    case "menu":
+      return <path d="M4 7h16M4 12h16M4 17h16" />;
+    case "refresh":
+      return (
+        <>
+          <path d="M20 7v5h-5" />
+          <path d="M18.5 16a8 8 0 1 1 .8-8L20 12" />
+        </>
+      );
+    case "bell":
+      return (
+        <>
+          <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+          <path d="M10 21h4" />
+        </>
+      );
+    case "logout":
+      return (
+        <>
+          <path d="M10 5H5v14h5M14 8l4 4-4 4M9 12h9" />
+        </>
+      );
+    case "brand-pulse":
+      return <path d="M3 12h4l2-5 4 10 2-5h6" />;
+    default:
+      return null;
+  }
+}
+
 function Icon({ symbol }: { symbol: string }) {
+  const artwork = iconArtwork(symbol);
   return (
     <span className="icon-glyph" aria-hidden="true">
-      {symbol}
+      {artwork ? (
+        <svg viewBox="0 0 24 24" focusable="false">
+          {artwork}
+        </svg>
+      ) : (
+        symbol
+      )}
     </span>
   );
 }
@@ -3064,13 +3198,11 @@ function Brand() {
   return (
     <div className="brand" aria-label={appName}>
       <span className="brand-mark" aria-hidden="true">
-        <i />
-        <i />
-        <i />
+        <Icon symbol="brand-pulse" />
       </span>
       <span>
         <b>{appName}</b>
-        <small>{tr("центр мониторинга", "distributed ops")}</small>
+        <small>{tr("центр мониторинга", "monitoring center")}</small>
       </span>
     </div>
   );
@@ -3132,6 +3264,14 @@ function AuthGate({
   const [bootstrapToken, setBootstrapToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    document.documentElement.classList.add("auth-open");
+    document.body.classList.add("auth-open");
+    return () => {
+      document.documentElement.classList.remove("auth-open");
+      document.body.classList.remove("auth-open");
+    };
+  }, []);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (mode === "bootstrap" && password !== confirmPassword) {
@@ -3191,7 +3331,7 @@ function AuthGate({
           <h1>
             {tr("Каждый узел работает автономно.", "Every node stays useful.")}
             <br />
-            <em>{tr("Ни одно событие не потеряется.", "Every event survives.")}</em>
+            <span>{tr("Ни одно событие не потеряется.", "Every event survives.")}</span>
           </h1>
           <p>
             {tr(
@@ -3200,31 +3340,40 @@ function AuthGate({
             )}
           </p>
         </div>
-        <div className="auth-topology">
-          <span className="auth-topology__line auth-topology__line--1" />
-          <span className="auth-topology__line auth-topology__line--2" />
-          <span className="auth-topology__line auth-topology__line--3" />
+        <div
+          className="auth-topology"
+          role="img"
+          aria-label={tr(
+            "Три автономных узла с синхронизацией журнала событий",
+            "Three autonomous nodes synchronizing their event journals",
+          )}
+        >
+          <svg
+            className="auth-topology__links"
+            viewBox="0 0 100 100"
+            preserveAspectRatio="none"
+            aria-hidden="true"
+          >
+            <path d="M50 39 L12.5 12 M50 39 L87.5 12 M50 39 L50 75" />
+          </svg>
           {[
-            { code: "A", label: tr("Региональный узел", "Peer region") },
-            { code: "B", label: tr("Региональный узел", "Peer region") },
-            { code: "C", label: tr("Региональный узел", "Peer region") },
+            { code: "01", label: tr("Узел 01", "Node 01") },
+            { code: "02", label: tr("Узел 02", "Node 02") },
+            { code: "03", label: tr("Узел 03", "Node 03") },
           ].map((node, index) => (
             <div key={node.code} className={`auth-node auth-node--${index + 1}`}>
-              <span>{node.code}</span>
+              <span>
+                <Icon symbol="server" />
+              </span>
               <b>{node.label}</b>
-              <small>
-                <StatusDot health="unknown" />
-                {tr("пример узла", "example node")}
-              </small>
+              <small>{tr("Приём · UI · доставка", "Ingest · UI · delivery")}</small>
             </div>
           ))}
           <div className="auth-topology__center">
             <span className="brand-mark">
-              <i />
-              <i />
-              <i />
+              <Icon symbol="brand-pulse" />
             </span>
-            <small>{tr("пример топологии", "example topology")}</small>
+            <small>{tr("append-only синхронизация", "append-only sync")}</small>
           </div>
         </div>
         <div className="auth-story__foot">
@@ -3354,9 +3503,9 @@ function AuthGate({
             </button>
           </form>
           <div className="auth-demo">
-            <span>{tr("Посмотреть без подключения к API", "Preview without a live API")}</span>
+            <span>{tr("Без подключения к API", "Without a live API")}</span>
             <button onClick={onDemo}>
-              {tr("Открыть демо", "Open demo snapshot")} <Icon symbol="→" />
+              {tr("Открыть демо", "Open demo")} <Icon symbol="→" />
             </button>
           </div>
         </div>
@@ -3504,7 +3653,7 @@ function MobileNav({
         </button>
       ))}
       <button onClick={onMore}>
-        <Icon symbol="•••" />
+        <Icon symbol="more" />
         <span>{tr("Ещё", "More")}</span>
       </button>
     </nav>
@@ -3560,7 +3709,6 @@ function MobileDrawer({
           ))}
         </nav>
         <div className="mobile-drawer__foot">
-          <LanguageSwitch className="drawer-language-switch" />
           <span className="avatar">OP</span>
           <span>
             <b>{tr("Оператор", "Operator")}</b>
@@ -3594,7 +3742,7 @@ function ConnectionBanner({
         <b>
           {online
             ? mode === "demo"
-              ? tr("Демонстрационный режим", "Demo snapshot")
+              ? tr("демо-режим", "demo mode")
               : tr("Часть данных недоступна", "Partial data")
             : tr("Нет подключения", "Offline mode")}
         </b>
@@ -3653,7 +3801,7 @@ function AppHeader({
           onClick={onMenu}
           aria-label={tr("Открыть меню", "Open menu")}
         >
-          <Icon symbol="≡" />
+          <Icon symbol="menu" />
         </button>
         <Brand />
       </div>
@@ -3689,19 +3837,18 @@ function AppHeader({
                 ? tr("Опрос", "Polling")
                 : mode === "cached"
                   ? tr("Из кэша", "Cached")
-                  : tr("Демо", "Demo")}
+                  : tr("демо-режим", "demo mode")}
           </span>
         </span>
-        <LanguageSwitch className="header-language-switch" />
         <button
           className={`icon-button refresh-button ${refreshing ? "is-spinning" : ""}`}
           onClick={onRefresh}
           aria-label={tr("Обновить данные кластера", "Refresh cluster data")}
         >
-          <Icon symbol="↻" />
+          <Icon symbol="refresh" />
         </button>
         <button className="button button--quiet notifications-button" onClick={onNotifications}>
-          <Icon symbol="◉" />
+          <Icon symbol="bell" />
           <span>{tr("Уведомления", "Notifications")}</span>
         </button>
         <button
@@ -3711,7 +3858,7 @@ function AppHeader({
           disabled={logoutBusy}
           aria-label={tr("Выйти из Alert Hub", "Log out of Alert Hub")}
         >
-          <Icon symbol="↪" />
+          <Icon symbol="logout" />
           <span>{logoutBusy ? tr("Выходим…", "Logging out…") : tr("Выйти", "Log out")}</span>
         </button>
       </div>
@@ -3721,6 +3868,13 @@ function AppHeader({
 
 export function AlertHubApp({ appName = "Alert Hub" }: { appName?: string }) {
   const [language, setLanguageState] = useState<UiLanguage>(currentUiLanguage);
+  const [themePreference, setThemePreferenceState] = useState<ThemePreference>(readThemePreference);
+  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() =>
+    resolveThemePreference(
+      readThemePreference(),
+      window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true,
+    ),
+  );
   const setLanguage = useCallback((nextLanguage: UiLanguage) => {
     document.documentElement.lang = nextLanguage;
     try {
@@ -3730,9 +3884,27 @@ export function AlertHubApp({ appName = "Alert Hub" }: { appName?: string }) {
     }
     setLanguageState(nextLanguage);
   }, []);
+  const setThemePreference = useCallback((nextPreference: ThemePreference) => {
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, nextPreference);
+    } catch {
+      // The current document can still apply the preference without persistence.
+    }
+    setThemePreferenceState(nextPreference);
+  }, []);
+  useEffect(() => {
+    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
+    const apply = () => {
+      setResolvedTheme(applyThemePreference(themePreference, media?.matches ?? true));
+    };
+    apply();
+    if (themePreference !== "system" || !media) return undefined;
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [themePreference]);
   useEffect(() => {
     document.documentElement.lang = language;
-    const pageTitle = `${appName} — ${language === "ru" ? "консоль мониторинга" : "distributed operations console"}`;
+    const pageTitle = `${appName} — ${language === "ru" ? "центр мониторинга" : "monitoring center"}`;
     document.title = pageTitle;
     document
       .querySelectorAll<HTMLMetaElement>('meta[property="og:title"], meta[name="twitter:title"]')
@@ -3741,11 +3913,19 @@ export function AlertHubApp({ appName = "Alert Hub" }: { appName?: string }) {
       });
   }, [appName, language]);
   return (
-    <LanguageContext.Provider value={{ language, setLanguage }}>
-      <AppNameContext.Provider value={appName}>
-        <AlertHubRuntime />
-      </AppNameContext.Provider>
-    </LanguageContext.Provider>
+    <ThemeContext.Provider
+      value={{
+        preference: themePreference,
+        resolved: resolvedTheme,
+        setPreference: setThemePreference,
+      }}
+    >
+      <LanguageContext.Provider value={{ language, setLanguage }}>
+        <AppNameContext.Provider value={appName}>
+          <AlertHubRuntime />
+        </AppNameContext.Provider>
+      </LanguageContext.Provider>
+    </ThemeContext.Provider>
   );
 }
 
@@ -3798,7 +3978,17 @@ function AlertHubRuntime() {
   };
 
   useEffect(() => {
-    if ("serviceWorker" in navigator) {
+    if (import.meta.env.DEV && "serviceWorker" in navigator) {
+      void navigator.serviceWorker
+        .getRegistrations()
+        .then(async (registrations) => {
+          const needsReload =
+            registrations.length > 0 && navigator.serviceWorker.controller != null;
+          await Promise.all(registrations.map((registration) => registration.unregister()));
+          if (needsReload) window.location.reload();
+        })
+        .catch(() => undefined);
+    } else if ("serviceWorker" in navigator) {
       navigator.serviceWorker
         .register("/sw.js", { scope: "/" })
         .then(() => navigator.serviceWorker.ready)
@@ -4212,6 +4402,7 @@ function OverviewPage({
         }
         actions={
           <>
+            <LanguageSwitch className="overview-language-switch" />
             <button className="button button--quiet" onClick={onNotifications} disabled={readOnly}>
               <Icon symbol="◉" />
               {tr("Включить оповещения", "Enable alerts")}
@@ -4388,7 +4579,7 @@ function OverviewPage({
                   </small>
                 </span>
                 <span className="node-row__metric">
-                  <small>{tr("Задержка синхронизации", "Sync lag")}</small>
+                  <small>{tr("Задержка", "Sync lag")}</small>
                   <b className={node.syncLag != null && node.syncLag > 10 ? "text-warning" : ""}>
                     {node.syncLag == null
                       ? tr("Нет данных", "No data")
@@ -4710,12 +4901,17 @@ function IncidentDetailPage({
   const applyDetail = useCallback(
     (payload: unknown) => {
       const detail = normalizeIncident(payload, 0);
-      setData((current) => ({
-        ...current,
-        incidents: current.incidents.some((item) => item.id === detail.id)
-          ? current.incidents.map((item) => (item.id === detail.id ? detail : item))
-          : [detail, ...current.incidents],
-      }));
+      setData((current) => {
+        const [stableDetail] = mergeIncidentSummariesWithHistory([detail], current.incidents);
+        return {
+          ...current,
+          incidents: current.incidents.some((item) => item.id === detail.id)
+            ? current.incidents.map((item) =>
+                item.id === detail.id ? (stableDetail ?? detail) : item,
+              )
+            : [detail, ...current.incidents],
+        };
+      });
     },
     [setData],
   );
@@ -6174,10 +6370,11 @@ function ChannelsPage({
         }
       />
       <div className="channel-health-banner">
-        <div
-          className="delivery-ring"
-          style={{ ["--progress" as string]: `${deliveryRate ?? 0}%` }}
-        >
+        <div className="delivery-ring" style={{ ["--progress" as string]: deliveryRate ?? 0 }}>
+          <svg viewBox="0 0 48 48" aria-hidden="true">
+            <circle className="delivery-ring__track" cx="24" cy="24" r="19" pathLength="100" />
+            <circle className="delivery-ring__value" cx="24" cy="24" r="19" pathLength="100" />
+          </svg>
           <span>
             {deliveryRate == null ? "—" : deliveryRate.toFixed(1)}
             {deliveryRate != null && <small>%</small>}
@@ -7101,6 +7298,11 @@ function Toggle({
 
 function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boolean }) {
   const appName = useContext(AppNameContext);
+  const {
+    preference: themePreference,
+    resolved: resolvedTheme,
+    setPreference,
+  } = useContext(ThemeContext);
   const [autoFailover, setAutoFailover] = useState(() =>
     typeof localStorage === "undefined"
       ? true
@@ -7167,23 +7369,50 @@ function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boo
               <span>
                 <b>{tr("Тема", "Theme")}</b>
                 <small>
-                  {appName}{" "}
+                  {themePreference === "system"
+                    ? tr(
+                        `Следует настройкам устройства · сейчас ${resolvedTheme === "dark" ? "тёмная" : "светлая"}.`,
+                        `Follows this device · currently ${resolvedTheme}.`,
+                      )
+                    : tr("Выбор сохранён только на этом устройстве.", "Saved on this device only.")}
+                </small>
+              </span>
+              <span
+                className="theme-picker"
+                role="group"
+                aria-label={tr("Тема интерфейса", "Interface theme")}
+              >
+                {(
+                  [
+                    ["light", tr("Светлая", "Light")],
+                    ["dark", tr("Тёмная", "Dark")],
+                    ["system", tr("Системная", "System")],
+                  ] as const
+                ).map(([item, label]) => (
+                  <button
+                    key={item}
+                    type="button"
+                    className={themePreference === item ? "active" : ""}
+                    aria-pressed={themePreference === item}
+                    onClick={() => setPreference(item)}
+                  >
+                    <i className={`theme-swatch theme-swatch--${item}`} aria-hidden="true" />
+                    {label}
+                  </button>
+                ))}
+              </span>
+            </div>
+            <div className="setting-row">
+              <span>
+                <b>{tr("Язык интерфейса", "Interface language")}</b>
+                <small>
                   {tr(
-                    "использует тёмную контрастную палитру.",
-                    "uses a high-contrast dark palette.",
+                    "Меняет подписи только на этом устройстве.",
+                    "Changes interface labels on this device only.",
                   )}
                 </small>
               </span>
-              <span className="theme-picker">
-                <button className="active" disabled>
-                  <i />
-                  {tr("Тёмная", "Dark")}
-                </button>
-                <button disabled>
-                  <i />
-                  {tr("Системная", "System")}
-                </button>
-              </span>
+              <LanguageSwitch className="settings-language-switch" />
             </div>
           </Panel>
           <Panel

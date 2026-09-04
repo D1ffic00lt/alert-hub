@@ -1,9 +1,15 @@
 /* Alert Hub application shell and notification worker. */
-const SHELL_CACHE = "alert-hub-v3-shell";
+const SHELL_CACHE = "alert-hub-v6-shell";
 // Keep the authenticated read-cache prefix stable so a service-worker upgrade
 // does not erase a verified session partition needed for a cold offline start.
 const DATA_CACHE = "alert-hub-v2-read-model";
-const SHELL = ["/", "/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"];
+const SHELL = [
+  "/",
+  "/theme-bootstrap.js",
+  "/icon-192.png",
+  "/icon-512.png",
+  "/apple-touch-icon.png",
+];
 const MANIFEST_FETCH_TIMEOUT_MS = 750;
 const SPA_ROUTE =
   /^\/(?:$|incidents(?:\/[^/]+)?|reachability|sources|channels|devices|cluster|audit|settings)\/?$/;
