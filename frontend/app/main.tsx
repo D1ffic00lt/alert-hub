@@ -5,6 +5,7 @@ import { BrowserRouter } from "react-router-dom";
 import { AlertHubApp } from "./AlertHubApp";
 import "./globals.css";
 import { getAppName } from "./product";
+import { applyThemePreference, readThemePreference } from "./theme";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -22,7 +23,8 @@ function setMeta(selector: string, value: string) {
 }
 
 const appName = getAppName();
-const pageTitle = `${appName} — консоль мониторинга`;
+applyThemePreference(readThemePreference());
+const pageTitle = `${appName} — ${document.documentElement.lang === "ru" ? "центр мониторинга" : "monitoring center"}`;
 document.title = pageTitle;
 setMeta('meta[name="application-name"]', appName);
 setMeta('meta[name="apple-mobile-web-app-title"]', appName);

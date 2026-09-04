@@ -2,19 +2,19 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 describe("static SPA security contract", () => {
-  it("declares Russian document metadata while preserving the product brand", () => {
+  it("declares English defaults while preserving the product brand", () => {
     const html = readFileSync("index.html", "utf8");
-    expect(html).toContain('<html lang="ru">');
-    expect(html).toContain('<meta name="theme-color" content="#0b0f0e" />');
-    expect(html).toContain("<title>Alert Hub — консоль мониторинга</title>");
-    expect(html).toContain(
-      '<meta property="og:title" content="Alert Hub — консоль мониторинга" />',
-    );
+    expect(html).toContain('<html lang="en">');
+    expect(html).toContain('<meta name="theme-color" content="#0A0A0B" />');
+    expect(html).toContain('<meta name="color-scheme" content="light dark" />');
+    expect(html).toContain("<title>Alert Hub — monitoring center</title>");
+    expect(html).toContain('<meta property="og:title" content="Alert Hub — monitoring center" />');
   });
 
   it("loads runtime configuration and application code only from external scripts", () => {
     const html = readFileSync("index.html", "utf8");
     const approvedScripts = [
+      '<script src="/theme-bootstrap.js"></script>',
       '<script vite-ignore src="/runtime-config.js"></script>',
       '<script type="module" src="/app/main.tsx"></script>',
     ];

@@ -49,7 +49,7 @@ describe("container UI runtime renderer", () => {
       expect(manifest.name).toBe(config.appName);
       expect(manifest.short_name).toBe(config.appName.slice(0, 24));
       expect(manifest).toMatchObject({
-        background_color: "#0b0f0e",
+        background_color: "#0A0A0B",
         description: "Распределённый мониторинг инцидентов и отказоустойчивая доставка оповещений.",
         shortcuts: [
           {
@@ -65,7 +65,7 @@ describe("container UI runtime renderer", () => {
             url: "/cluster",
           },
         ],
-        theme_color: "#0b0f0e",
+        theme_color: "#0A0A0B",
       });
       expect(manifest.icons.map((icon) => icon.purpose)).toEqual(["any", "maskable"]);
       expect(statSync(scriptPath).mode & 0o777).toBe(0o444);
