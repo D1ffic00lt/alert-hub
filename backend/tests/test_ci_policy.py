@@ -1157,10 +1157,19 @@ def test_manual_release_reserves_tag_and_publishes_assets_idempotently() -> None
     dispatch_inputs = triggers["workflow_dispatch"]["inputs"]
     assert set(dispatch_inputs) == {"version"}
     assert dispatch_inputs["version"]["required"] == "false"
-    assert dispatch_inputs["version"]["default"] == "v0.0.0"
+    assert dispatch_inputs["version"]["default"] == ""
 
     release = _workflow("release.yml")["jobs"]["release"]
     steps = release["steps"]
+    validation_step = next(
+        step for step in steps if step.get("name") == "Validate release version and source revision"
+    )
+    validation_run = validation_step["run"]
+    assert "product_version=$(<VERSION)" in validation_run
+    assert "backend/pyproject.toml" not in validation_run
+    assert "frontend/package.json" not in validation_run
+    assert "VERSION must contain X.Y.Z without a leading v" in validation_run
+    assert "does not match repository VERSION" in validation_run
     tag_step = next(
         step
         for step in steps
@@ -1170,7 +1179,7 @@ def test_manual_release_reserves_tag_and_publishes_assets_idempotently() -> None
     run = _job_run(release)
     assert '[[ "${GITHUB_REF}" == refs/heads/main ]]' in run
     assert "RELEASE_CONFIRMATION" not in run
-    assert "requested_version=${RELEASE_VERSION_INPUT:-${backend_version}}" in run
+    assert "requested_version=${RELEASE_VERSION_INPUT:-${product_version}}" in run
     assert 'release_version="v${requested_version#v}"' in run
     assert "printf 'RELEASE_VERSION=%s\\n'" in run
     assert '[[ "${GITHUB_SHA}" == "$(git rev-parse refs/remotes/origin/main)" ]]' in run
@@ -1199,6 +1208,13 @@ def test_manual_release_reserves_tag_and_publishes_assets_idempotently() -> None
     assert run.count("ensure_release_asset ") == 4
     assert "Published release is missing required asset" in run
     assert "Refusing to replace non-matching release asset" in run
+
+
+def test_root_version_is_the_release_source_of_truth() -> None:
+    source = (REPOSITORY / "VERSION").read_text(encoding="utf-8")
+    assert source.endswith("\n")
+    assert source.count("\n") == 1
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?\n", source)
 
 
 def test_compose_contract_has_only_independent_api_and_web_images() -> None:

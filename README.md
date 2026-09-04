@@ -75,9 +75,11 @@ ghcr.io/<owner>/alert-hub-web:vX.Y.Z
 The release manifest records both digest-qualified references and their API
 contract compatibility value. A release is complete only after both images are
 built, tested together, published, attested, and attached to the same GitHub
-Release. The Release workflow may be started manually from `main` with a version
-and literal `RELEASE` confirmation; it creates the immutable tag after the gate.
-Pushing an existing version tag remains supported.
+Release. A manual Release workflow run on `main` reads the product version from
+the root `VERSION` file. An optional explicit workflow input or an
+existing version tag must match that file. The workflow creates the immutable
+tag after the gate; pushing an existing version tag remains supported. Package
+manager versions are not used as the product release version.
 
 The API image uses `backend/` as its complete build context. It cannot see or
 copy frontend files and contains no Node.js tooling. The web image uses

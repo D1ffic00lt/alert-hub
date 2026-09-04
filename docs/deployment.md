@@ -332,11 +332,13 @@ disabled rather than inventing a topology.
 Pull requests to `main` build and test API and web independently and together,
 but have read-only permissions and never publish or deploy. Semver-like
 `v*.*.*` tags also run that normal CI matrix without publishing candidates. A
-version tag separately runs the complete release gate. An operator may instead run the Release workflow on
-`main`, enter a new `vX.Y.Z` and the literal confirmation `RELEASE`; that same
-workflow validates the main revision and package versions, creates the immutable
-tag, and publishes the release. Failure of either image makes the release
-incomplete. Pushing an already-created version tag remains supported.
+version tag separately runs the complete release gate. The root `VERSION` file is the sole product
+release version source. An operator may instead run the Release workflow on `main` without entering
+a version; the workflow reads `VERSION`, validates the main revision, creates the immutable tag, and
+publishes the release. An optional explicit `vX.Y.Z` input and any pushed version tag must match
+`VERSION`. Backend and frontend package-manager versions do not gate the product release. Failure
+of either image makes the release incomplete. Pushing an already-created version tag remains
+supported.
 If a manual run fails after creating its tag and `main` advances, resume it with
 **Re-run jobs** on that original Actions run. A new manual run starts from the
 new `main` commit and therefore refuses to reuse the older immutable tag.
