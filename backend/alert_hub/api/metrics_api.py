@@ -131,6 +131,14 @@ async def metrics_reachability(
         for sample in result.samples:
             source_region = sample.labels.get("source_region", "").strip()
             target_name = sample.labels.get("target_name", "").strip()
+            # Existing monitoring installations may expose the more specific
+            # source_server/target_server pair while retaining source_region for
+            # Grafana alerting and grouping.  Treat that pair as the legacy
+            # reachability identity only when target_name is absent, so the
+            # documented source_region/target_name schema keeps precedence.
+            if not target_name:
+                source_region = sample.labels.get("source_server", "").strip() or source_region
+                target_name = sample.labels.get("target_server", "").strip()
             if not source_region or not target_name:
                 missing_labels += 1
                 continue
@@ -150,7 +158,10 @@ async def metrics_reachability(
                     result.datasource_id,
                     result.datasource_name,
                     "missing_labels",
-                    f"Ignored {missing_labels} samples without source_region and target_name",
+                    (
+                        f"Ignored {missing_labels} samples without a supported reachability "
+                        "label pair"
+                    ),
                 )
             )
     cells = [

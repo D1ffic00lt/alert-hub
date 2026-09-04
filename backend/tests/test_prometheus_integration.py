@@ -324,6 +324,61 @@ def test_reachability_merges_actual_labels_and_reports_partial_failures(
     assert alerts.json()["status"] == "partial"
     assert alerts.json()["samples"][0]["metric"]["alertname"] == "DatabaseDown"
     assert FIXED_PROMQL["firing_alerts"] in query_values
+
+
+def test_reachability_accepts_server_labels_without_changing_canonical_labels(
+    client: TestClient,
+    auth: dict[str, str],
+    app,
+) -> None:
+    def prometheus(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["query"] == FIXED_PROMQL["reachability"]
+        return httpx.Response(
+            200,
+            request=request,
+            json=_vector(
+                (
+                    {
+                        "source_region": "eu",
+                        "source_server": "nl-2",
+                        "target_region": "eu",
+                        "target_server": "de-2",
+                    },
+                    1,
+                    200,
+                ),
+                (
+                    {
+                        "source_region": "ru",
+                        "source_server": "ru-2",
+                        "target_name": "canonical-target",
+                        "target_server": "legacy-target",
+                    },
+                    0,
+                    201,
+                ),
+            ),
+        )
+
+    app.state.prometheus_http_transport = httpx.MockTransport(prometheus)
+    created = client.post(
+        "/api/v1/prometheus-datasources",
+        headers=auth,
+        json={"name": "Central Prometheus", "url": "https://1.1.1.1:9090"},
+    )
+    assert created.status_code == 201, created.text
+
+    response = client.get("/api/v1/metrics/reachability", headers=auth)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert [
+        (cell["source"], cell["target"], cell["probe_success"]) for cell in payload["cells"]
+    ] == [
+        ("nl-2", "de-2", 1.0),
+        ("ru", "canonical-target", 0.0),
+    ]
+    assert payload["errors"] == []
     assert client.get("/api/v1/metrics/queries/arbitrary", headers=auth).status_code == 422
 
 
