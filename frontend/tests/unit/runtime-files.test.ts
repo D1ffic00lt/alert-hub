@@ -25,9 +25,13 @@ describe("container UI runtime renderer", () => {
       const manifestPath = join(destination, "manifest.webmanifest");
       const script = readFileSync(scriptPath, "utf8");
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+        background_color: string;
+        description: string;
         name: string;
         short_name: string;
         icons: Array<{ purpose: string }>;
+        shortcuts: Array<{ description: string; name: string; short_name: string; url: string }>;
+        theme_color: string;
       };
 
       expect(script).not.toContain("<script>");
@@ -44,6 +48,25 @@ describe("container UI runtime renderer", () => {
       );
       expect(manifest.name).toBe(config.appName);
       expect(manifest.short_name).toBe(config.appName.slice(0, 24));
+      expect(manifest).toMatchObject({
+        background_color: "#0b0f0e",
+        description: "Распределённый мониторинг инцидентов и отказоустойчивая доставка оповещений.",
+        shortcuts: [
+          {
+            description: "Открыть список активных инцидентов",
+            name: "Активные инциденты",
+            short_name: "Инциденты",
+            url: "/incidents",
+          },
+          {
+            description: "Проверить синхронизацию узлов",
+            name: "Состояние кластера",
+            short_name: "Кластер",
+            url: "/cluster",
+          },
+        ],
+        theme_color: "#0b0f0e",
+      });
       expect(manifest.icons.map((icon) => icon.purpose)).toEqual(["any", "maskable"]);
       expect(statSync(scriptPath).mode & 0o777).toBe(0o444);
       expect(statSync(manifestPath).mode & 0o777).toBe(0o444);
