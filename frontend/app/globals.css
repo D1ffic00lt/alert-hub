@@ -9,10 +9,12 @@
   --text-primary: #f4f4f5;
   --text-secondary: #a1a1aa;
   --text-muted: #71717a;
+  --text-muted-readable: #8b8b95;
   --accent: #e4e4e7;
   --success: #22c55e;
   --warning: #f59e0b;
   --danger: #ef4444;
+  --danger-text: #f05252;
   --info: #3b82f6;
   --bg-deep: var(--bg);
   --surface-2: var(--surface-hover);
@@ -22,12 +24,12 @@
   --text: var(--text-primary);
   --text-soft: var(--text-primary);
   --muted: var(--text-secondary);
-  --muted-2: var(--text-muted);
+  --muted-2: var(--text-muted-readable);
   --mint: var(--accent);
   --mint-bright: var(--accent);
   --mint-dim: rgba(228, 228, 231, 0.1);
   --cyan: var(--info);
-  --red: var(--danger);
+  --red: var(--danger-text);
   --red-dim: rgba(239, 68, 68, 0.12);
   --amber: var(--warning);
   --amber-dim: rgba(245, 158, 11, 0.12);
@@ -58,10 +60,12 @@
   --text-primary: #0f172a;
   --text-secondary: #475569;
   --text-muted: #94a3b8;
+  --text-muted-readable: #58677b;
   --accent: #3b82f6;
   --success: #22c55e;
   --warning: #f59e0b;
   --danger: #ef4444;
+  --danger-text: #c81e1e;
   --info: #6366f1;
   --bg-deep: var(--bg);
   --surface-2: var(--surface-hover);
@@ -71,12 +75,12 @@
   --text: var(--text-primary);
   --text-soft: var(--text-primary);
   --muted: var(--text-secondary);
-  --muted-2: var(--text-muted);
+  --muted-2: var(--text-muted-readable);
   --mint: var(--accent);
   --mint-bright: var(--accent);
   --mint-dim: rgba(59, 130, 246, 0.1);
   --cyan: var(--info);
-  --red: var(--danger);
+  --red: var(--danger-text);
   --red-dim: rgba(239, 68, 68, 0.1);
   --amber: var(--warning);
   --amber-dim: rgba(245, 158, 11, 0.1);
@@ -649,7 +653,7 @@ textarea:focus-visible {
   box-shadow: none;
 }
 .status-dot--offline {
-  background: var(--red);
+  background: var(--danger);
   box-shadow: none;
 }
 .status-dot--paused {
@@ -1076,7 +1080,7 @@ textarea:focus-visible {
   border-radius: 3px;
 }
 .incident-compact__signal--critical {
-  background: var(--red);
+  background: var(--danger);
   box-shadow: none;
 }
 .incident-compact__signal--warning {
@@ -1166,7 +1170,7 @@ textarea:focus-visible {
 .incident-status > span {
   width: 5px;
   height: 5px;
-  background: var(--red);
+  background: var(--danger);
   border-radius: 50%;
 }
 .incident-status--acknowledged > span {
@@ -1427,7 +1431,7 @@ textarea:focus-visible {
   background: var(--amber);
 }
 .legend-dot--failed {
-  background: var(--red);
+  background: var(--danger);
 }
 .legend-dot--unknown {
   background: var(--muted-2);
@@ -1796,7 +1800,7 @@ textarea:focus-visible {
   border-radius: 3px;
 }
 .table-severity--critical {
-  background: var(--red);
+  background: var(--danger);
 }
 .table-severity--warning {
   background: var(--amber);
@@ -6479,6 +6483,26 @@ body,
 }
 
 @media (max-width: 720px) {
+  .channel-health-banner {
+    display: grid;
+    grid-template-columns: 68px repeat(2, minmax(0, 1fr));
+    gap: 8px 12px;
+  }
+
+  .delivery-ring {
+    grid-row: 1 / span 2;
+  }
+
+  .channel-health-banner > span:nth-child(2) {
+    grid-column: 2 / -1;
+    overflow-wrap: normal;
+  }
+
+  .channel-health-banner__metrics {
+    min-width: 0;
+    align-items: flex-start;
+  }
+
   .setting-row {
     align-items: stretch;
     flex-direction: column;

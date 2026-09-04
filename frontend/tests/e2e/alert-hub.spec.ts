@@ -1372,6 +1372,7 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
 
   await page.getByRole("button", { name: "Ещё" }).click();
   await page.getByRole("button", { name: "Каналы", exact: true }).click();
+  await expect(page.locator(".delivery-ring")).toBeVisible();
   const deliveryRingLayout = await page.evaluate(() => {
     const ring = document.querySelector<HTMLElement>(".delivery-ring")!.getBoundingClientRect();
     const label = document
