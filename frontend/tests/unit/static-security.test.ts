@@ -2,6 +2,16 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 describe("static SPA security contract", () => {
+  it("declares Russian document metadata while preserving the product brand", () => {
+    const html = readFileSync("index.html", "utf8");
+    expect(html).toContain('<html lang="ru">');
+    expect(html).toContain('<meta name="theme-color" content="#0b0f0e" />');
+    expect(html).toContain("<title>Alert Hub — консоль мониторинга</title>");
+    expect(html).toContain(
+      '<meta property="og:title" content="Alert Hub — консоль мониторинга" />',
+    );
+  });
+
   it("loads runtime configuration and application code only from external scripts", () => {
     const html = readFileSync("index.html", "utf8");
     const approvedScripts = [

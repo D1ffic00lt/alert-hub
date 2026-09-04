@@ -22,7 +22,7 @@ function setMeta(selector: string, value: string) {
 }
 
 const appName = getAppName();
-const pageTitle = `${appName} — Distributed operations console`;
+const pageTitle = `${appName} — консоль мониторинга`;
 document.title = pageTitle;
 setMeta('meta[name="application-name"]', appName);
 setMeta('meta[name="apple-mobile-web-app-title"]', appName);

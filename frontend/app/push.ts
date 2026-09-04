@@ -39,7 +39,12 @@ export function currentPushClientEnvironment(): PushClientEnvironment {
   );
 }
 
-export function pushDeviceName(platform: string, userAgent: string, standalone: boolean): string {
+export function pushDeviceName(
+  platform: string,
+  userAgent: string,
+  standalone: boolean,
+  language: "ru" | "en" = "ru",
+): string {
   const normalizedPlatform = Array.from(platform, (character) => {
     const point = character.codePointAt(0) ?? 0;
     return point <= 31 || point === 127 ? " " : character;
@@ -60,48 +65,65 @@ export function pushDeviceName(platform: string, userAgent: string, standalone: 
             ? "Windows"
             : /linux/.test(agent)
               ? "Linux"
-              : "Browser";
+              : language === "ru"
+                ? "Браузер"
+                : "Browser";
   const base = normalizedPlatform || fallback;
-  return `${base} · ${standalone ? "installed app" : "browser"}`.slice(0, 255);
+  return `${base} · ${
+    standalone
+      ? language === "ru"
+        ? "установленное приложение"
+        : "installed app"
+      : language === "ru"
+        ? "браузер"
+        : "browser"
+  }`.slice(0, 255);
 }
 
-export function currentPushDeviceName(): string {
+export function currentPushDeviceName(language: "ru" | "en" = "ru"): string {
   const environment = currentPushClientEnvironment();
   const platform =
     environment.ios && /^mac/i.test(navigator.platform) ? "iPad" : navigator.platform;
-  return pushDeviceName(platform, navigator.userAgent, environment.standalone);
+  return pushDeviceName(platform, navigator.userAgent, environment.standalone, language);
 }
 
 export function blockedPermissionHelp(environment: PushClientEnvironment): string {
   if (environment.ios) {
-    return "Notifications are blocked for this Home Screen app. Open iOS/iPadOS Settings → Notifications, select this installed app, allow notifications, then reopen it.";
+    return "Уведомления для этого приложения с экрана «Домой» заблокированы. Откройте «Настройки» iOS/iPadOS → «Уведомления», выберите установленное приложение, разрешите уведомления и откройте его снова.";
   }
   if (environment.browser === "safari") {
-    return "Notifications are blocked. Open Safari → Settings → Websites → Notifications, set this site to Allow, then reload.";
+    return "Уведомления заблокированы. Откройте Safari → «Настройки» → «Веб-сайты» → «Уведомления», разрешите их для этого сайта и перезагрузите страницу.";
   }
   if (environment.browser === "firefox") {
-    return "Notifications are blocked. Open the site permissions beside the address bar, reset Notifications, then reload and allow the prompt.";
+    return "Уведомления заблокированы. Откройте настройки сайта рядом с адресной строкой, сбросьте разрешение на уведомления, перезагрузите страницу и подтвердите запрос.";
   }
-  return "Notifications are blocked. Open this site's permissions beside the address bar, set Notifications to Allow, then reload.";
+  return "Уведомления заблокированы. Откройте настройки сайта рядом с адресной строкой, разрешите уведомления и перезагрузите страницу.";
 }
 
-export function decodeApplicationServerKey(value: string): Uint8Array<ArrayBuffer> {
+export function decodeApplicationServerKey(
+  value: string,
+  language: "ru" | "en" = "ru",
+): Uint8Array<ArrayBuffer> {
+  const invalidKeyMessage =
+    language === "ru"
+      ? "API вернул некорректный публичный ключ VAPID."
+      : "The API returned an invalid public VAPID key.";
   if (!/^[A-Za-z0-9_-]+$/.test(value) || value.includes("=")) {
-    throw new Error("The API returned an invalid VAPID public key.");
+    throw new Error(invalidKeyMessage);
   }
   const padding = "=".repeat((4 - (value.length % 4)) % 4);
   let decoded: string;
   try {
     decoded = atob((value + padding).replace(/-/g, "+").replace(/_/g, "/"));
   } catch {
-    throw new Error("The API returned an invalid VAPID public key.");
+    throw new Error(invalidKeyMessage);
   }
   const bytes = new Uint8Array(new ArrayBuffer(decoded.length));
   for (let index = 0; index < decoded.length; index += 1) {
     bytes[index] = decoded.charCodeAt(index);
   }
   if (bytes.length !== 65 || bytes[0] !== 0x04) {
-    throw new Error("The API returned an invalid VAPID public key.");
+    throw new Error(invalidKeyMessage);
   }
   return bytes;
 }

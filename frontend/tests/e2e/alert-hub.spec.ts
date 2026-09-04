@@ -430,11 +430,12 @@ async function installFakePushClient(
 
 async function signIn(page: Page) {
   await page.goto("/");
-  await page.getByRole("button", { name: "Sign in" }).first().click();
-  await page.getByLabel("Username").fill("second-admin");
-  await page.getByLabel("Password", { exact: true }).fill("second-password");
-  await page.getByRole("button", { name: "Sign in" }).last().click();
-  await expect(page.getByRole("heading", { name: "System overview" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Запуск кластера" })).toBeVisible();
+  await page.getByRole("button", { name: "Войти" }).first().click();
+  await page.getByLabel("Имя пользователя").fill("second-admin");
+  await page.getByLabel("Пароль", { exact: true }).fill("second-password");
+  await page.getByRole("button", { name: "Войти" }).last().click();
+  await expect(page.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
 }
 
 test("Web Push surfaces node errors, rotates stale keys, and binds the login device", async ({
@@ -457,15 +458,15 @@ test("Web Push surfaces node errors, rotates stale keys, and binds the login dev
   await installApi(page, state);
   await signIn(page);
 
-  await page.getByRole("button", { name: "Enable alerts" }).click();
-  const dialog = page.getByRole("dialog", { name: "Enable notifications" });
-  await dialog.getByRole("button", { name: "Verify subscription" }).click();
+  await page.getByRole("button", { name: "Включить оповещения" }).click();
+  const dialog = page.getByRole("dialog", { name: "Включить уведомления" });
+  await dialog.getByRole("button", { name: "Проверить подписку" }).click();
   await expect(dialog.getByRole("alert")).toContainText("Web Push sender key is unavailable");
   await expect(dialog.locator(".permission-message--success")).toHaveCount(0);
 
   state.pushPublicKeyStatus = 200;
-  await dialog.getByRole("button", { name: "Verify subscription" }).click();
-  await expect(dialog.getByRole("status")).toContainText("This device is subscribed");
+  await dialog.getByRole("button", { name: "Проверить подписку" }).click();
+  await expect(dialog.getByRole("status")).toContainText("Устройство подписано");
   expect(state.pushSubscriptionRequest).toMatchObject({
     endpoint: "https://push.example.test/subscription/current",
     keys: { auth: "AQIDBAUGBwgJCgsMDQ4PEA", p256dh: TEST_VAPID_PUBLIC_KEY },
@@ -502,11 +503,11 @@ test("Web Push explains blocked permission without retrying the browser prompt",
   await installApi(page, state);
   await signIn(page);
 
-  await page.getByRole("button", { name: "Enable alerts" }).click();
-  const dialog = page.getByRole("dialog", { name: "Enable notifications" });
-  await expect(dialog.getByRole("alert")).toContainText("site's permissions");
-  await dialog.getByRole("button", { name: "Show recovery steps" }).click();
-  await expect(dialog.getByRole("alert")).toContainText("site's permissions");
+  await page.getByRole("button", { name: "Включить оповещения" }).click();
+  const dialog = page.getByRole("dialog", { name: "Включить уведомления" });
+  await expect(dialog.getByRole("alert")).toContainText("настройки сайта");
+  await dialog.getByRole("button", { name: "Как вернуть разрешение" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("настройки сайта");
   expect(
     await page.evaluate(
       () =>
@@ -534,9 +535,9 @@ test("Web Push cancels a delayed browser subscription when the authenticated ses
   await installApi(page, state);
   await signIn(page);
 
-  await page.getByRole("button", { name: "Enable alerts" }).click();
-  const dialog = page.getByRole("dialog", { name: "Enable notifications" });
-  await dialog.getByRole("button", { name: "Verify subscription" }).click();
+  await page.getByRole("button", { name: "Включить оповещения" }).click();
+  const dialog = page.getByRole("dialog", { name: "Включить уведомления" });
+  await dialog.getByRole("button", { name: "Проверить подписку" }).click();
   await expect
     .poll(() =>
       page.evaluate(
@@ -549,17 +550,17 @@ test("Web Push cancels a delayed browser subscription when the authenticated ses
       ),
     )
     .toBe(1);
-  await expect(dialog.getByRole("button", { name: "Close" })).toBeDisabled();
-  await expect(dialog.getByRole("button", { name: "Maybe later" })).toBeDisabled();
+  await expect(dialog.getByRole("button", { name: "Закрыть" })).toBeDisabled();
+  await expect(dialog.getByRole("button", { name: "Позже" })).toBeDisabled();
   await page.keyboard.press("Escape");
   await expect(dialog).toBeVisible();
 
   await page.evaluate(() => window.dispatchEvent(new Event("alert-hub:session-expired")));
-  await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
-  await page.getByLabel("Username").fill("second-admin");
-  await page.getByLabel("Password", { exact: true }).fill("second-password");
-  await page.getByRole("button", { name: "Sign in" }).last().click();
-  await expect(page.getByRole("heading", { name: "System overview" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Вход в систему" })).toBeVisible();
+  await page.getByLabel("Имя пользователя").fill("second-admin");
+  await page.getByLabel("Пароль", { exact: true }).fill("second-password");
+  await page.getByRole("button", { name: "Войти" }).last().click();
+  await expect(page.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
 
   await page.evaluate(() =>
     (
@@ -601,9 +602,9 @@ test("Web Push cancels a delayed subscription when silent refresh replaces the s
   await installApi(page, state);
   await signIn(page);
 
-  await page.getByRole("button", { name: "Enable alerts" }).click();
-  const dialog = page.getByRole("dialog", { name: "Enable notifications" });
-  await dialog.getByRole("button", { name: "Verify subscription" }).click();
+  await page.getByRole("button", { name: "Включить оповещения" }).click();
+  const dialog = page.getByRole("dialog", { name: "Включить уведомления" });
+  await dialog.getByRole("button", { name: "Проверить подписку" }).click();
   await expect
     .poll(() =>
       page.evaluate(
@@ -621,7 +622,7 @@ test("Web Push cancels a delayed subscription when silent refresh replaces the s
   state.authoritativeUnauthorized = true;
   state.refreshGate = Promise.resolve();
   await page
-    .getByRole("button", { name: "Refresh cluster data" })
+    .getByRole("button", { name: "Обновить данные кластера" })
     .evaluate((button: HTMLButtonElement) => button.click());
   await expect
     .poll(() => state.refreshRequests)
@@ -647,7 +648,7 @@ test("Web Push cancels a delayed subscription when silent refresh replaces the s
       ),
     )
     .toBe(1);
-  await expect(dialog.getByRole("alert")).toContainText("authenticated session changed");
+  await expect(dialog.getByRole("alert")).toContainText("изменилась активная сессия");
   expect(state.pushSubscriptionRequest).toBeNull();
 });
 
@@ -673,81 +674,97 @@ test("bootstrap, deep-link navigation, live source creation, failover trust, and
   await installApi(page, state);
 
   await page.goto("/sources");
-  await expect(page).toHaveTitle("E2E Operations — Distributed operations console");
-  await expect(page.getByRole("heading", { name: "Bootstrap the cluster" })).toBeVisible();
-  await page.getByLabel("Bootstrap token").fill("one-time-bootstrap-token");
-  await page.getByLabel("Username").fill("admin");
-  await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
-  await page.getByLabel("Confirm password").fill("correct-horse-battery");
-  await page.getByRole("button", { name: "Create administrator" }).click();
+  const manifest = await page.evaluate(async () => {
+    const response = await fetch("/manifest.webmanifest");
+    return response.json() as Promise<Record<string, unknown>>;
+  });
+  expect(manifest).toMatchObject({
+    background_color: "#0b0f0e",
+    description: "Распределённый мониторинг инцидентов и отказоустойчивая доставка оповещений.",
+    name: "E2E Operations",
+    shortcuts: [
+      { name: "Активные инциденты", short_name: "Инциденты", url: "/incidents" },
+      { name: "Состояние кластера", short_name: "Кластер", url: "/cluster" },
+    ],
+    theme_color: "#0b0f0e",
+  });
+  await expect(page).toHaveTitle("E2E Operations — консоль мониторинга");
+  await expect(page.getByRole("heading", { name: "Запуск кластера" })).toBeVisible();
+  await page.getByLabel("Токен первичной настройки").fill("one-time-bootstrap-token");
+  await page.getByLabel("Имя пользователя").fill("admin");
+  await page.getByLabel("Пароль", { exact: true }).fill("correct-horse-battery");
+  await page.getByLabel("Повторите пароль").fill("correct-horse-battery");
+  await page.getByRole("button", { name: "Создать администратора" }).click();
 
   await expect(page).toHaveURL(/\/sources$/);
-  await expect(page.getByRole("heading", { name: "Sources", exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Add source" }).click();
-  const sourceDialog = page.getByRole("dialog", { name: "Add source" });
+  await expect(page.getByRole("heading", { name: "Источники", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Добавить источник" }).click();
+  const sourceDialog = page.getByRole("dialog", { name: "Добавить источник" });
   await expect(sourceDialog).toBeVisible();
-  await sourceDialog.getByRole("button", { name: /Continue/ }).click();
-  await sourceDialog.getByLabel("Source name").fill("Edge Alertmanager");
-  await sourceDialog.getByLabel("Nearest region").fill("NL");
-  await sourceDialog.getByLabel(/Allowed source IP/).fill("198.51.100.0/24");
-  await sourceDialog.getByRole("button", { name: "Create source" }).click();
-  await expect(sourceDialog.getByRole("heading", { name: "Source created" })).toBeVisible();
+  await sourceDialog.getByRole("button", { name: /Продолжить/ }).click();
+  await sourceDialog.getByLabel("Название источника").fill("Edge Alertmanager");
+  await sourceDialog.getByLabel("Ближайший регион").fill("NL");
+  await sourceDialog.getByLabel(/Разрешённый IP/).fill("198.51.100.0/24");
+  await sourceDialog.getByRole("button", { name: "Создать источник" }).click();
+  await expect(sourceDialog.getByRole("heading", { name: "Источник создан" })).toBeVisible();
   await expect(sourceDialog.getByText("shown-once-source-token")).toBeVisible();
   const browserOrigin = await page.evaluate(() => window.location.origin);
   const absoluteWebhook = `${browserOrigin}/ingest/v1/alertmanager/source-created`;
   await expect(sourceDialog.getByText(absoluteWebhook, { exact: true })).toBeVisible();
   await expect(sourceDialog.getByText(/https:\/\/YOUR_HOST/)).toHaveCount(0);
-  await expect(sourceDialog.getByText(/Ready Alertmanager receiver fragment/)).toBeVisible();
+  await expect(sourceDialog.getByText(/Готовый фрагмент receiver для Alertmanager/)).toBeVisible();
   expect(state.sourceRequest).toMatchObject({
     name: "Edge Alertmanager",
     kind: "alertmanager",
     region: "NL",
     allowed_cidrs: ["198.51.100.0/24"],
   });
-  await sourceDialog.getByRole("button", { name: "I saved the token" }).click();
+  await sourceDialog.getByRole("button", { name: "Я сохранил токен" }).click();
   await expect(page.getByText(absoluteWebhook, { exact: true })).toBeVisible();
   page.once("dialog", (dialog) => void dialog.accept());
-  await page.getByRole("button", { name: "Rotate token" }).click();
-  const rotatedDialog = page.getByRole("dialog", { name: "Rotated source token" });
+  await page.getByRole("button", { name: "Обновить токен" }).click();
+  const rotatedDialog = page.getByRole("dialog", { name: "Новый токен источника" });
   await expect(rotatedDialog.getByText("rotated-source-token")).toBeVisible();
   await expect(rotatedDialog.getByText(absoluteWebhook, { exact: true })).toBeVisible();
   await expect(rotatedDialog.getByText(/https:\/\/YOUR_HOST/)).toHaveCount(0);
-  await rotatedDialog.getByRole("button", { name: "I saved the new token" }).click();
+  await rotatedDialog.getByRole("button", { name: "Я сохранил новый токен" }).click();
 
-  await page.getByRole("button", { name: "Overview" }).click();
+  await page.getByRole("button", { name: "Обзор" }).click();
+  await expect(page.getByRole("heading", { name: "Состояние по данным Prometheus" })).toBeVisible();
   await expect(
-    page.getByRole("heading", { name: "Prometheus operational evidence" }),
+    page.getByRole("heading", { name: "Доступность по регионам" }).first(),
   ).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Regional reachability" }).first()).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Firing alerts" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Активные тревоги" })).toBeVisible();
   await expect(
     page.getByRole("heading", { name: "Prometheus / Alertmanager / Blackbox" }),
   ).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Alert Hub sync / app health" })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Open Grafana" })).toHaveAttribute(
+  await expect(
+    page.getByRole("heading", { name: "Синхронизация и состояние Alert Hub" }),
+  ).toBeVisible();
+  await expect(page.getByRole("link", { name: "Открыть Grafana" })).toHaveAttribute(
     "href",
     "https://grafana.example.test/d/alert-hub",
   );
-  await page.getByRole("button", { name: "Sources" }).click();
+  await page.getByRole("button", { name: "Источники" }).click();
 
   state.primaryUnavailable = true;
-  await page.getByRole("button", { name: "Refresh cluster data" }).click();
-  await expect(page.locator(".connection-banner")).toContainText("API nodes are unavailable");
+  await page.getByRole("button", { name: "Обновить данные кластера" }).click();
+  await expect(page.locator(".connection-banner")).toContainText("Узлы API недоступны");
   expect(evilRequests).toEqual([]);
   state.primaryUnavailable = false;
 
-  await page.getByRole("button", { name: "Log out of Alert Hub" }).click();
-  await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
-  await page.getByLabel("Username").fill("second-admin");
-  await page.getByLabel("Password", { exact: true }).fill("second-password");
-  await page.getByRole("button", { name: "Sign in" }).last().click();
+  await page.getByRole("button", { name: "Выйти из Alert Hub" }).click();
+  await expect(page.getByRole("heading", { name: "Вход в систему" })).toBeVisible();
+  await page.getByLabel("Имя пользователя").fill("second-admin");
+  await page.getByLabel("Пароль", { exact: true }).fill("second-password");
+  await page.getByRole("button", { name: "Войти" }).last().click();
 
   await expect(page.getByText("Second-session source")).toBeVisible();
   await expect(page.getByText("Edge Alertmanager")).toHaveCount(0);
 
   state.authoritativeUnauthorized = true;
-  await page.getByRole("button", { name: "Refresh cluster data" }).click();
-  await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+  await page.getByRole("button", { name: "Обновить данные кластера" }).click();
+  await expect(page.getByRole("heading", { name: "Вход в систему" })).toBeVisible();
   await expect(page.getByText("Second-session source")).toHaveCount(0);
   await expect
     .poll(() => page.evaluate(() => localStorage.getItem("alert-hub-session-partition-v1")))
@@ -767,10 +784,10 @@ test("logout waits for an in-flight refresh and rejects its stale token", async 
   };
   await installApi(page, state);
   await page.goto("/sources");
-  await page.getByRole("button", { name: "Sign in" }).click();
-  await page.getByLabel("Username").fill("second-admin");
-  await page.getByLabel("Password", { exact: true }).fill("second-password");
-  await page.getByRole("button", { name: "Sign in" }).last().click();
+  await page.getByRole("button", { name: "Войти" }).click();
+  await page.getByLabel("Имя пользователя").fill("second-admin");
+  await page.getByLabel("Пароль", { exact: true }).fill("second-password");
+  await page.getByRole("button", { name: "Войти" }).last().click();
   await expect(page.getByText("Second-session source")).toBeVisible();
 
   let releaseRefresh: () => void = () => undefined;
@@ -781,12 +798,12 @@ test("logout waits for an in-flight refresh and rejects its stale token", async 
     state.refreshStarted = resolve;
   });
   state.authoritativeUnauthorized = true;
-  await page.getByRole("button", { name: "Refresh cluster data" }).click();
+  await page.getByRole("button", { name: "Обновить данные кластера" }).click();
   await refreshStarted;
-  await page.getByRole("button", { name: "Log out of Alert Hub" }).click();
+  await page.getByRole("button", { name: "Выйти из Alert Hub" }).click();
   releaseRefresh();
 
-  await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Вход в систему" })).toBeVisible();
   expect(state.logoutRequests).toBe(1);
   expect(state.lateTokenRequests).toEqual([]);
   await expect
@@ -800,7 +817,7 @@ test("logout waits for an in-flight refresh and rejects its stale token", async 
 
   const refreshCount = state.refreshRequests;
   await page.reload();
-  await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Вход в систему" })).toBeVisible();
   expect(state.refreshRequests).toBe(refreshCount);
   expect(state.lateTokenRequests).toEqual([]);
 });
@@ -859,28 +876,28 @@ test("renders live cluster telemetry and groups repeated historical audit failur
   };
   await installApi(page, state);
   await page.goto("/audit");
-  await page.getByLabel("Bootstrap token").fill("one-time-bootstrap-token");
-  await page.getByLabel("Username").fill("admin");
-  await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
-  await page.getByLabel("Confirm password").fill("correct-horse-battery");
+  await page.getByLabel("Токен первичной настройки").fill("one-time-bootstrap-token");
+  await page.getByLabel("Имя пользователя").fill("admin");
+  await page.getByLabel("Пароль", { exact: true }).fill("correct-horse-battery");
+  await page.getByLabel("Повторите пароль").fill("correct-horse-battery");
   // Install the fake clock after the anonymous bootstrap probe has settled, but
   // before authenticated data hooks create their polling intervals.
   await page.clock.install({ time: new Date(now) });
-  await page.getByRole("button", { name: "Create administrator" }).click();
+  await page.getByRole("button", { name: "Создать администратора" }).click();
 
-  await expect(page.getByText(/Sync 0\.0s/)).toBeVisible();
-  await expect(page.getByText("3 healthy · 0 impaired · 0 unknown")).toBeVisible();
-  await expect(page.getByText("3/3 nodes healthy.")).toBeVisible();
-  await expect(page.getByText("Rejected cluster-auth attempt")).toHaveCount(1);
-  await expect(page.getByLabel("3 identical events in this burst")).toBeVisible();
-  await expect(page.getByText("100/103 loaded")).toBeVisible();
+  await expect(page.getByText(/Синхронизация 0\.0 сек\./)).toBeVisible();
+  await expect(page.getByText("3 работают · 0 с проблемами · 0 без данных")).toBeVisible();
+  await expect(page.getByText("3/3 узлов работают.")).toBeVisible();
+  await expect(page.getByText("Отклонённая попытка входа в кластер")).toHaveCount(1);
+  await expect(page.getByLabel("3 одинаковых событий в этой группе")).toBeVisible();
+  await expect(page.getByText("Загружено 100/103")).toBeVisible();
 
-  await page.getByRole("button", { name: "Load older events (100/103)" }).click();
-  await expect(page.getByText("103/103 loaded")).toBeVisible();
-  await expect(page.getByRole("button", { name: /Load older events/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "Загрузить старые события (100/103)" }).click();
+  await expect(page.getByText("Загружено 103/103")).toBeVisible();
+  await expect(page.getByRole("button", { name: /Загрузить старые события/ })).toHaveCount(0);
 
   const downloadPromise = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Export loaded JSONL" }).click();
+  await page.getByRole("button", { name: "Скачать загруженный JSONL" }).click();
   const download = await downloadPromise;
   const downloadPath = await download.path();
   expect(downloadPath).not.toBeNull();
@@ -901,18 +918,18 @@ test("renders live cluster telemetry and groups repeated historical audit failur
   const staleClusterStarted = new Promise<void>((resolve) => {
     state.clusterRequestStarted = resolve;
   });
-  await page.getByRole("button", { name: "Refresh cluster data" }).click();
+  await page.getByRole("button", { name: "Обновить данные кластера" }).click();
   await staleClusterStarted;
 
   state.clusterUnavailable = true;
   await page.clock.fastForward(30000);
-  await expect(page.getByText(/Sync telemetry unavailable/)).toBeVisible();
-  await expect(page.getByText("0/3 nodes healthy.")).toBeVisible();
+  await expect(page.getByText(/Синхронизация нет телеметрии/)).toBeVisible();
+  await expect(page.getByText("0/3 узлов работают.")).toBeVisible();
 
   state.clusterUnavailable = false;
   releaseStaleCluster();
   await expect(page.locator(".refresh-button")).not.toHaveClass(/is-spinning/);
-  await expect(page.getByText(/Sync telemetry unavailable/)).toBeVisible();
+  await expect(page.getByText(/Синхронизация нет телеметрии/)).toBeVisible();
   state.clusterRequestStarted = null;
   state.clusterStatus = {
     ...(state.clusterStatus as Record<string, unknown>),
@@ -927,11 +944,11 @@ test("renders live cluster telemetry and groups repeated historical audit failur
     })),
   };
   await page.clock.fastForward(30000);
-  await expect(page.getByText(/Sync degraded/)).toBeVisible();
-  await expect(page.getByText("2 healthy · 1 impaired · 0 unknown")).toBeVisible();
+  await expect(page.getByText(/Синхронизация Есть проблемы/)).toBeVisible();
+  await expect(page.getByText("2 работают · 1 с проблемами · 0 без данных")).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.getByLabel("Audit date range")).toBeVisible();
+  await expect(page.getByLabel("Период журнала")).toBeVisible();
 });
 
 test("rebases pure audit prepends and safely resets for an interior insertion", async ({
@@ -962,12 +979,12 @@ test("rebases pure audit prepends and safely resets for an interior insertion", 
   };
   await installApi(page, state);
   await page.goto("/audit");
-  await page.getByLabel("Bootstrap token").fill("one-time-bootstrap-token");
-  await page.getByLabel("Username").fill("admin");
-  await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
-  await page.getByLabel("Confirm password").fill("correct-horse-battery");
-  await page.getByRole("button", { name: "Create administrator" }).click();
-  await expect(page.getByText("100/205 loaded")).toBeVisible();
+  await page.getByLabel("Токен первичной настройки").fill("one-time-bootstrap-token");
+  await page.getByLabel("Имя пользователя").fill("admin");
+  await page.getByLabel("Пароль", { exact: true }).fill("correct-horse-battery");
+  await page.getByLabel("Повторите пароль").fill("correct-horse-battery");
+  await page.getByRole("button", { name: "Создать администратора" }).click();
+  await expect(page.getByText("Загружено 100/205")).toBeVisible();
 
   const newestItems = Array.from({ length: 3 }, (_, index) => ({
     id: `new-audit-${index}`,
@@ -982,15 +999,15 @@ test("rebases pure audit prepends and safely resets for an interior insertion", 
   }));
   state.auditItems = [...newestItems, ...originalItems];
 
-  await page.getByRole("button", { name: "Load older events (100/205)" }).click();
-  await expect(page.getByText("200/208 loaded")).toBeVisible();
+  await page.getByRole("button", { name: "Загрузить старые события (100/205)" }).click();
+  await expect(page.getByText("Загружено 200/208")).toBeVisible();
   await expect(page.getByText("New audit event")).toHaveCount(3);
-  await page.getByRole("button", { name: "Load older events (200/208)" }).click();
-  await expect(page.getByText("208/208 loaded")).toBeVisible();
-  await expect(page.getByRole("button", { name: /Load older events/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "Загрузить старые события (200/208)" }).click();
+  await expect(page.getByText("Загружено 208/208")).toBeVisible();
+  await expect(page.getByRole("button", { name: /Загрузить старые события/ })).toHaveCount(0);
 
   const downloadPromise = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Export loaded JSONL" }).click();
+  await page.getByRole("button", { name: "Скачать загруженный JSONL" }).click();
   const download = await downloadPromise;
   const downloadPath = await download.path();
   expect(downloadPath).not.toBeNull();
@@ -1027,16 +1044,16 @@ test("rebases pure audit prepends and safely resets for an interior insertion", 
   reorderedItems.splice(50, 0, interiorItem);
   state.auditItems = reorderedItems;
 
-  await page.getByRole("button", { name: "Refresh cluster data" }).click();
-  await expect(page.getByText("100/209 loaded")).toBeVisible();
+  await page.getByRole("button", { name: "Обновить данные кластера" }).click();
+  await expect(page.getByText("Загружено 100/209")).toBeVisible();
   await expect(page.getByText("Interior audit event")).toBeVisible();
-  await page.getByRole("button", { name: "Load older events (100/209)" }).click();
-  await expect(page.getByText("200/209 loaded")).toBeVisible();
-  await page.getByRole("button", { name: "Load older events (200/209)" }).click();
-  await expect(page.getByText("209/209 loaded")).toBeVisible();
+  await page.getByRole("button", { name: "Загрузить старые события (100/209)" }).click();
+  await expect(page.getByText("Загружено 200/209")).toBeVisible();
+  await page.getByRole("button", { name: "Загрузить старые события (200/209)" }).click();
+  await expect(page.getByText("Загружено 209/209")).toBeVisible();
 
   const interiorDownloadPromise = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Export loaded JSONL" }).click();
+  await page.getByRole("button", { name: "Скачать загруженный JSONL" }).click();
   const interiorDownload = await interiorDownloadPromise;
   const interiorDownloadPath = await interiorDownload.path();
   expect(interiorDownloadPath).not.toBeNull();
@@ -1075,12 +1092,12 @@ test("discards a delayed audit page after the authenticated session changes", as
   };
   await installApi(page, state);
   await page.goto("/audit");
-  await page.getByLabel("Bootstrap token").fill("one-time-bootstrap-token");
-  await page.getByLabel("Username").fill("admin");
-  await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
-  await page.getByLabel("Confirm password").fill("correct-horse-battery");
-  await page.getByRole("button", { name: "Create administrator" }).click();
-  await expect(page.getByText("100/101 loaded")).toBeVisible();
+  await page.getByLabel("Токен первичной настройки").fill("one-time-bootstrap-token");
+  await page.getByLabel("Имя пользователя").fill("admin");
+  await page.getByLabel("Пароль", { exact: true }).fill("correct-horse-battery");
+  await page.getByLabel("Повторите пароль").fill("correct-horse-battery");
+  await page.getByRole("button", { name: "Создать администратора" }).click();
+  await expect(page.getByText("Загружено 100/101")).toBeVisible();
 
   let releaseOldPage: () => void = () => undefined;
   state.auditPageGate = new Promise<void>((resolve) => {
@@ -1089,11 +1106,11 @@ test("discards a delayed audit page after the authenticated session changes", as
   const oldPageStarted = new Promise<void>((resolve) => {
     state.auditPageStarted = resolve;
   });
-  await page.getByRole("button", { name: "Load older events (100/101)" }).click();
+  await page.getByRole("button", { name: "Загрузить старые события (100/101)" }).click();
   await oldPageStarted;
 
-  await page.getByRole("button", { name: "Log out of Alert Hub" }).click();
-  await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+  await page.getByRole("button", { name: "Выйти из Alert Hub" }).click();
+  await expect(page.getByRole("heading", { name: "Вход в систему" })).toBeVisible();
   state.auditItems = [
     {
       id: "new-session-audit",
@@ -1107,19 +1124,19 @@ test("discards a delayed audit page after the authenticated session changes", as
       tone: "success",
     },
   ];
-  await page.getByLabel("Username").fill("second-admin");
-  await page.getByLabel("Password", { exact: true }).fill("second-password");
-  await page.getByRole("button", { name: "Sign in" }).last().click();
+  await page.getByLabel("Имя пользователя").fill("second-admin");
+  await page.getByLabel("Пароль", { exact: true }).fill("second-password");
+  await page.getByRole("button", { name: "Войти" }).last().click();
   await expect(page.getByText("New session event")).toBeVisible();
-  await expect(page.getByText("1/1 loaded")).toBeVisible();
+  await expect(page.getByText("Загружено 1/1")).toBeVisible();
 
   releaseOldPage();
   state.auditPageGate = null;
   await expect(page.getByText("old-session-private-marker")).toHaveCount(0);
-  await expect(page.getByText("1/1 loaded")).toBeVisible();
+  await expect(page.getByText("Загружено 1/1")).toBeVisible();
 
   const downloadPromise = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Export loaded JSONL" }).click();
+  await page.getByRole("button", { name: "Скачать загруженный JSONL" }).click();
   const download = await downloadPromise;
   const downloadPath = await download.path();
   expect(downloadPath).not.toBeNull();
@@ -1143,10 +1160,10 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
   );
 
   await page.goto("/");
-  await page.getByRole("button", { name: /Open demo snapshot/ }).click();
+  await page.getByRole("button", { name: /Открыть демо/ }).click();
   await expect(page.getByRole("main")).toBeVisible();
-  await expect(page.getByLabel("Grafana not configured")).toBeVisible();
-  await expect(page.getByRole("link", { name: "Open Grafana" })).toHaveCount(0);
+  await expect(page.getByLabel("Grafana не настроена")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Открыть Grafana" })).toHaveCount(0);
   await expect(page.locator(".mobile-nav")).toBeVisible();
   const overflow = await page.evaluate(() => ({
     documentWidth: document.documentElement.scrollWidth,
@@ -1193,7 +1210,7 @@ test.describe("service-worker offline lifecycle", () => {
       fulfill(route, { bootstrap_required: false }),
     );
     await page.goto("/");
-    await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Вход в систему" })).toBeVisible();
     await page.evaluate(async () => {
       await navigator.serviceWorker.ready;
       if (!navigator.serviceWorker.controller) {
@@ -1296,11 +1313,13 @@ test.describe("service-worker offline lifecycle", () => {
     await context.setOffline(true);
     const offlinePage = await context.newPage();
     await offlinePage.goto("/sources");
-    await expect(offlinePage.getByRole("heading", { name: "Sources", exact: true })).toBeVisible();
+    await expect(
+      offlinePage.getByRole("heading", { name: "Источники", exact: true }),
+    ).toBeVisible();
     await expect(offlinePage.getByText("Offline cached source")).toBeVisible();
-    await expect(offlinePage.locator(".connection-banner")).toContainText("Offline mode");
-    await expect(offlinePage.getByRole("button", { name: "Add source" })).toBeDisabled();
-    await expect(offlinePage.getByRole("button", { name: "Rotate token" })).toBeDisabled();
+    await expect(offlinePage.locator(".connection-banner")).toContainText("Нет подключения");
+    await expect(offlinePage.getByRole("button", { name: "Добавить источник" })).toBeDisabled();
+    await expect(offlinePage.getByRole("button", { name: "Обновить токен" })).toBeDisabled();
     await expect
       .poll(() => offlinePage.evaluate(() => Boolean(navigator.serviceWorker.controller)))
       .toBe(true);
@@ -1308,13 +1327,13 @@ test.describe("service-worker offline lifecycle", () => {
     recoverSession = true;
     refreshNetworkFailure = false;
     await context.setOffline(false);
-    await offlinePage.getByRole("button", { name: "Refresh cluster data" }).click();
-    await expect(offlinePage.getByLabel("Signed-in account")).toContainText("recovered-admin");
-    await expect(offlinePage.getByRole("button", { name: "Add source" })).toBeEnabled();
+    await offlinePage.getByRole("button", { name: "Обновить данные кластера" }).click();
+    await expect(offlinePage.getByLabel("Текущая учётная запись")).toContainText("recovered-admin");
+    await expect(offlinePage.getByRole("button", { name: "Добавить источник" })).toBeEnabled();
     await context.setOffline(true);
 
-    await offlinePage.getByRole("button", { name: "Log out of Alert Hub" }).click();
-    await expect(offlinePage.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+    await offlinePage.getByRole("button", { name: "Выйти из Alert Hub" }).click();
+    await expect(offlinePage.getByRole("heading", { name: "Вход в систему" })).toBeVisible();
     await expect
       .poll(() =>
         offlinePage.evaluate(() => ({
@@ -1324,7 +1343,7 @@ test.describe("service-worker offline lifecycle", () => {
       )
       .toMatchObject({ hint: null, tombstone: expect.any(String) });
     await offlinePage.reload();
-    await expect(offlinePage.getByRole("heading", { name: "Welcome back" })).toBeVisible();
+    await expect(offlinePage.getByRole("heading", { name: "Вход в систему" })).toBeVisible();
     await context.setOffline(false);
   });
 });

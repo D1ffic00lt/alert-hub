@@ -26,16 +26,16 @@ describe("Web Push client helpers", () => {
 
   it("creates stable, bounded device labels without control characters", () => {
     const name = pushDeviceName(" MacIntel\n", "Mozilla/5.0 Safari/605.1.15", true);
-    expect(name).toBe("MacIntel · installed app");
+    expect(name).toBe("MacIntel · установленное приложение");
     expect(name.length).toBeLessThanOrEqual(255);
   });
 
   it("returns actionable permission recovery per browser", () => {
     expect(blockedPermissionHelp({ browser: "safari", ios: false, standalone: false })).toContain(
-      "Safari → Settings",
+      "Safari → «Настройки»",
     );
     expect(blockedPermissionHelp({ browser: "chromium", ios: false, standalone: false })).toContain(
-      "site's permissions",
+      "настройки сайта",
     );
   });
 
@@ -46,7 +46,9 @@ describe("Web Push client helpers", () => {
     const changed = expected.slice();
     changed[64] ^= 1;
     expect(applicationServerKeyMatches(changed.buffer, expected)).toBe(false);
-    expect(() => decodeApplicationServerKey(`${VAPID_PUBLIC_KEY}=`)).toThrow(/invalid VAPID/);
+    expect(() => decodeApplicationServerKey(`${VAPID_PUBLIC_KEY}=`)).toThrow(
+      /некорректный публичный ключ VAPID/,
+    );
   });
 
   it("bounds a stalled service worker operation", async () => {

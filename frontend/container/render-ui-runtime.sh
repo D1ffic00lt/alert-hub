@@ -136,7 +136,7 @@ printf '%s%s%s\n' \
 
 printf '%s%s%s%s%s\n' \
   '{"id":"/","name":' "${app_name_json}" ',"short_name":' "${short_name_json}" \
-  ',"description":"Distributed incident operations and resilient alert delivery.","start_url":"/","scope":"/","display":"standalone","display_override":["window-controls-overlay","standalone","minimal-ui"],"orientation":"any","background_color":"#07100e","theme_color":"#07100e","categories":["productivity","utilities"],"icons":[{"src":"/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},{"src":"/icon-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}],"shortcuts":[{"name":"Active incidents","short_name":"Incidents","description":"Open the active incident ledger","url":"/incidents"},{"name":"Cluster health","short_name":"Cluster","description":"Inspect peer synchronization","url":"/cluster"}]}' \
+  ',"description":"Распределённый мониторинг инцидентов и отказоустойчивая доставка оповещений.","start_url":"/","scope":"/","display":"standalone","display_override":["window-controls-overlay","standalone","minimal-ui"],"orientation":"any","background_color":"#0b0f0e","theme_color":"#0b0f0e","categories":["productivity","utilities"],"icons":[{"src":"/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},{"src":"/icon-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}],"shortcuts":[{"name":"Активные инциденты","short_name":"Инциденты","description":"Открыть список активных инцидентов","url":"/incidents"},{"name":"Состояние кластера","short_name":"Кластер","description":"Проверить синхронизацию узлов","url":"/cluster"}]}' \
   >"${manifest_tmp}"
 
 chmod 0444 "${runtime_tmp}" "${manifest_tmp}"

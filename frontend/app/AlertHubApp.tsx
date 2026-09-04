@@ -23,6 +23,28 @@ import {
 
 const API_BASE = "/api/v1";
 const AppNameContext = createContext("Alert Hub");
+type UiLanguage = "ru" | "en";
+const LANGUAGE_STORAGE_KEY = "alert-hub-ui-language";
+const LanguageContext = createContext<{
+  language: UiLanguage;
+  setLanguage: (language: UiLanguage) => void;
+}>({ language: "ru", setLanguage: () => undefined });
+
+function currentUiLanguage(): UiLanguage {
+  if (typeof window === "undefined") return "ru";
+  try {
+    const stored = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+    if (stored === "ru" || stored === "en") return stored;
+  } catch {
+    // Storage can be blocked in hardened browser contexts; the document language remains usable.
+  }
+  return document.documentElement.lang === "en" ? "en" : "ru";
+}
+
+function tr(russian: string, english: string) {
+  return currentUiLanguage() === "ru" ? russian : english;
+}
+
 let memoryAccessToken: string | null = null;
 let memorySessionId: string | null = null;
 let memoryAccessExpiresAt = 0;
@@ -42,7 +64,12 @@ const SESSION_HINT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 class PushSetupCancelledError extends Error {
   constructor() {
-    super("Push setup was cancelled because the active session changed.");
+    super(
+      tr(
+        "Настройка Push отменена: активная сессия изменилась.",
+        "Push setup was cancelled because the active session changed.",
+      ),
+    );
     this.name = "PushSetupCancelledError";
   }
 }
@@ -287,601 +314,740 @@ const EMPTY_DATA: HubData = {
   },
 };
 
-const timelineA: IncidentEvent[] = [
-  {
-    id: "evt-a4",
-    type: "delivery_succeeded",
-    label: "Push delivered",
-    detail: "Primary delivery owner eu-nl-01 completed on attempt 1.",
-    at: "2026-09-01T12:44:11Z",
-    node: "eu-nl-01",
-  },
-  {
-    id: "evt-a3",
-    type: "replicated",
-    label: "Replicated to 3 nodes",
-    detail: "Cluster event converged; vector cursors match for this incident.",
-    at: "2026-09-01T12:44:08Z",
-    node: "ru-msk-01",
-  },
-  {
-    id: "evt-a2",
-    type: "firing",
-    label: "Threshold still exceeded",
-    detail: "p95 latency 2.84 s for 5 consecutive minutes.",
-    at: "2026-09-01T12:44:02Z",
-    node: "eu-nl-01",
-  },
-  {
-    id: "evt-a1",
-    type: "firing",
-    label: "Incident opened",
-    detail: "Alertmanager normalized a firing event from prometheus-nl.",
-    at: "2026-09-01T12:39:02Z",
-    node: "eu-nl-01",
-  },
-];
-
-const DEMO_DATA: HubData = {
-  incidents: [
+function createTimelineA(): IncidentEvent[] {
+  return [
     {
-      id: "inc-01J7ZQ4K8W8AWMRV77B9",
-      title: "Core API latency breach",
-      description: "Checkout API p95 is above 2.5 s from two probe regions.",
-      severity: "critical",
-      status: "open",
-      source: "Prometheus EU",
-      region: "NL",
-      target: "api-core",
-      startsAt: "2026-09-01T12:39:02Z",
-      lastEventAt: "2026-09-01T12:44:11Z",
-      labels: {
-        alertname: "ApiLatencyHigh",
-        source_region: "nl",
-        target_region: "global",
-        target_name: "api-core",
-        service: "checkout",
-      },
-      annotations: {
-        summary: "Checkout API p95 latency exceeds SLO",
-        runbook_url: "https://runbooks.example.net/api-latency",
-      },
-      events: timelineA,
-    },
-    {
-      id: "inc-01J7ZNRQBGCQKD0NN06T",
-      title: "VLESS endpoint unreachable",
-      description: "nl-edge-02 is unreachable from the Moscow probe node.",
-      severity: "critical",
-      status: "acknowledged",
-      source: "Blackbox RU",
-      region: "RU",
-      target: "nl-edge-02",
-      startsAt: "2026-09-01T12:31:25Z",
-      lastEventAt: "2026-09-01T12:42:52Z",
-      labels: {
-        alertname: "VlessEndpointUnreachable",
-        source_region: "ru",
-        target_region: "eu",
-        target_name: "nl-edge-02",
-      },
-      annotations: { summary: "Probe failed from ru-msk-01" },
-      events: [
-        {
-          id: "evt-b3",
-          type: "acknowledged",
-          label: "Acknowledged by operator",
-          detail: "Investigating upstream route changes.",
-          at: "2026-09-01T12:42:52Z",
-          node: "ru-msk-01",
-          actor: "ops@local",
-        },
-        {
-          id: "evt-b2",
-          type: "delivery_succeeded",
-          label: "Telegram delivered",
-          detail: "EU-only delivery policy selected eu-de-01.",
-          at: "2026-09-01T12:31:34Z",
-          node: "eu-de-01",
-        },
-        {
-          id: "evt-b1",
-          type: "firing",
-          label: "Incident opened",
-          detail: "probe_success returned 0 from ru-msk-01.",
-          at: "2026-09-01T12:31:25Z",
-          node: "ru-msk-01",
-        },
-      ],
-    },
-    {
-      id: "inc-01J7ZHW5D6W2C66RJ2EM",
-      title: "TLS certificate expires in 12 days",
-      description: "portal.example.net certificate is inside the warning window.",
-      severity: "warning",
-      status: "open",
-      source: "Prometheus DE",
-      region: "DE",
-      target: "portal.example.net",
-      startsAt: "2026-09-01T11:58:00Z",
-      lastEventAt: "2026-09-01T12:38:00Z",
-      labels: {
-        alertname: "TlsCertificateExpiringSoon",
-        source_region: "de",
-        target_name: "portal.example.net",
-      },
-      annotations: { summary: "Certificate validity below 14 days" },
-      events: [
-        {
-          id: "evt-c1",
-          type: "firing",
-          label: "Incident opened",
-          detail: "Certificate has 12.4 days remaining.",
-          at: "2026-09-01T11:58:00Z",
-          node: "eu-de-01",
-        },
-      ],
-    },
-    {
-      id: "inc-01J7Z9P2ZVM3A1NNDKWB",
-      title: "Peer sync lag recovered",
-      description: "eu-de-01 caught up after a transient WireGuard interruption.",
-      severity: "info",
-      status: "resolved",
-      source: "Alert Hub health",
-      region: "DE",
-      target: "eu-de-01",
-      startsAt: "2026-09-01T10:42:00Z",
-      lastEventAt: "2026-09-01T11:07:19Z",
-      labels: {
-        alertname: "PeerSyncLagHigh",
-        source_region: "nl",
-        target_name: "eu-de-01",
-      },
-      annotations: { summary: "Peer recovered without manual action" },
-      events: [
-        {
-          id: "evt-d2",
-          type: "resolved",
-          label: "Incident resolved",
-          detail: "Sync lag returned below 5 seconds.",
-          at: "2026-09-01T11:07:19Z",
-          node: "eu-nl-01",
-        },
-        {
-          id: "evt-d1",
-          type: "firing",
-          label: "Incident opened",
-          detail: "Peer cursor lag reached 184 seconds.",
-          at: "2026-09-01T10:42:00Z",
-          node: "eu-nl-01",
-        },
-      ],
-    },
-  ],
-  nodes: [
-    {
-      id: "node-ru-01",
-      name: "ru-msk-01",
-      city: "Moscow",
-      region: "RU",
-      health: "healthy",
-      version: "v0.3.0",
-      syncLag: 0.8,
-      queue: 0,
-      lastSeen: "2026-09-01T12:45:20Z",
-      roles: ["ingest", "notify", "sync", "ui"],
-      publicApiUrl: "https://ru.demo.invalid",
-    },
-    {
-      id: "node-nl-01",
-      name: "eu-nl-01",
-      city: "Amsterdam",
-      region: "NL",
-      health: "healthy",
-      version: "v0.3.0",
-      syncLag: 1.2,
-      queue: 1,
-      lastSeen: "2026-09-01T12:45:20Z",
-      roles: ["ingest", "notify", "sync", "ui"],
-      publicApiUrl: "https://nl.demo.invalid",
-    },
-    {
-      id: "node-de-01",
-      name: "eu-de-01",
-      city: "Frankfurt",
-      region: "DE",
-      health: "degraded",
-      version: "v0.3.0",
-      syncLag: 12.4,
-      queue: 3,
-      lastSeen: "2026-09-01T12:45:08Z",
-      roles: ["ingest", "notify", "sync", "ui"],
-      publicApiUrl: "https://de.demo.invalid",
-    },
-  ],
-  sources: [
-    {
-      id: "src-am-nl",
-      name: "Prometheus EU",
-      kind: "alertmanager",
-      region: "NL",
-      enabled: true,
-      health: "healthy",
-      lastEvent: "2026-09-01T12:44:02Z",
-      events24h: 186,
-      allowedCidrs: [],
-    },
-    {
-      id: "src-am-ru",
-      name: "Blackbox RU",
-      kind: "alertmanager",
-      region: "RU",
-      enabled: true,
-      health: "healthy",
-      lastEvent: "2026-09-01T12:31:25Z",
-      events24h: 92,
-      allowedCidrs: [],
-    },
-    {
-      id: "src-heart-de",
-      name: "Billing heartbeat",
-      kind: "heartbeat",
-      region: "DE",
-      enabled: true,
-      health: "degraded",
-      lastEvent: "2026-09-01T12:40:04Z",
-      events24h: 1438,
-      allowedCidrs: [],
-    },
-    {
-      id: "src-deploy",
-      name: "Deploy events",
-      kind: "generic_json",
-      region: "Global",
-      enabled: false,
-      health: "paused",
-      lastEvent: "2026-08-28T17:02:11Z",
-      events24h: 0,
-      allowedCidrs: [],
-    },
-  ],
-  channels: [
-    {
-      id: "ch-push",
-      name: "Operator Web Push",
-      kind: "web_push",
-      health: "healthy",
-      enabled: true,
-      delivered24h: 48,
-      deliveryAttempts24h: 49,
-      successRate: 98.7,
-      eligible: "All nodes",
-      eligibleRegions: [],
-      eligibleNodeIds: [],
-      configuredFields: [],
-      configAvailable: true,
-    },
-    {
-      id: "ch-tg",
-      name: "EU on-call Telegram",
-      kind: "telegram",
-      health: "healthy",
-      enabled: true,
-      delivered24h: 16,
-      deliveryAttempts24h: 16,
-      successRate: 100,
-      eligible: "NL, DE",
-      eligibleRegions: ["NL", "DE"],
-      eligibleNodeIds: [],
-      configuredFields: ["bot_token", "chat_id"],
-      configAvailable: true,
-    },
-    {
-      id: "ch-mail",
-      name: "Incident digest",
-      kind: "smtp",
-      health: "degraded",
-      enabled: true,
-      delivered24h: 7,
-      deliveryAttempts24h: 8,
-      successRate: 92.1,
-      eligible: "All nodes",
-      eligibleRegions: [],
-      eligibleNodeIds: [],
-      configuredFields: ["host", "port", "from", "to", "tls"],
-      configAvailable: true,
-    },
-    {
-      id: "ch-hook",
-      name: "Ticketing webhook",
-      kind: "generic_webhook",
-      health: "paused",
-      enabled: false,
-      delivered24h: 0,
-      deliveryAttempts24h: 0,
-      successRate: null,
-      eligible: "NL only",
-      eligibleRegions: ["NL"],
-      eligibleNodeIds: [],
-      configuredFields: ["url", "hmac_secret"],
-      configAvailable: true,
-    },
-  ],
-  routes: [
-    {
-      id: "route-demo-critical",
-      name: "Critical fan-out",
-      enabled: true,
-      priority: 10,
-      sourceFilter: [],
-      severityFilter: ["critical"],
-      labelMatchers: [],
-      channelIds: ["ch-push", "ch-tg"],
-      continueMatching: false,
-    },
-  ],
-  datasources: [
-    {
-      id: "prom-demo",
-      name: "Demo Prometheus",
-      url: "https://prometheus.demo.invalid",
-      nodeId: null,
-      region: "DEMO",
-      enabled: true,
-      authType: "none",
-      credentialsConfigured: false,
-      credentialsAvailable: true,
-    },
-  ],
-  devices: [
-    {
-      id: "dev-iphone",
-      name: "Dmitry’s iPhone",
-      platform: "iOS PWA · Safari",
-      current: true,
-      push: true,
-      lastUsed: "2026-09-01T12:45:20Z",
-      location: "Moscow, RU",
-    },
-    {
-      id: "dev-mac",
-      name: "Operations MacBook",
-      platform: "macOS · Chrome",
-      current: false,
-      push: true,
-      lastUsed: "2026-09-01T09:13:08Z",
-      location: "Moscow, RU",
-    },
-    {
-      id: "dev-ipad",
-      name: "On-call iPad",
-      platform: "iPadOS PWA · Safari",
-      current: false,
-      push: false,
-      lastUsed: "2026-08-29T18:21:42Z",
-      location: "Amsterdam, NL",
-    },
-  ],
-  audit: [
-    {
-      id: "aud-1",
-      action: "Incident acknowledged",
-      detail: "VLESS endpoint unreachable · investigation started",
-      actor: "ops@local",
-      node: "ru-msk-01",
-      at: "2026-09-01T12:42:52Z",
-      tone: "warning",
-    },
-    {
-      id: "aud-2",
-      action: "Delivery failover",
-      detail: "Telegram delivery moved from eu-nl-01 to eu-de-01",
-      actor: "system",
-      node: "eu-de-01",
-      at: "2026-09-01T12:31:34Z",
-      tone: "success",
-    },
-    {
-      id: "aud-3",
-      action: "Source configuration changed",
-      detail: "Billing heartbeat grace period changed from 60s to 90s",
-      actor: "ops@local",
+      id: "evt-a4",
+      type: "delivery_succeeded",
+      label: tr("Push доставлен", "Push delivered"),
+      detail: tr(
+        "Основной узел доставки eu-nl-01 завершил отправку с первой попытки.",
+        "Primary delivery owner eu-nl-01 completed on attempt 1.",
+      ),
+      at: "2026-09-01T12:44:11Z",
       node: "eu-nl-01",
-      at: "2026-09-01T11:28:02Z",
-      tone: "neutral",
     },
     {
-      id: "aud-4",
-      action: "Peer connection restored",
-      detail: "eu-de-01 completed resync; 286 events applied",
-      actor: "system",
-      node: "eu-de-01",
-      at: "2026-09-01T11:07:19Z",
-      tone: "success",
-    },
-    {
-      id: "aud-5",
-      action: "Channel test failed",
-      detail: "SMTP provider returned 451; retry queued",
-      actor: "ops@local",
+      id: "evt-a3",
+      type: "replicated",
+      label: tr("Синхронизировано на 3 узла", "Replicated to 3 nodes"),
+      detail: tr(
+        "Событие кластера согласовано; векторные курсоры инцидента совпадают.",
+        "Cluster event converged; vector cursors match for this incident.",
+      ),
+      at: "2026-09-01T12:44:08Z",
       node: "ru-msk-01",
-      at: "2026-09-01T09:44:38Z",
-      tone: "danger",
-    },
-  ],
-  auditNextOffset: 5,
-  auditTotal: 5,
-  reachability: [
-    {
-      source: "Moscow",
-      target: "api-core",
-      success: true,
-      latency: 182,
-      checkedAt: "2026-09-01T12:45:18Z",
     },
     {
-      source: "Moscow",
-      target: "nl-edge-02",
-      success: false,
-      latency: null,
-      checkedAt: "2026-09-01T12:45:16Z",
+      id: "evt-a2",
+      type: "firing",
+      label: tr("Порог всё ещё превышен", "Threshold still exceeded"),
+      detail: tr(
+        "Задержка p95 держится на 2,84 сек. пять минут подряд.",
+        "p95 latency 2.84 s for 5 consecutive minutes.",
+      ),
+      at: "2026-09-01T12:44:02Z",
+      node: "eu-nl-01",
     },
     {
-      source: "Moscow",
-      target: "portal",
-      success: true,
-      latency: 211,
-      checkedAt: "2026-09-01T12:45:17Z",
+      id: "evt-a1",
+      type: "firing",
+      label: tr("Инцидент открыт", "Incident opened"),
+      detail: tr(
+        "Alertmanager обработал активное событие от prometheus-nl.",
+        "Alertmanager normalized a firing event from prometheus-nl.",
+      ),
+      at: "2026-09-01T12:39:02Z",
+      node: "eu-nl-01",
     },
-    {
-      source: "Moscow",
-      target: "billing",
-      success: true,
-      latency: 238,
-      checkedAt: "2026-09-01T12:45:14Z",
-    },
-    {
-      source: "Amsterdam",
-      target: "api-core",
-      success: true,
-      latency: 44,
-      checkedAt: "2026-09-01T12:45:19Z",
-    },
-    {
-      source: "Amsterdam",
-      target: "nl-edge-02",
-      success: true,
-      latency: 18,
-      checkedAt: "2026-09-01T12:45:19Z",
-    },
-    {
-      source: "Amsterdam",
-      target: "portal",
-      success: true,
-      latency: 26,
-      checkedAt: "2026-09-01T12:45:18Z",
-    },
-    {
-      source: "Amsterdam",
-      target: "billing",
-      success: true,
-      latency: 73,
-      checkedAt: "2026-09-01T12:45:16Z",
-    },
-    {
-      source: "Frankfurt",
-      target: "api-core",
-      success: true,
-      latency: 61,
-      checkedAt: "2026-09-01T12:45:08Z",
-    },
-    {
-      source: "Frankfurt",
-      target: "nl-edge-02",
-      success: true,
-      latency: 33,
-      checkedAt: "2026-09-01T12:45:08Z",
-    },
-    {
-      source: "Frankfurt",
-      target: "portal",
-      success: true,
-      latency: 17,
-      checkedAt: "2026-09-01T12:45:07Z",
-    },
-    {
-      source: "Frankfurt",
-      target: "billing",
-      success: false,
-      latency: null,
-      checkedAt: "2026-09-01T12:45:04Z",
-    },
-  ],
-  reachabilityMeta: {
-    status: "ok",
-    detail: "Demo reachability fixture",
-    datasources: 1,
-    errors: [],
-  },
-  clusterMeta: {
-    cursor: { "node-ru-01": 1520, "node-nl-01": 1509, "node-de-01": 1498 },
-    eventCount: 4527,
-  },
-  fixedMetrics: {
-    firingAlerts: {
-      status: "ok",
-      datasources: 1,
-      samples: [
-        {
-          datasourceId: "prom-demo",
-          datasourceName: "Demo Prometheus",
-          metric: { alertname: "CheckoutLatency", severity: "critical" },
-          value: 1,
-          timestamp: "2026-09-01T12:45:20Z",
+  ];
+}
+
+function createDemoData(): HubData {
+  return {
+    incidents: [
+      {
+        id: "inc-01J7ZQ4K8W8AWMRV77B9",
+        title: tr("Высокая задержка основного API", "Core API latency breach"),
+        description: tr(
+          "p95 Checkout API превышает 2,5 сек. из двух регионов проверки.",
+          "Checkout API p95 is above 2.5 s from two probe regions.",
+        ),
+        severity: "critical",
+        status: "open",
+        source: "Prometheus EU",
+        region: "NL",
+        target: "api-core",
+        startsAt: "2026-09-01T12:39:02Z",
+        lastEventAt: "2026-09-01T12:44:11Z",
+        labels: {
+          alertname: "ApiLatencyHigh",
+          source_region: "nl",
+          target_region: "global",
+          target_name: "api-core",
+          service: "checkout",
         },
-      ],
+        annotations: {
+          summary: tr(
+            "Задержка p95 Checkout API превышает SLO",
+            "Checkout API p95 latency exceeds SLO",
+          ),
+          runbook_url: "https://runbooks.example.net/api-latency",
+        },
+        events: createTimelineA(),
+      },
+      {
+        id: "inc-01J7ZNRQBGCQKD0NN06T",
+        title: tr("Точка VLESS недоступна", "VLESS endpoint unreachable"),
+        description: tr(
+          "nl-edge-02 не отвечает с московского узла проверки.",
+          "nl-edge-02 is unreachable from the Moscow probe node.",
+        ),
+        severity: "critical",
+        status: "acknowledged",
+        source: "Blackbox RU",
+        region: "RU",
+        target: "nl-edge-02",
+        startsAt: "2026-09-01T12:31:25Z",
+        lastEventAt: "2026-09-01T12:42:52Z",
+        labels: {
+          alertname: "VlessEndpointUnreachable",
+          source_region: "ru",
+          target_region: "eu",
+          target_name: "nl-edge-02",
+        },
+        annotations: {
+          summary: tr("Проверка с ru-msk-01 не прошла", "Probe failed from ru-msk-01"),
+        },
+        events: [
+          {
+            id: "evt-b3",
+            type: "acknowledged",
+            label: tr("Принят в работу оператором", "Acknowledged by operator"),
+            detail: tr(
+              "Проверяем изменения маршрута у провайдера.",
+              "Investigating upstream route changes.",
+            ),
+            at: "2026-09-01T12:42:52Z",
+            node: "ru-msk-01",
+            actor: "ops@local",
+          },
+          {
+            id: "evt-b2",
+            type: "delivery_succeeded",
+            label: tr("Доставлено в Telegram", "Telegram delivered"),
+            detail: tr(
+              "Политика доставки в ЕС выбрала узел eu-de-01.",
+              "EU-only delivery policy selected eu-de-01.",
+            ),
+            at: "2026-09-01T12:31:34Z",
+            node: "eu-de-01",
+          },
+          {
+            id: "evt-b1",
+            type: "firing",
+            label: tr("Инцидент открыт", "Incident opened"),
+            detail: tr(
+              "probe_success вернул 0 с узла ru-msk-01.",
+              "probe_success returned 0 from ru-msk-01.",
+            ),
+            at: "2026-09-01T12:31:25Z",
+            node: "ru-msk-01",
+          },
+        ],
+      },
+      {
+        id: "inc-01J7ZHW5D6W2C66RJ2EM",
+        title: tr("Сертификат TLS истекает через 12 дней", "TLS certificate expires in 12 days"),
+        description: tr(
+          "Сертификат portal.example.net вошёл в интервал предупреждения.",
+          "portal.example.net certificate is inside the warning window.",
+        ),
+        severity: "warning",
+        status: "open",
+        source: "Prometheus DE",
+        region: "DE",
+        target: "portal.example.net",
+        startsAt: "2026-09-01T11:58:00Z",
+        lastEventAt: "2026-09-01T12:38:00Z",
+        labels: {
+          alertname: "TlsCertificateExpiringSoon",
+          source_region: "de",
+          target_name: "portal.example.net",
+        },
+        annotations: {
+          summary: tr(
+            "Срок действия сертификата меньше 14 дней",
+            "Certificate validity below 14 days",
+          ),
+        },
+        events: [
+          {
+            id: "evt-c1",
+            type: "firing",
+            label: tr("Инцидент открыт", "Incident opened"),
+            detail: tr(
+              "До истечения сертификата осталось 12,4 дня.",
+              "Certificate has 12.4 days remaining.",
+            ),
+            at: "2026-09-01T11:58:00Z",
+            node: "eu-de-01",
+          },
+        ],
+      },
+      {
+        id: "inc-01J7Z9P2ZVM3A1NNDKWB",
+        title: tr("Синхронизация узла восстановлена", "Peer sync lag recovered"),
+        description: tr(
+          "eu-de-01 догнал кластер после краткого разрыва WireGuard.",
+          "eu-de-01 caught up after a transient WireGuard interruption.",
+        ),
+        severity: "info",
+        status: "resolved",
+        source: tr("Состояние Alert Hub", "Alert Hub health"),
+        region: "DE",
+        target: "eu-de-01",
+        startsAt: "2026-09-01T10:42:00Z",
+        lastEventAt: "2026-09-01T11:07:19Z",
+        labels: {
+          alertname: "PeerSyncLagHigh",
+          source_region: "nl",
+          target_name: "eu-de-01",
+        },
+        annotations: {
+          summary: tr(
+            "Узел восстановился без ручного вмешательства",
+            "Peer recovered without manual action",
+          ),
+        },
+        events: [
+          {
+            id: "evt-d2",
+            type: "resolved",
+            label: tr("Инцидент решён", "Incident resolved"),
+            detail: tr(
+              "Задержка синхронизации вернулась ниже 5 секунд.",
+              "Sync lag returned below 5 seconds.",
+            ),
+            at: "2026-09-01T11:07:19Z",
+            node: "eu-nl-01",
+          },
+          {
+            id: "evt-d1",
+            type: "firing",
+            label: tr("Инцидент открыт", "Incident opened"),
+            detail: tr(
+              "Отставание курсора узла достигло 184 секунд.",
+              "Peer cursor lag reached 184 seconds.",
+            ),
+            at: "2026-09-01T10:42:00Z",
+            node: "eu-nl-01",
+          },
+        ],
+      },
+    ],
+    nodes: [
+      {
+        id: "node-ru-01",
+        name: "ru-msk-01",
+        city: tr("Москва", "Moscow"),
+        region: "RU",
+        health: "healthy",
+        version: "v0.3.0",
+        syncLag: 0.8,
+        queue: 0,
+        lastSeen: "2026-09-01T12:45:20Z",
+        roles: ["ingest", "notify", "sync", "ui"],
+        publicApiUrl: "https://ru.demo.invalid",
+      },
+      {
+        id: "node-nl-01",
+        name: "eu-nl-01",
+        city: tr("Амстердам", "Amsterdam"),
+        region: "NL",
+        health: "healthy",
+        version: "v0.3.0",
+        syncLag: 1.2,
+        queue: 1,
+        lastSeen: "2026-09-01T12:45:20Z",
+        roles: ["ingest", "notify", "sync", "ui"],
+        publicApiUrl: "https://nl.demo.invalid",
+      },
+      {
+        id: "node-de-01",
+        name: "eu-de-01",
+        city: tr("Франкфурт", "Frankfurt"),
+        region: "DE",
+        health: "degraded",
+        version: "v0.3.0",
+        syncLag: 12.4,
+        queue: 3,
+        lastSeen: "2026-09-01T12:45:08Z",
+        roles: ["ingest", "notify", "sync", "ui"],
+        publicApiUrl: "https://de.demo.invalid",
+      },
+    ],
+    sources: [
+      {
+        id: "src-am-nl",
+        name: "Prometheus EU",
+        kind: "alertmanager",
+        region: "NL",
+        enabled: true,
+        health: "healthy",
+        lastEvent: "2026-09-01T12:44:02Z",
+        events24h: 186,
+        allowedCidrs: [],
+      },
+      {
+        id: "src-am-ru",
+        name: "Blackbox RU",
+        kind: "alertmanager",
+        region: "RU",
+        enabled: true,
+        health: "healthy",
+        lastEvent: "2026-09-01T12:31:25Z",
+        events24h: 92,
+        allowedCidrs: [],
+      },
+      {
+        id: "src-heart-de",
+        name: tr("Контроль биллинга", "Billing heartbeat"),
+        kind: "heartbeat",
+        region: "DE",
+        enabled: true,
+        health: "degraded",
+        lastEvent: "2026-09-01T12:40:04Z",
+        events24h: 1438,
+        allowedCidrs: [],
+      },
+      {
+        id: "src-deploy",
+        name: tr("События деплоя", "Deploy events"),
+        kind: "generic_json",
+        region: tr("Глобально", "Global"),
+        enabled: false,
+        health: "paused",
+        lastEvent: "2026-08-28T17:02:11Z",
+        events24h: 0,
+        allowedCidrs: [],
+      },
+    ],
+    channels: [
+      {
+        id: "ch-push",
+        name: tr("Web Push оператора", "Operator Web Push"),
+        kind: "web_push",
+        health: "healthy",
+        enabled: true,
+        delivered24h: 48,
+        deliveryAttempts24h: 49,
+        successRate: 98.7,
+        eligible: tr("Все узлы", "All nodes"),
+        eligibleRegions: [],
+        eligibleNodeIds: [],
+        configuredFields: [],
+        configAvailable: true,
+      },
+      {
+        id: "ch-tg",
+        name: tr("Дежурный Telegram ЕС", "EU on-call Telegram"),
+        kind: "telegram",
+        health: "healthy",
+        enabled: true,
+        delivered24h: 16,
+        deliveryAttempts24h: 16,
+        successRate: 100,
+        eligible: "NL, DE",
+        eligibleRegions: ["NL", "DE"],
+        eligibleNodeIds: [],
+        configuredFields: ["bot_token", "chat_id"],
+        configAvailable: true,
+      },
+      {
+        id: "ch-mail",
+        name: tr("Сводка инцидентов", "Incident digest"),
+        kind: "smtp",
+        health: "degraded",
+        enabled: true,
+        delivered24h: 7,
+        deliveryAttempts24h: 8,
+        successRate: 92.1,
+        eligible: tr("Все узлы", "All nodes"),
+        eligibleRegions: [],
+        eligibleNodeIds: [],
+        configuredFields: ["host", "port", "from", "to", "tls"],
+        configAvailable: true,
+      },
+      {
+        id: "ch-hook",
+        name: tr("Вебхук тикет-системы", "Ticketing webhook"),
+        kind: "generic_webhook",
+        health: "paused",
+        enabled: false,
+        delivered24h: 0,
+        deliveryAttempts24h: 0,
+        successRate: null,
+        eligible: tr("Только NL", "NL only"),
+        eligibleRegions: ["NL"],
+        eligibleNodeIds: [],
+        configuredFields: ["url", "hmac_secret"],
+        configAvailable: true,
+      },
+    ],
+    routes: [
+      {
+        id: "route-demo-critical",
+        name: tr("Критические — во все каналы", "Critical fan-out"),
+        enabled: true,
+        priority: 10,
+        sourceFilter: [],
+        severityFilter: ["critical"],
+        labelMatchers: [],
+        channelIds: ["ch-push", "ch-tg"],
+        continueMatching: false,
+      },
+    ],
+    datasources: [
+      {
+        id: "prom-demo",
+        name: tr("Демо Prometheus", "Demo Prometheus"),
+        url: "https://prometheus.demo.invalid",
+        nodeId: null,
+        region: "DEMO",
+        enabled: true,
+        authType: "none",
+        credentialsConfigured: false,
+        credentialsAvailable: true,
+      },
+    ],
+    devices: [
+      {
+        id: "dev-iphone",
+        name: tr("iPhone Дмитрия", "Dmitry’s iPhone"),
+        platform: "iOS PWA · Safari",
+        current: true,
+        push: true,
+        lastUsed: "2026-09-01T12:45:20Z",
+        location: tr("Москва, RU", "Moscow, RU"),
+      },
+      {
+        id: "dev-mac",
+        name: tr("Рабочий MacBook", "Operations MacBook"),
+        platform: "macOS · Chrome",
+        current: false,
+        push: true,
+        lastUsed: "2026-09-01T09:13:08Z",
+        location: tr("Москва, RU", "Moscow, RU"),
+      },
+      {
+        id: "dev-ipad",
+        name: tr("Дежурный iPad", "On-call iPad"),
+        platform: "iPadOS PWA · Safari",
+        current: false,
+        push: false,
+        lastUsed: "2026-08-29T18:21:42Z",
+        location: tr("Амстердам, NL", "Amsterdam, NL"),
+      },
+    ],
+    audit: [
+      {
+        id: "aud-1",
+        action: tr("Инцидент принят в работу", "Incident acknowledged"),
+        detail: tr(
+          "Точка VLESS недоступна · расследование начато",
+          "VLESS endpoint unreachable · investigation started",
+        ),
+        actor: "ops@local",
+        node: "ru-msk-01",
+        at: "2026-09-01T12:42:52Z",
+        tone: "warning",
+      },
+      {
+        id: "aud-2",
+        action: tr("Переключение доставки", "Delivery failover"),
+        detail: tr(
+          "Доставка Telegram перенесена с eu-nl-01 на eu-de-01",
+          "Telegram delivery moved from eu-nl-01 to eu-de-01",
+        ),
+        actor: tr("система", "system"),
+        node: "eu-de-01",
+        at: "2026-09-01T12:31:34Z",
+        tone: "success",
+      },
+      {
+        id: "aud-3",
+        action: tr("Настройки источника изменены", "Source configuration changed"),
+        detail: tr(
+          "Допустимая задержка сигнала биллинга изменена с 60 до 90 сек.",
+          "Billing heartbeat grace period changed from 60s to 90s",
+        ),
+        actor: "ops@local",
+        node: "eu-nl-01",
+        at: "2026-09-01T11:28:02Z",
+        tone: "neutral",
+      },
+      {
+        id: "aud-4",
+        action: tr("Связь с узлом восстановлена", "Peer connection restored"),
+        detail: tr(
+          "eu-de-01 завершил синхронизацию; применено 286 событий",
+          "eu-de-01 completed resync; 286 events applied",
+        ),
+        actor: tr("система", "system"),
+        node: "eu-de-01",
+        at: "2026-09-01T11:07:19Z",
+        tone: "success",
+      },
+      {
+        id: "aud-5",
+        action: tr("Проверка канала не прошла", "Channel test failed"),
+        detail: tr(
+          "SMTP-провайдер вернул 451; повтор поставлен в очередь",
+          "SMTP provider returned 451; retry queued",
+        ),
+        actor: "ops@local",
+        node: "ru-msk-01",
+        at: "2026-09-01T09:44:38Z",
+        tone: "danger",
+      },
+    ],
+    auditNextOffset: 5,
+    auditTotal: 5,
+    reachability: [
+      {
+        source: tr("Москва", "Moscow"),
+        target: "api-core",
+        success: true,
+        latency: 182,
+        checkedAt: "2026-09-01T12:45:18Z",
+      },
+      {
+        source: tr("Москва", "Moscow"),
+        target: "nl-edge-02",
+        success: false,
+        latency: null,
+        checkedAt: "2026-09-01T12:45:16Z",
+      },
+      {
+        source: tr("Москва", "Moscow"),
+        target: "portal",
+        success: true,
+        latency: 211,
+        checkedAt: "2026-09-01T12:45:17Z",
+      },
+      {
+        source: tr("Москва", "Moscow"),
+        target: "billing",
+        success: true,
+        latency: 238,
+        checkedAt: "2026-09-01T12:45:14Z",
+      },
+      {
+        source: tr("Амстердам", "Amsterdam"),
+        target: "api-core",
+        success: true,
+        latency: 44,
+        checkedAt: "2026-09-01T12:45:19Z",
+      },
+      {
+        source: tr("Амстердам", "Amsterdam"),
+        target: "nl-edge-02",
+        success: true,
+        latency: 18,
+        checkedAt: "2026-09-01T12:45:19Z",
+      },
+      {
+        source: tr("Амстердам", "Amsterdam"),
+        target: "portal",
+        success: true,
+        latency: 26,
+        checkedAt: "2026-09-01T12:45:18Z",
+      },
+      {
+        source: tr("Амстердам", "Amsterdam"),
+        target: "billing",
+        success: true,
+        latency: 73,
+        checkedAt: "2026-09-01T12:45:16Z",
+      },
+      {
+        source: tr("Франкфурт", "Frankfurt"),
+        target: "api-core",
+        success: true,
+        latency: 61,
+        checkedAt: "2026-09-01T12:45:08Z",
+      },
+      {
+        source: tr("Франкфурт", "Frankfurt"),
+        target: "nl-edge-02",
+        success: true,
+        latency: 33,
+        checkedAt: "2026-09-01T12:45:08Z",
+      },
+      {
+        source: tr("Франкфурт", "Frankfurt"),
+        target: "portal",
+        success: true,
+        latency: 17,
+        checkedAt: "2026-09-01T12:45:07Z",
+      },
+      {
+        source: tr("Франкфурт", "Frankfurt"),
+        target: "billing",
+        success: false,
+        latency: null,
+        checkedAt: "2026-09-01T12:45:04Z",
+      },
+    ],
+    reachabilityMeta: {
+      status: "ok",
+      detail: tr("Демонстрационные данные доступности", "Demo reachability fixture"),
+      datasources: 1,
       errors: [],
     },
-    keyJobsUp: {
-      status: "ok",
-      datasources: 1,
-      samples: [
-        {
-          datasourceId: "prom-demo",
-          datasourceName: "Demo Prometheus",
-          metric: { instance: "prometheus:9090", job: "prometheus" },
-          value: 1,
-          timestamp: "2026-09-01T12:45:20Z",
-        },
-        {
-          datasourceId: "prom-demo",
-          datasourceName: "Demo Prometheus",
-          metric: { instance: "alertmanager:9093", job: "alertmanager" },
-          value: 1,
-          timestamp: "2026-09-01T12:45:20Z",
-        },
-      ],
-      errors: [],
+    clusterMeta: {
+      cursor: { "node-ru-01": 1520, "node-nl-01": 1509, "node-de-01": 1498 },
+      eventCount: 4527,
     },
-    alertHubHealth: {
-      status: "ok",
-      datasources: 1,
-      samples: [
-        {
-          datasourceId: "prom-demo",
-          datasourceName: "Demo Prometheus",
-          metric: { instance: "alert-hub:8000", job: "alert-hub" },
-          value: 1,
-          timestamp: "2026-09-01T12:45:20Z",
-        },
-      ],
-      errors: [],
+    fixedMetrics: {
+      firingAlerts: {
+        status: "ok",
+        datasources: 1,
+        samples: [
+          {
+            datasourceId: "prom-demo",
+            datasourceName: tr("Демо Prometheus", "Demo Prometheus"),
+            metric: { alertname: "CheckoutLatency", severity: "critical" },
+            value: 1,
+            timestamp: "2026-09-01T12:45:20Z",
+          },
+        ],
+        errors: [],
+      },
+      keyJobsUp: {
+        status: "ok",
+        datasources: 1,
+        samples: [
+          {
+            datasourceId: "prom-demo",
+            datasourceName: tr("Демо Prometheus", "Demo Prometheus"),
+            metric: { instance: "prometheus:9090", job: "prometheus" },
+            value: 1,
+            timestamp: "2026-09-01T12:45:20Z",
+          },
+          {
+            datasourceId: "prom-demo",
+            datasourceName: tr("Демо Prometheus", "Demo Prometheus"),
+            metric: { instance: "alertmanager:9093", job: "alertmanager" },
+            value: 1,
+            timestamp: "2026-09-01T12:45:20Z",
+          },
+        ],
+        errors: [],
+      },
+      alertHubHealth: {
+        status: "ok",
+        datasources: 1,
+        samples: [
+          {
+            datasourceId: "prom-demo",
+            datasourceName: tr("Демо Prometheus", "Demo Prometheus"),
+            metric: { instance: "alert-hub:8000", job: "alert-hub" },
+            value: 1,
+            timestamp: "2026-09-01T12:45:20Z",
+          },
+        ],
+        errors: [],
+      },
     },
-  },
-  summary: {
-    open: 2,
-    acknowledged: 1,
-    critical: 2,
-    deliveryRate: 98.7,
-    deliveries24h: 71,
-    deliverySuccess24h: 70,
-    outboxPending: 1,
-    channelsEnabled: 3,
-    grafanaUrl: null,
-  },
-};
+    summary: {
+      open: 2,
+      acknowledged: 1,
+      critical: 2,
+      deliveryRate: 98.7,
+      deliveries24h: 71,
+      deliverySuccess24h: 70,
+      outboxPending: 1,
+      channelsEnabled: 3,
+      grafanaUrl: null,
+    },
+  };
+}
 
 const NAV_ITEMS = [
-  { id: "overview", label: "Overview", path: "/", icon: "◫" },
-  { id: "incidents", label: "Incidents", path: "/incidents", icon: "!" },
-  { id: "reachability", label: "Regional reachability", path: "/reachability", icon: "∿" },
-  { id: "sources", label: "Sources", path: "/sources", icon: "→" },
-  { id: "channels", label: "Channels", path: "/channels", icon: "≫" },
-  { id: "devices", label: "Devices", path: "/devices", icon: "▣" },
-  { id: "cluster", label: "Cluster", path: "/cluster", icon: "⌘" },
-  { id: "audit", label: "Audit log", path: "/audit", icon: "≡" },
-  { id: "settings", label: "Settings", path: "/settings", icon: "⚙" },
+  {
+    id: "overview",
+    get label() {
+      return tr("Обзор", "Overview");
+    },
+    path: "/",
+    icon: "◫",
+  },
+  {
+    id: "incidents",
+    get label() {
+      return tr("Инциденты", "Incidents");
+    },
+    path: "/incidents",
+    icon: "!",
+  },
+  {
+    id: "reachability",
+    get label() {
+      return tr("Доступность", "Regional reachability");
+    },
+    path: "/reachability",
+    icon: "∿",
+  },
+  {
+    id: "sources",
+    get label() {
+      return tr("Источники", "Sources");
+    },
+    path: "/sources",
+    icon: "→",
+  },
+  {
+    id: "channels",
+    get label() {
+      return tr("Каналы", "Channels");
+    },
+    path: "/channels",
+    icon: "≫",
+  },
+  {
+    id: "devices",
+    get label() {
+      return tr("Устройства", "Devices");
+    },
+    path: "/devices",
+    icon: "▣",
+  },
+  {
+    id: "cluster",
+    get label() {
+      return tr("Кластер", "Cluster");
+    },
+    path: "/cluster",
+    icon: "⌘",
+  },
+  {
+    id: "audit",
+    get label() {
+      return tr("Журнал действий", "Audit log");
+    },
+    path: "/audit",
+    icon: "≡",
+  },
+  {
+    id: "settings",
+    get label() {
+      return tr("Настройки", "Settings");
+    },
+    path: "/settings",
+    icon: "⚙",
+  },
 ] as const;
 
 type RouteId = (typeof NAV_ITEMS)[number]["id"] | "incident";
@@ -890,21 +1056,153 @@ function titleCase(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+const HEALTH_LABELS: Record<Health, readonly [string, string]> = {
+  healthy: ["Работает", "Healthy"],
+  degraded: ["Есть проблемы", "Degraded"],
+  offline: ["Нет связи", "Offline"],
+  paused: ["Приостановлено", "Paused"],
+  unknown: ["Нет данных", "Unknown"],
+  not_exercised: ["Не проверено", "Not Exercised"],
+};
+
+const SEVERITY_LABELS: Record<Severity, readonly [string, string]> = {
+  critical: ["Критический", "Critical"],
+  warning: ["Предупреждение", "Warning"],
+  info: ["Информация", "Info"],
+  unknown: ["Неизвестно", "Unknown"],
+};
+
+const INCIDENT_STATUS_LABELS: Record<IncidentStatus, readonly [string, string]> = {
+  open: ["Открыт", "Open"],
+  acknowledged: ["Принят в работу", "Acknowledged"],
+  resolved: ["Решён", "Resolved"],
+  silenced: ["Приглушён", "Silenced"],
+};
+
+const SOURCE_KIND_LABELS: Record<Source["kind"], readonly [string, string]> = {
+  alertmanager: ["Alertmanager", "Alertmanager"],
+  generic_json: ["JSON-вебхук", "Generic Json"],
+  heartbeat: ["Контрольный сигнал", "Heartbeat"],
+};
+
+const CHANNEL_KIND_LABELS: Record<Channel["kind"], readonly [string, string]> = {
+  web_push: ["Web Push", "Web Push"],
+  telegram: ["Telegram", "Telegram"],
+  smtp: ["Электронная почта", "Smtp"],
+  generic_webhook: ["Вебхук", "Generic Webhook"],
+};
+
+function healthLabel(value: Health) {
+  const [russian, english] = HEALTH_LABELS[value] ?? HEALTH_LABELS.unknown;
+  return tr(russian, english);
+}
+
+function severityLabel(value: Severity) {
+  const [russian, english] = SEVERITY_LABELS[value] ?? SEVERITY_LABELS.unknown;
+  return tr(russian, english);
+}
+
+function incidentStatusLabel(value: IncidentStatus) {
+  const label = INCIDENT_STATUS_LABELS[value];
+  return label ? tr(label[0], label[1]) : value;
+}
+
+function sourceKindLabel(value: Source["kind"]) {
+  const label = SOURCE_KIND_LABELS[value];
+  return label ? tr(label[0], label[1]) : value;
+}
+
+function channelKindLabel(value: Channel["kind"]) {
+  const label = CHANNEL_KIND_LABELS[value];
+  return label ? tr(label[0], label[1]) : value;
+}
+
+function isSystemActor(value: string) {
+  return value === "system" || value === "система";
+}
+
+const EVENT_TYPE_LABELS: Record<string, readonly [string, string]> = {
+  firing: ["Тревога активна", "Firing"],
+  resolved: ["Инцидент решён", "Resolved"],
+  acknowledged: ["Инцидент принят в работу", "Acknowledged"],
+  silenced: ["Инцидент приглушён", "Silenced"],
+  commented: ["Добавлен комментарий", "Commented"],
+  delivery_succeeded: ["Уведомление доставлено", "Delivery Succeeded"],
+  delivery_failed: ["Ошибка доставки", "Delivery Failed"],
+  delivery_retry: ["Повторная доставка", "Delivery Retry"],
+  replicated: ["Событие синхронизировано", "Replicated"],
+};
+
+const AUDIT_ACTION_LABELS: Record<string, readonly [string, string]> = {
+  bootstrap_failed: ["Ошибка первичной настройки", "Bootstrap Failed"],
+  bootstrap_completed: ["Первичная настройка завершена", "Bootstrap Completed"],
+  bootstrap_conflict_detected: [
+    "Обнаружен конфликт первичной настройки",
+    "Bootstrap Conflict Detected",
+  ],
+  login_failed: ["Неудачная попытка входа", "Login Failed"],
+  login_succeeded: ["Вход выполнен", "Login Succeeded"],
+  session_refreshed: ["Сессия обновлена", "Session Refreshed"],
+  logout: ["Выход из системы", "Logout"],
+  session_revoked: ["Сессия отозвана", "Session Revoked"],
+  source_created: ["Источник создан", "Source Created"],
+  source_updated: ["Источник обновлён", "Source Updated"],
+  source_deleted: ["Источник удалён", "Source Deleted"],
+  source_token_rotated: ["Токен источника обновлён", "Source Token Rotated"],
+  ingest_auth_failed: ["Ошибка авторизации источника", "Ingest Auth Failed"],
+  channel_created: ["Канал создан", "Channel Created"],
+  channel_updated: ["Канал обновлён", "Channel Updated"],
+  channel_deleted: ["Канал удалён", "Channel Deleted"],
+  channel_test_requested: ["Запрошена проверка канала", "Channel Test Requested"],
+  channel_test_rejected: ["Проверка канала отклонена", "Channel Test Rejected"],
+  channel_test_completed: ["Проверка канала завершена", "Channel Test Completed"],
+  notification_route_created: ["Маршрут уведомлений создан", "Notification Route Created"],
+  notification_route_updated: ["Маршрут уведомлений обновлён", "Notification Route Updated"],
+  notification_route_deleted: ["Маршрут уведомлений удалён", "Notification Route Deleted"],
+  incident_acknowledged: ["Инцидент принят в работу", "Incident Acknowledged"],
+  incident_resolved: ["Инцидент решён", "Incident Resolved"],
+  incident_silenced: ["Инцидент приглушён", "Incident Silenced"],
+  prometheus_datasource_created: ["Источник Prometheus создан", "Prometheus Datasource Created"],
+  prometheus_datasource_updated: ["Источник Prometheus обновлён", "Prometheus Datasource Updated"],
+  prometheus_datasource_deleted: ["Источник Prometheus удалён", "Prometheus Datasource Deleted"],
+  prometheus_datasource_test_failed: [
+    "Проверка Prometheus не прошла",
+    "Prometheus Datasource Test Failed",
+  ],
+  cluster_peer_denied: ["Подключение узла отклонено", "Cluster Peer Denied"],
+  cluster_auth_failed: ["Ошибка авторизации узла", "Cluster Auth Failed"],
+  push_subscription_created: ["Push-подписка создана", "Push Subscription Created"],
+  push_subscription_updated: ["Push-подписка обновлена", "Push Subscription Updated"],
+  push_subscription_disabled: ["Push-подписка отключена", "Push Subscription Disabled"],
+};
+
+function eventTypeLabel(value: string) {
+  const label = EVENT_TYPE_LABELS[value];
+  return label ? tr(label[0], label[1]) : titleCase(value);
+}
+
+function auditActionLabel(code: string, fallback: unknown) {
+  const label = AUDIT_ACTION_LABELS[code];
+  return label ? tr(label[0], label[1]) : String(fallback ?? titleCase(code));
+}
+
 function formatRelative(value: string) {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value || "Never";
+  if (Number.isNaN(date.getTime())) return value || tr("Никогда", "Never");
   const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
-  if (seconds < 60) return `${Math.max(1, seconds)}s ago`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86400)}d ago`;
+  if (seconds < 60) return tr(`${Math.max(1, seconds)} сек. назад`, `${Math.max(1, seconds)}s ago`);
+  if (seconds < 3600)
+    return tr(`${Math.floor(seconds / 60)} мин. назад`, `${Math.floor(seconds / 60)}m ago`);
+  if (seconds < 86400)
+    return tr(`${Math.floor(seconds / 3600)} ч. назад`, `${Math.floor(seconds / 3600)}h ago`);
+  return tr(`${Math.floor(seconds / 86400)} дн. назад`, `${Math.floor(seconds / 86400)}d ago`);
 }
 
 function formatDate(value: string, includeDate = false) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value || "—";
   return (
-    new Intl.DateTimeFormat("en-GB", {
+    new Intl.DateTimeFormat(currentUiLanguage() === "ru" ? "ru-RU" : "en-GB", {
       ...(includeDate ? { day: "2-digit", month: "short" } : {}),
       hour: "2-digit",
       minute: "2-digit",
@@ -917,8 +1215,8 @@ function formatDate(value: string, includeDate = false) {
 
 function formatDay(value: string) {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "Audit trail";
-  return new Intl.DateTimeFormat("en-GB", {
+  if (Number.isNaN(date.getTime())) return tr("Журнал действий", "Audit trail");
+  return new Intl.DateTimeFormat(currentUiLanguage() === "ru" ? "ru-RU" : "en-GB", {
     day: "2-digit",
     month: "long",
     year: "numeric",
@@ -940,8 +1238,11 @@ const GENERIC_JSON_SCHEMA_EXAMPLE = JSON.stringify(
     external_event_id: "deploy-2026-09-02T10:15:00Z",
     dedup_key: "checkout-api-latency",
     status: "firing",
-    title: "Checkout API latency is high",
-    description: "p95 exceeded 800 ms for 10 minutes",
+    title: tr("Высокая задержка Checkout API", "Checkout API latency is high"),
+    description: tr(
+      "p95 превышает 800 мс в течение 10 минут",
+      "p95 exceeded 800 ms for 10 minutes",
+    ),
     severity: "critical",
     starts_at: "2026-09-02T10:15:00Z",
     labels: { service: "checkout", region: "eu-west" },
@@ -955,7 +1256,12 @@ const GENERIC_JSON_SCHEMA_EXAMPLE = JSON.stringify(
 function absoluteSourceWebhook(value: string) {
   const resolved = new URL(value, window.location.origin);
   if (resolved.origin !== window.location.origin) {
-    throw new Error("The source endpoint must use this Alert Hub origin.");
+    throw new Error(
+      tr(
+        "Адрес источника должен использовать текущий домен Alert Hub.",
+        "The source endpoint must use this Alert Hub origin.",
+      ),
+    );
   }
   return resolved.href;
 }
@@ -981,7 +1287,12 @@ function sourceCredential(payload: unknown, kind: Source["kind"]): SourceCredent
   const webhook = typeof body.webhook_url === "string" ? body.webhook_url : "";
   const example = typeof body.example === "string" ? body.example : "";
   if (!id || !token || !webhook || !example) {
-    throw new Error("The API did not return the required one-time source credential fields.");
+    throw new Error(
+      tr(
+        "API не вернул обязательные одноразовые данные доступа источника.",
+        "The API did not return the required one-time source credential fields.",
+      ),
+    );
   }
   return {
     id,
@@ -1040,16 +1351,25 @@ function normalizeIncident(item: unknown, index: number): Incident {
   const rawEvents = listFrom(row.events ?? row.timeline, "events");
   return {
     id: String(row.id ?? `incident-${index}`),
-    title: String(row.title ?? row.name ?? "Untitled incident"),
-    description: String(row.description ?? row.summary ?? "No description provided."),
+    title: String(row.title ?? row.name ?? tr("Инцидент без названия", "Untitled incident")),
+    description: String(
+      row.description ?? row.summary ?? tr("Описание не добавлено.", "No description provided."),
+    ),
     severity: (["critical", "warning", "info", "unknown"].includes(String(row.severity))
       ? String(row.severity)
       : "unknown") as Severity,
     status: (["open", "acknowledged", "resolved", "silenced"].includes(String(row.status))
       ? String(row.status)
       : "open") as IncidentStatus,
-    source: String(asRecord(row.source).name ?? row.source_name ?? row.source ?? "Unknown source"),
-    region: String(row.region ?? asRecord(row.labels).source_region ?? "Global").toUpperCase(),
+    source: String(
+      asRecord(row.source).name ??
+        row.source_name ??
+        row.source ??
+        tr("Источник не указан", "Unknown source"),
+    ),
+    region: String(
+      row.region ?? asRecord(row.labels).source_region ?? tr("Глобально", "Global"),
+    ).toUpperCase(),
     target: String(row.target ?? asRecord(row.labels).target_name ?? "—"),
     startsAt: String(row.starts_at ?? row.startsAt ?? row.created_at ?? ""),
     lastEventAt: String(
@@ -1064,7 +1384,7 @@ function normalizeIncident(item: unknown, index: number): Incident {
       return {
         id: String(entry.id ?? `${row.id}-event-${eventIndex}`),
         type: eventType,
-        label: String(entry.label ?? titleCase(eventType)),
+        label: String(entry.label ?? eventTypeLabel(eventType)),
         detail: String(
           entry.detail ??
             entry.description ??
@@ -1072,10 +1392,10 @@ function normalizeIncident(item: unknown, index: number): Incident {
             eventPayload.reason ??
             eventPayload.description ??
             eventPayload.title ??
-            "No event detail supplied.",
+            tr("Подробности события не переданы.", "No event detail supplied."),
         ),
         at: String(entry.occurred_at ?? entry.at ?? entry.created_at ?? ""),
-        node: String(entry.origin_node_id ?? entry.node ?? "unknown"),
+        node: String(entry.origin_node_id ?? entry.node ?? tr("неизвестно", "unknown")),
         actor:
           entry.actor || eventPayload.actor ? String(entry.actor ?? eventPayload.actor) : undefined,
       };
@@ -1089,14 +1409,16 @@ function normalizeNode(item: unknown, index: number): ClusterNode {
   return {
     id: String(row.id ?? row.node_id ?? `node-${index}`),
     name: String(row.name ?? row.node_id ?? `node-${index + 1}`),
-    city: String(row.city ?? row.location ?? row.region ?? "Unknown region"),
+    city: String(
+      row.city ?? row.location ?? row.region ?? tr("Регион не указан", "Unknown region"),
+    ),
     region: String(row.region ?? "—").toUpperCase(),
     health: (["healthy", "degraded", "offline", "paused"].includes(state)
       ? state
       : state === "online"
         ? "healthy"
         : "unknown") as Health,
-    version: String(row.software_version ?? row.version ?? "unknown"),
+    version: String(row.software_version ?? row.version ?? tr("неизвестно", "unknown")),
     syncLag: asFiniteNumber(row.sync_lag_seconds ?? row.sync_lag ?? row.lag),
     queue: asFiniteNumber(row.outbox_pending ?? row.queue),
     lastSeen: String(row.last_seen_at ?? row.last_seen ?? ""),
@@ -1133,9 +1455,9 @@ function normalizeSource(item: unknown, index: number): Source {
   const kind = String(row.kind ?? "generic_json") as Source["kind"];
   return {
     id: String(row.id ?? `source-${index}`),
-    name: String(row.name ?? `Source ${index + 1}`),
+    name: String(row.name ?? tr(`Источник ${index + 1}`, `Source ${index + 1}`)),
     kind: ["alertmanager", "generic_json", "heartbeat"].includes(kind) ? kind : "generic_json",
-    region: String(row.region ?? "Global").toUpperCase(),
+    region: String(row.region ?? tr("Глобально", "Global")).toUpperCase(),
     enabled: row.enabled !== false,
     health: (row.enabled === false ? "paused" : String(row.health ?? "unknown")) as Health,
     lastEvent: String(row.last_event_at ?? row.last_event ?? ""),
@@ -1149,7 +1471,7 @@ function normalizeChannel(item: unknown, index: number): Channel {
   const kind = String(row.kind ?? "generic_webhook") as Channel["kind"];
   return {
     id: String(row.id ?? `channel-${index}`),
-    name: String(row.name ?? `Channel ${index + 1}`),
+    name: String(row.name ?? tr(`Канал ${index + 1}`, `Channel ${index + 1}`)),
     kind: ["web_push", "telegram", "smtp", "generic_webhook"].includes(kind)
       ? kind
       : "generic_webhook",
@@ -1158,7 +1480,7 @@ function normalizeChannel(item: unknown, index: number): Channel {
     delivered24h: Number(row.delivered_24h ?? row.delivery_success_24h ?? 0),
     deliveryAttempts24h: Number(row.deliveries_24h ?? row.delivery_count ?? 0),
     successRate: asFiniteNumber(row.success_rate),
-    eligible: String(row.eligible ?? "All nodes"),
+    eligible: String(row.eligible ?? tr("Все узлы", "All nodes")),
     eligibleRegions: asStringList(row.eligible_regions),
     eligibleNodeIds: asStringList(row.eligible_node_ids),
     configuredFields: asStringList(row.configured_fields),
@@ -1170,7 +1492,7 @@ function normalizeRoute(item: unknown, index: number): NotificationRoute {
   const row = asRecord(item);
   return {
     id: String(row.id ?? `route-${index}`),
-    name: String(row.name ?? `Route ${index + 1}`),
+    name: String(row.name ?? tr(`Маршрут ${index + 1}`, `Route ${index + 1}`)),
     enabled: row.enabled !== false,
     priority: asFiniteNumber(row.priority) ?? 0,
     sourceFilter: asStringList(row.source_filter),
@@ -1193,7 +1515,7 @@ function normalizeDatasource(item: unknown, index: number): PrometheusDatasource
   const authType = String(row.auth_type ?? "unknown");
   return {
     id: String(row.id ?? `datasource-${index}`),
-    name: String(row.name ?? `Datasource ${index + 1}`),
+    name: String(row.name ?? tr(`Источник данных ${index + 1}`, `Datasource ${index + 1}`)),
     url: String(row.url ?? ""),
     nodeId: typeof row.node_id === "string" && row.node_id ? row.node_id : null,
     region: typeof row.region === "string" && row.region ? row.region : null,
@@ -1212,10 +1534,10 @@ function normalizeAudit(item: unknown, index: number): AuditItem {
   const tone = String(row.tone ?? "neutral");
   return {
     id: String(row.id ?? `audit-${index}`),
-    action: String(row.action ?? titleCase(actionCode)),
+    action: auditActionLabel(actionCode, row.action),
     actionCode,
-    detail: String(row.detail ?? row.description ?? "System operation"),
-    actor: String(row.actor ?? row.username ?? "system"),
+    detail: String(row.detail ?? row.description ?? tr("Системная операция", "System operation")),
+    actor: String(row.actor ?? row.username ?? tr("система", "system")),
     node: String(row.node_id ?? row.node ?? "local-node"),
     at: String(row.occurred_at ?? row.at ?? ""),
     tone: (["neutral", "success", "warning", "danger"].includes(tone)
@@ -1383,8 +1705,8 @@ function aggregateNodeHealth(nodes: ClusterNode[]): Health {
 function normalizeReachability(item: unknown): ReachabilityCell {
   const row = asRecord(item);
   return {
-    source: String(row.source ?? row.source_region ?? "Unknown"),
-    target: String(row.target ?? row.target_name ?? "Unknown"),
+    source: String(row.source ?? row.source_region ?? tr("Неизвестно", "Unknown")),
+    target: String(row.target ?? row.target_name ?? tr("Неизвестно", "Unknown")),
     success: Boolean(row.success ?? row.probe_success),
     latency:
       row.latency_ms == null && row.latency == null ? null : Number(row.latency_ms ?? row.latency),
@@ -1406,7 +1728,9 @@ function normalizeFixedMetricResult(payload: unknown): FixedMetricResult {
       const sample = asRecord(item);
       return {
         datasourceId: String(sample.datasource_id ?? ""),
-        datasourceName: String(sample.datasource_name ?? "Unknown datasource"),
+        datasourceName: String(
+          sample.datasource_name ?? tr("Неизвестный источник данных", "Unknown datasource"),
+        ),
         metric: asStringRecord(sample.metric),
         value: Number(sample.value ?? 0),
         timestamp: String(sample.timestamp ?? ""),
@@ -1416,9 +1740,11 @@ function normalizeFixedMetricResult(payload: unknown): FixedMetricResult {
       const error = asRecord(item);
       return {
         datasourceId: String(error.datasource_id ?? ""),
-        datasourceName: String(error.datasource_name ?? "Unknown datasource"),
+        datasourceName: String(
+          error.datasource_name ?? tr("Неизвестный источник данных", "Unknown datasource"),
+        ),
         code: String(error.code ?? "unknown"),
-        detail: String(error.detail ?? "No detail supplied"),
+        detail: String(error.detail ?? tr("Подробности не переданы", "No detail supplied")),
       };
     }),
   };
@@ -1643,10 +1969,17 @@ async function apiFetch(
   assertExpectedAuthContext();
   const method = (init.method ?? "GET").toUpperCase();
   if (demoModeActive && method !== "GET" && method !== "HEAD") {
-    throw new Error("Live mutations are disabled in demo mode.");
+    throw new Error(
+      tr("В демо-режиме изменения отключены.", "Live mutations are disabled in demo mode."),
+    );
   }
   if (offlineReadOnlyActive && method !== "GET" && method !== "HEAD") {
-    throw new Error("Live mutations are disabled while using an offline cached session.");
+    throw new Error(
+      tr(
+        "В офлайн-режиме изменения отключены.",
+        "Live mutations are disabled while using an offline cached session.",
+      ),
+    );
   }
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
@@ -1712,7 +2045,9 @@ async function apiFetch(
     }
   }
   if (primary) return primary;
-  throw primaryError instanceof Error ? primaryError : new Error("No API node responded");
+  throw primaryError instanceof Error
+    ? primaryError
+    : new Error(tr("Ни один узел API не ответил", "No API node responded"));
 }
 
 async function apiError(response: Response, fallback: string) {
@@ -1729,7 +2064,12 @@ async function apiError(response: Response, fallback: string) {
 async function mutationJson(path: string, init: RequestInit) {
   const response = await apiFetch(path, init);
   if (!response.ok)
-    throw new Error(await apiError(response, `Request failed (${response.status})`));
+    throw new Error(
+      await apiError(
+        response,
+        tr(`Запрос завершился ошибкой (${response.status})`, `Request failed (${response.status})`),
+      ),
+    );
   if (response.status === 204) return null;
   return (await response.json()) as unknown;
 }
@@ -1943,8 +2283,9 @@ function useAuthSession() {
   };
 }
 
-function useHubData(enabled: boolean, demo: boolean) {
+function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
   const queryClient = useQueryClient();
+  const localizedDataVersion = demo ? demoLanguage : "live";
   const [data, setData] = useState<HubData>(EMPTY_DATA);
   const [mode, setMode] = useState<DataMode>("live");
   const [online, setOnline] = useState(() =>
@@ -2005,7 +2346,8 @@ function useHubData(enabled: boolean, demo: boolean) {
         });
         if (!isCurrentRequest()) return;
         const successful = requests.filter((result) => result.status === "fulfilled").length;
-        if (successful === 0) throw new Error("No API node responded");
+        if (successful === 0)
+          throw new Error(tr("Ни один узел API не ответил", "No API node responded"));
         const cachedResponses = requests.filter(
           (result) => result.status === "fulfilled" && result.value.cached,
         ).length;
@@ -2086,12 +2428,20 @@ function useHubData(enabled: boolean, demo: boolean) {
               const row = asRecord(item);
               return {
                 id: String(row.id ?? `device-${index}`),
-                name: String(row.device_name ?? row.name ?? `Device ${index + 1}`),
-                platform: String(row.platform ?? row.user_agent ?? "Browser session"),
+                name: String(
+                  row.device_name ??
+                    row.name ??
+                    tr(`Устройство ${index + 1}`, `Device ${index + 1}`),
+                ),
+                platform: String(
+                  row.platform ?? row.user_agent ?? tr("Сессия браузера", "Browser session"),
+                ),
                 current: Boolean(row.current ?? row.is_current),
                 push: Boolean(row.push_enabled ?? row.push ?? false),
                 lastUsed: String(row.last_used_at ?? row.last_used ?? ""),
-                location: String(row.location ?? "Unknown location"),
+                location: String(
+                  row.location ?? tr("Местоположение неизвестно", "Unknown location"),
+                ),
               };
             });
           }
@@ -2122,9 +2472,11 @@ function useHubData(enabled: boolean, demo: boolean) {
                 const row = asRecord(item);
                 return {
                   datasourceId: String(row.datasource_id ?? ""),
-                  datasourceName: String(row.datasource_name ?? "Unknown datasource"),
+                  datasourceName: String(
+                    row.datasource_name ?? tr("Неизвестный источник данных", "Unknown datasource"),
+                  ),
                   code: String(row.code ?? "unknown"),
-                  detail: String(row.detail ?? "No detail supplied"),
+                  detail: String(row.detail ?? tr("Подробности не переданы", "No detail supplied")),
                 };
               }),
             };
@@ -2195,12 +2547,20 @@ function useHubData(enabled: boolean, demo: boolean) {
         if (cachedResponses > 0 || !navigator.onLine) {
           setMode("cached");
           setError(
-            "The live API is unavailable for some requests. Showing verified on-device data.",
+            tr(
+              "Часть запросов к API недоступна. Показаны подтверждённые данные с устройства.",
+              "The live API is unavailable for some requests. Showing verified on-device data.",
+            ),
           );
         } else {
           setMode("live");
           setError(
-            successful < requests.length ? "Some cluster data is temporarily unavailable." : null,
+            successful < requests.length
+              ? tr(
+                  "Часть данных кластера временно недоступна.",
+                  "Some cluster data is temporarily unavailable.",
+                )
+              : null,
           );
         }
       } catch {
@@ -2221,14 +2581,26 @@ function useHubData(enabled: boolean, demo: boolean) {
         if (snapshot) {
           setError(
             navigator.onLine
-              ? "API nodes are unavailable. Showing the last verified operational snapshot."
-              : "You are offline. Showing the last verified on-device snapshot.",
+              ? tr(
+                  "Узлы API недоступны. Показан последний подтверждённый снимок.",
+                  "API nodes are unavailable. Showing the last verified operational snapshot.",
+                )
+              : tr(
+                  "Нет подключения. Показан последний подтверждённый снимок с устройства.",
+                  "You are offline. Showing the last verified on-device snapshot.",
+                ),
           );
         } else {
           setError(
             navigator.onLine
-              ? "API nodes are unavailable. No verified operational data is available."
-              : "You are offline and no verified on-device snapshot is available.",
+              ? tr(
+                  "Узлы API недоступны, подтверждённых данных нет.",
+                  "API nodes are unavailable. No verified operational data is available.",
+                )
+              : tr(
+                  "Нет подключения и сохранённого подтверждённого снимка.",
+                  "You are offline and no verified on-device snapshot is available.",
+                ),
           );
         }
       } finally {
@@ -2330,7 +2702,13 @@ function useHubData(enabled: boolean, demo: boolean) {
         return next;
       });
     } catch {
-      if (isCurrentRequest()) setAuditLoadError("Could not load older audit events. Try again.");
+      if (isCurrentRequest())
+        setAuditLoadError(
+          tr(
+            "Не удалось загрузить старые события. Повторите.",
+            "Could not load older audit events. Try again.",
+          ),
+        );
     } finally {
       window.clearTimeout(timer);
       if (isCurrentRequest()) {
@@ -2350,9 +2728,14 @@ function useHubData(enabled: boolean, demo: boolean) {
       verifiedData.current = null;
       verifiedPartition.current = null;
       const transition = window.setTimeout(() => {
-        setData(DEMO_DATA);
+        setData(createDemoData());
         setMode("demo");
-        setError("Preview data only. No live API session is active.");
+        setError(
+          tr(
+            "Показаны демонстрационные данные. Активной сессии API нет.",
+            "Preview data only. No live API session is active.",
+          ),
+        );
         setRefreshing(false);
         setAuditLoadingMore(false);
         setAuditLoadError(null);
@@ -2418,8 +2801,14 @@ function useHubData(enabled: boolean, demo: boolean) {
       });
       setError(
         verifiedData.current
-          ? "You are offline. Showing the last verified on-device snapshot."
-          : "You are offline and no verified on-device snapshot is available.",
+          ? tr(
+              "Нет подключения. Показан последний подтверждённый снимок с устройства.",
+              "You are offline. Showing the last verified on-device snapshot.",
+            )
+          : tr(
+              "Нет подключения и сохранённого подтверждённого снимка.",
+              "You are offline and no verified on-device snapshot is available.",
+            ),
       );
     };
     window.addEventListener("online", onOnline);
@@ -2434,7 +2823,7 @@ function useHubData(enabled: boolean, demo: boolean) {
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
     };
-  }, [demo, enabled, refresh]);
+  }, [demo, enabled, localizedDataVersion, refresh]);
 
   useEffect(() => {
     if (!enabled || demo || !online) return;
@@ -2577,14 +2966,16 @@ function StatusDot({ health = "unknown" }: { health?: Health }) {
 }
 
 function SeverityBadge({ severity }: { severity: Severity }) {
-  return <span className={`severity-badge severity-badge--${severity}`}>{severity}</span>;
+  return (
+    <span className={`severity-badge severity-badge--${severity}`}>{severityLabel(severity)}</span>
+  );
 }
 
 function IncidentStatusBadge({ status }: { status: IncidentStatus }) {
   return (
     <span className={`incident-status incident-status--${status}`}>
       <span aria-hidden="true" />
-      {status}
+      {incidentStatusLabel(status)}
     </span>
   );
 }
@@ -2675,8 +3066,30 @@ function Brand() {
       </span>
       <span>
         <b>{appName}</b>
-        <small>distributed ops</small>
+        <small>{tr("центр мониторинга", "distributed ops")}</small>
       </span>
+    </div>
+  );
+}
+
+function LanguageSwitch({ className = "" }: { className?: string }) {
+  const { language, setLanguage } = useContext(LanguageContext);
+  return (
+    <div
+      className={`language-switch ${className}`}
+      aria-label={tr("Язык интерфейса", "Interface language")}
+    >
+      {(["ru", "en"] as const).map((item) => (
+        <button
+          key={item}
+          type="button"
+          className={language === item ? "active" : ""}
+          aria-pressed={language === item}
+          onClick={() => setLanguage(item)}
+        >
+          {item.toUpperCase()}
+        </button>
+      ))}
     </div>
   );
 }
@@ -2691,7 +3104,9 @@ function AuthLoading() {
           <i />
           <i />
         </span>
-        <small>Contacting the nearest API node…</small>
+        <small>
+          {tr("Подключаемся к ближайшему узлу API…", "Contacting the nearest API node…")}
+        </small>
       </div>
     </div>
   );
@@ -2716,7 +3131,7 @@ function AuthGate({
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (mode === "bootstrap" && password !== confirmPassword) {
-      setError("Passwords do not match.");
+      setError(tr("Пароли не совпадают.", "Passwords do not match."));
       return;
     }
     setBusy(true);
@@ -2726,12 +3141,12 @@ function AuthGate({
         method: "POST",
         body: JSON.stringify(
           mode === "login"
-            ? { username, password, device_name: currentPushDeviceName() }
+            ? { username, password, device_name: currentPushDeviceName(currentUiLanguage()) }
             : {
                 bootstrap_token: bootstrapToken,
                 username,
                 password,
-                device_name: currentPushDeviceName(),
+                device_name: currentPushDeviceName(currentUiLanguage()),
               },
         ),
       });
@@ -2743,32 +3158,42 @@ function AuthGate({
             body.detail ??
               body.message ??
               (response.status === 401
-                ? "Username or password is incorrect."
-                : "Authentication failed."),
+                ? tr("Неверное имя пользователя или пароль.", "Username or password is incorrect.")
+                : tr("Не удалось войти.", "Authentication failed.")),
           ),
         );
       }
       onAuthenticated(payload, asRecord(asRecord(payload).user));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Authentication failed.");
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось войти.", "Authentication failed."),
+      );
     } finally {
       setBusy(false);
     }
   };
   return (
     <div className="auth-screen">
+      <LanguageSwitch className="auth-language-switch" />
       <div className="auth-grid" aria-hidden="true" />
       <section className="auth-story">
         <Brand />
         <div className="auth-story__copy">
-          <span className="eyebrow">Distributed operations</span>
+          <span className="eyebrow">
+            {tr("Распределённый мониторинг", "Distributed operations")}
+          </span>
           <h1>
-            Every node stays useful.
+            {tr("Каждый узел работает автономно.", "Every node stays useful.")}
             <br />
-            <em>Every event survives.</em>
+            <em>{tr("Ни одно событие не потеряется.", "Every event survives.")}</em>
           </h1>
           <p>
-            Ingest locally, converge globally, and keep delivering alerts when a region disappears.
+            {tr(
+              "Принимайте события локально, синхронизируйте их между регионами и получайте оповещения даже при потере связи.",
+              "Ingest locally, converge globally, and keep delivering alerts when a region disappears.",
+            )}
           </p>
         </div>
         <div className="auth-topology">
@@ -2776,16 +3201,16 @@ function AuthGate({
           <span className="auth-topology__line auth-topology__line--2" />
           <span className="auth-topology__line auth-topology__line--3" />
           {[
-            { code: "A", label: "Peer region" },
-            { code: "B", label: "Peer region" },
-            { code: "C", label: "Peer region" },
+            { code: "A", label: tr("Региональный узел", "Peer region") },
+            { code: "B", label: tr("Региональный узел", "Peer region") },
+            { code: "C", label: tr("Региональный узел", "Peer region") },
           ].map((node, index) => (
             <div key={node.code} className={`auth-node auth-node--${index + 1}`}>
               <span>{node.code}</span>
               <b>{node.label}</b>
               <small>
                 <StatusDot health="unknown" />
-                example node
+                {tr("пример узла", "example node")}
               </small>
             </div>
           ))}
@@ -2795,21 +3220,21 @@ function AuthGate({
               <i />
               <i />
             </span>
-            <small>example topology</small>
+            <small>{tr("пример топологии", "example topology")}</small>
           </div>
         </div>
         <div className="auth-story__foot">
           <span>
             <Icon symbol="◇" />
-            Self-hosted
+            {tr("На своих серверах", "Self-hosted")}
           </span>
           <span>
             <Icon symbol="⇄" />
-            Local-first
+            {tr("Сначала локально", "Local-first")}
           </span>
           <span>
             <Icon symbol="◉" />
-            Push ready
+            {tr("Готово к Push", "Push ready")}
           </span>
         </div>
       </section>
@@ -2819,13 +3244,25 @@ function AuthGate({
         </div>
         <div className="auth-card">
           <span className="eyebrow">
-            {mode === "login" ? "Operator access" : "First node setup"}
+            {mode === "login"
+              ? tr("Доступ оператора", "Operator access")
+              : tr("Настройка первого узла", "First node setup")}
           </span>
-          <h2>{mode === "login" ? "Welcome back" : "Bootstrap the cluster"}</h2>
+          <h2>
+            {mode === "login"
+              ? tr("Вход в систему", "Welcome back")
+              : tr("Запуск кластера", "Bootstrap the cluster")}
+          </h2>
           <p>
             {mode === "login"
-              ? "Sign in to view the live incident ledger and manage this cluster."
-              : "Use the one-time token stored on the server to create the first administrator."}
+              ? tr(
+                  "Войдите, чтобы просматривать инциденты и управлять кластером.",
+                  "Sign in to view the live incident ledger and manage this cluster.",
+                )
+              : tr(
+                  "Используйте одноразовый токен с сервера, чтобы создать первого администратора.",
+                  "Use the one-time token stored on the server to create the first administrator.",
+                )}
           </p>
           <div className="auth-tabs">
             <button
@@ -2836,7 +3273,7 @@ function AuthGate({
                 setError(null);
               }}
             >
-              Sign in
+              {tr("Войти", "Sign in")}
             </button>
             <button
               className={mode === "bootstrap" ? "active" : ""}
@@ -2846,24 +3283,24 @@ function AuthGate({
                 setError(null);
               }}
             >
-              First run
+              {tr("Первый запуск", "First run")}
             </button>
           </div>
           <form onSubmit={submit}>
             {mode === "bootstrap" && (
               <label>
-                <span>Bootstrap token</span>
+                <span>{tr("Токен первичной настройки", "Bootstrap token")}</span>
                 <input
                   value={bootstrapToken}
                   onChange={(event) => setBootstrapToken(event.target.value)}
                   autoComplete="off"
-                  placeholder="Paste token from the server"
+                  placeholder={tr("Вставьте токен с сервера", "Paste token from the server")}
                   required
                 />
               </label>
             )}
             <label>
-              <span>Username</span>
+              <span>{tr("Имя пользователя", "Username")}</span>
               <input
                 value={username}
                 onChange={(event) => setUsername(event.target.value)}
@@ -2873,20 +3310,20 @@ function AuthGate({
               />
             </label>
             <label>
-              <span>Password</span>
+              <span>{tr("Пароль", "Password")}</span>
               <input
                 type="password"
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
                 autoComplete={mode === "login" ? "current-password" : "new-password"}
-                placeholder="Enter your password"
+                placeholder={tr("Введите пароль", "Enter your password")}
                 required
                 minLength={mode === "bootstrap" ? 12 : 8}
               />
             </label>
             {mode === "bootstrap" && (
               <label>
-                <span>Confirm password</span>
+                <span>{tr("Повторите пароль", "Confirm password")}</span>
                 <input
                   type="password"
                   value={confirmPassword}
@@ -2904,20 +3341,27 @@ function AuthGate({
               </div>
             )}
             <button className="button button--primary auth-submit" disabled={busy}>
-              {busy ? "Authenticating…" : mode === "login" ? "Sign in" : "Create administrator"}
+              {busy
+                ? tr("Входим…", "Authenticating…")
+                : mode === "login"
+                  ? tr("Войти", "Sign in")
+                  : tr("Создать администратора", "Create administrator")}
               <Icon symbol="→" />
             </button>
           </form>
           <div className="auth-demo">
-            <span>Preview without a live API</span>
+            <span>{tr("Посмотреть без подключения к API", "Preview without a live API")}</span>
             <button onClick={onDemo}>
-              Open demo snapshot <Icon symbol="→" />
+              {tr("Открыть демо", "Open demo snapshot")} <Icon symbol="→" />
             </button>
           </div>
         </div>
         <p className="auth-security">
           <Icon symbol="◇" />
-          Access tokens stay in memory. Refresh sessions use a secure HttpOnly cookie.
+          {tr(
+            "Токены доступа хранятся только в памяти. Сессия обновляется через защищённый HttpOnly cookie.",
+            "Access tokens stay in memory. Refresh sessions use a secure HttpOnly cookie.",
+          )}
         </p>
       </section>
     </div>
@@ -2954,13 +3398,17 @@ function Sidebar({
         <button
           className="icon-button sidebar__collapse"
           onClick={onCollapse}
-          aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
+          aria-label={
+            collapsed
+              ? tr("Развернуть навигацию", "Expand navigation")
+              : tr("Свернуть навигацию", "Collapse navigation")
+          }
         >
           <Icon symbol={collapsed ? "›" : "‹"} />
         </button>
       </div>
-      <nav className="sidebar__nav" aria-label="Primary navigation">
-        <span className="sidebar__section-label">Operations</span>
+      <nav className="sidebar__nav" aria-label={tr("Основная навигация", "Primary navigation")}>
+        <span className="sidebar__section-label">{tr("Мониторинг", "Operations")}</span>
         {NAV_ITEMS.slice(0, 5).map((item) => (
           <button
             key={item.id}
@@ -2975,7 +3423,7 @@ function Sidebar({
             {item.id === "incidents" && <em>{activeIncidents}</em>}
           </button>
         ))}
-        <span className="sidebar__section-label">Manage</span>
+        <span className="sidebar__section-label">{tr("Управление", "Manage")}</span>
         {NAV_ITEMS.slice(5).map((item) => (
           <button
             key={item.id}
@@ -2996,18 +3444,29 @@ function Sidebar({
             <i />
           </span>
           <span>
-            <b>{nodes.length ? `${nodes.length} nodes` : "No verified nodes"}</b>
+            <b>
+              {nodes.length
+                ? currentUiLanguage() === "ru"
+                  ? `${nodes.length} узл.`
+                  : `${nodes.length} nodes`
+                : tr("Нет подтверждённых узлов", "No verified nodes")}
+            </b>
             <small>
               {nodes.length
-                ? `${healthyNodes} healthy · ${impairedNodes} impaired · ${unknownNodes} unknown`
-                : "Waiting for live data"}
+                ? currentUiLanguage() === "ru"
+                  ? `${healthyNodes} работают · ${impairedNodes} с проблемами · ${unknownNodes} без данных`
+                  : `${healthyNodes} healthy · ${impairedNodes} impaired · ${unknownNodes} unknown`
+                : tr("Ожидаем данные", "Waiting for live data")}
             </small>
           </span>
         </div>
-        <div className="sidebar__profile" aria-label="Signed-in account">
+        <div
+          className="sidebar__profile"
+          aria-label={tr("Текущая учётная запись", "Signed-in account")}
+        >
           <span className="avatar">OP</span>
           <span>
-            <b>Operator</b>
+            <b>{tr("Оператор", "Operator")}</b>
             <small>{operator}</small>
           </span>
         </div>
@@ -3027,7 +3486,7 @@ function MobileNav({
 }) {
   const items = [NAV_ITEMS[0], NAV_ITEMS[1], NAV_ITEMS[2], NAV_ITEMS[6]];
   return (
-    <nav className="mobile-nav" aria-label="Mobile navigation">
+    <nav className="mobile-nav" aria-label={tr("Мобильная навигация", "Mobile navigation")}>
       {items.map((item) => (
         <button
           key={item.id}
@@ -3037,12 +3496,12 @@ function MobileNav({
           onClick={() => navigate(item.path)}
         >
           <Icon symbol={item.icon} />
-          <span>{item.id === "reachability" ? "Reach" : item.label}</span>
+          <span>{item.label}</span>
         </button>
       ))}
       <button onClick={onMore}>
         <Icon symbol="•••" />
-        <span>More</span>
+        <span>{tr("Ещё", "More")}</span>
       </button>
     </nav>
   );
@@ -3065,11 +3524,15 @@ function MobileDrawer({
       <aside
         className="mobile-drawer"
         onMouseDown={(event) => event.stopPropagation()}
-        aria-label="All navigation"
+        aria-label={tr("Вся навигация", "All navigation")}
       >
         <div className="mobile-drawer__head">
           <Brand />
-          <button className="icon-button" onClick={onClose} aria-label="Close menu">
+          <button
+            className="icon-button"
+            onClick={onClose}
+            aria-label={tr("Закрыть меню", "Close menu")}
+          >
             <Icon symbol="×" />
           </button>
         </div>
@@ -3093,10 +3556,11 @@ function MobileDrawer({
           ))}
         </nav>
         <div className="mobile-drawer__foot">
+          <LanguageSwitch className="drawer-language-switch" />
           <span className="avatar">OP</span>
           <span>
-            <b>Operator</b>
-            <small>Signed-in session</small>
+            <b>{tr("Оператор", "Operator")}</b>
+            <small>{tr("Активная сессия", "Signed-in session")}</small>
           </span>
         </div>
       </aside>
@@ -3122,11 +3586,17 @@ function ConnectionBanner({
       role="status"
     >
       <Icon symbol={online ? "◇" : "⊘"} />
-      <span>
-        <b>{online ? (mode === "demo" ? "Demo snapshot" : "Partial data") : "Offline mode"}</b>
-        {error ?? "Live API data is not available."}
+      <span className="connection-banner__content">
+        <b>
+          {online
+            ? mode === "demo"
+              ? tr("Демонстрационный режим", "Demo snapshot")
+              : tr("Часть данных недоступна", "Partial data")
+            : tr("Нет подключения", "Offline mode")}
+        </b>
+        {error ?? tr("Данные API сейчас недоступны.", "Live API data is not available.")}
       </span>
-      {online && <button onClick={onRetry}>Retry</button>}
+      {online && <button onClick={onRetry}>{tr("Повторить", "Retry")}</button>}
     </div>
   );
 }
@@ -3167,64 +3637,78 @@ function AppHeader({
       : clusterHealth;
   const syncLabel =
     syncHealth === "healthy" && worstLag != null
-      ? `${worstLag.toFixed(1)}s`
+      ? `${worstLag.toFixed(1)}${tr(" сек.", "s")}`
       : syncHealth === "unknown"
-        ? "telemetry unavailable"
-        : syncHealth;
+        ? tr("нет телеметрии", "telemetry unavailable")
+        : healthLabel(syncHealth);
   return (
     <header className="app-header">
       <div className="app-header__mobile-brand">
-        <button className="icon-button" onClick={onMenu} aria-label="Open menu">
+        <button
+          className="icon-button"
+          onClick={onMenu}
+          aria-label={tr("Открыть меню", "Open menu")}
+        >
           <Icon symbol="≡" />
         </button>
         <Brand />
       </div>
-      <div className="node-chip" title="Latest cluster inventory">
+      <div
+        className="node-chip"
+        title={tr("Последнее состояние кластера", "Latest cluster inventory")}
+      >
         <StatusDot health={online ? (nodes.length ? clusterHealth : "paused") : "offline"} />
         <span>
-          <small>Cluster inventory</small>
-          <b>{nodes.length ? `${nodes.length} known node(s)` : "No node records"}</b>
+          <small>{tr("Состав кластера", "Cluster inventory")}</small>
+          <b>
+            {nodes.length
+              ? currentUiLanguage() === "ru"
+                ? `${nodes.length} узл.`
+                : `${nodes.length} known node(s)`
+              : tr("Нет данных об узлах", "No node records")}
+          </b>
         </span>
       </div>
       <div className="app-header__status">
         <span className="header-signal">
           <StatusDot health={syncHealth} />
           <span>
-            Sync <b>{syncLabel}</b>
+            {tr("Синхронизация", "Sync")} <b>{syncLabel}</b>
           </span>
         </span>
         <span className="header-signal">
           <StatusDot health={liveUpdates ? "healthy" : mode === "live" ? "degraded" : "paused"} />
           <span>
             {liveUpdates
-              ? "Live"
+              ? tr("В реальном времени", "Live")
               : mode === "live"
-                ? "Polling"
+                ? tr("Опрос", "Polling")
                 : mode === "cached"
-                  ? "Cached"
-                  : "Demo"}
+                  ? tr("Из кэша", "Cached")
+                  : tr("Демо", "Demo")}
           </span>
         </span>
+        <LanguageSwitch className="header-language-switch" />
         <button
           className={`icon-button refresh-button ${refreshing ? "is-spinning" : ""}`}
           onClick={onRefresh}
-          aria-label="Refresh cluster data"
+          aria-label={tr("Обновить данные кластера", "Refresh cluster data")}
         >
           <Icon symbol="↻" />
         </button>
         <button className="button button--quiet notifications-button" onClick={onNotifications}>
           <Icon symbol="◉" />
-          <span>Notifications</span>
+          <span>{tr("Уведомления", "Notifications")}</span>
         </button>
         <button
           className="button button--quiet button--small"
           type="button"
           onClick={onLogout}
           disabled={logoutBusy}
-          aria-label="Log out of Alert Hub"
+          aria-label={tr("Выйти из Alert Hub", "Log out of Alert Hub")}
         >
           <Icon symbol="↪" />
-          <span>{logoutBusy ? "Logging out…" : "Log out"}</span>
+          <span>{logoutBusy ? tr("Выходим…", "Logging out…") : tr("Выйти", "Log out")}</span>
         </button>
       </div>
     </header>
@@ -3232,15 +3716,38 @@ function AppHeader({
 }
 
 export function AlertHubApp({ appName = "Alert Hub" }: { appName?: string }) {
+  const [language, setLanguageState] = useState<UiLanguage>(currentUiLanguage);
+  const setLanguage = useCallback((nextLanguage: UiLanguage) => {
+    document.documentElement.lang = nextLanguage;
+    try {
+      window.localStorage.setItem(LANGUAGE_STORAGE_KEY, nextLanguage);
+    } catch {
+      // The in-memory React state still keeps language switching functional.
+    }
+    setLanguageState(nextLanguage);
+  }, []);
+  useEffect(() => {
+    document.documentElement.lang = language;
+    const pageTitle = `${appName} — ${language === "ru" ? "консоль мониторинга" : "distributed operations console"}`;
+    document.title = pageTitle;
+    document
+      .querySelectorAll<HTMLMetaElement>('meta[property="og:title"], meta[name="twitter:title"]')
+      .forEach((meta) => {
+        meta.content = pageTitle;
+      });
+  }, [appName, language]);
   return (
-    <AppNameContext.Provider value={appName}>
-      <AlertHubRuntime />
-    </AppNameContext.Provider>
+    <LanguageContext.Provider value={{ language, setLanguage }}>
+      <AppNameContext.Provider value={appName}>
+        <AlertHubRuntime />
+      </AppNameContext.Provider>
+    </LanguageContext.Provider>
   );
 }
 
 function AlertHubRuntime() {
   const queryClient = useQueryClient();
+  const { language } = useContext(LanguageContext);
   const auth = useAuthSession();
   const {
     data,
@@ -3257,6 +3764,7 @@ function AlertHubRuntime() {
   } = useHubData(
     auth.state.status === "authenticated" || auth.state.status === "offline",
     auth.state.status === "demo",
+    language,
   );
   const { route, navigate } = useRoute();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -3402,7 +3910,7 @@ function AlertHubRuntime() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">
-        Skip to content
+        {tr("Перейти к содержимому", "Skip to content")}
       </a>
       <Sidebar
         route={route.id}
@@ -3415,8 +3923,8 @@ function AlertHubRuntime() {
           auth.state.status === "authenticated"
             ? String(auth.state.user.username ?? "operator")
             : auth.state.status === "offline"
-              ? "offline · read-only"
-              : "demo-preview"
+              ? tr("офлайн · только чтение", "offline · read-only")
+              : tr("демо-режим", "demo-preview")
         }
       />
       <div className="app-frame">
@@ -3505,8 +4013,12 @@ function KpiCard({
 function GrafanaLink({ url }: { url: string | null }) {
   if (!url) {
     return (
-      <span className="grafana-link grafana-link--missing" aria-label="Grafana not configured">
-        <Icon symbol="∿" /> Grafana not configured
+      <span
+        className="button button--quiet grafana-link grafana-link--missing"
+        aria-label={tr("Grafana не настроена", "Grafana not configured")}
+        aria-disabled="true"
+      >
+        <Icon symbol="∿" /> {tr("Grafana не настроена", "Grafana not configured")}
       </span>
     );
   }
@@ -3517,7 +4029,7 @@ function GrafanaLink({ url }: { url: string | null }) {
       target="_blank"
       rel="noopener noreferrer"
     >
-      <Icon symbol="∿" /> Open Grafana
+      <Icon symbol="∿" /> {tr("Открыть Grafana", "Open Grafana")}
     </a>
   );
 }
@@ -3532,16 +4044,23 @@ function MetricEvidenceValue({
   if (result.status === "not_configured") {
     return (
       <>
-        <strong>Not configured</strong>
-        <small>Add an enabled Prometheus datasource.</small>
+        <strong>{tr("Не настроено", "Not configured")}</strong>
+        <small>
+          {tr(
+            "Добавьте активный источник данных Prometheus.",
+            "Add an enabled Prometheus datasource.",
+          )}
+        </small>
       </>
     );
   }
   if (result.status === "unavailable" || result.status === "unknown") {
     return (
       <>
-        <strong>Unavailable</strong>
-        <small>No verified sample was returned.</small>
+        <strong>{tr("Недоступно", "Unavailable")}</strong>
+        <small>
+          {tr("Prometheus не вернул подтверждённых значений.", "No verified sample was returned.")}
+        </small>
       </>
     );
   }
@@ -3551,18 +4070,23 @@ function MetricEvidenceValue({
     <>
       <strong>
         {kind === "alerts" ? active : `${active}/${result.samples.length}`}
-        <span>{kind === "alerts" ? " firing" : " up"}</span>
+        <span>{kind === "alerts" ? tr(" активн.", " firing") : tr(" доступно", " up")}</span>
       </strong>
       <small>
         {kind === "alerts"
           ? active
-            ? "Prometheus reports active firing alerts."
-            : "No firing alert samples returned."
+            ? tr(
+                "Prometheus сообщает об активных тревогах.",
+                "Prometheus reports active firing alerts.",
+              )
+            : tr("Активных тревог не обнаружено.", "No firing alert samples returned.")
           : failed
-            ? `${failed} target${failed === 1 ? "" : "s"} down.`
+            ? currentUiLanguage() === "ru"
+              ? `${failed} целей недоступно.`
+              : `${failed} target${failed === 1 ? "" : "s"} down.`
             : result.samples.length
-              ? "All returned targets are up."
-              : "No target samples returned."}
+              ? tr("Все полученные цели доступны.", "All returned targets are up.")
+              : tr("Данные по целям не получены.", "No target samples returned.")}
       </small>
     </>
   );
@@ -3576,42 +4100,65 @@ function PrometheusEvidenceGrid({ data }: { data: HubData }) {
     <section className="prometheus-evidence" aria-labelledby="prometheus-evidence-title">
       <div className="prometheus-evidence__head">
         <span>
-          <span className="eyebrow">Server-owned PromQL</span>
-          <h2 id="prometheus-evidence-title">Prometheus operational evidence</h2>
+          <span className="eyebrow">
+            {tr("Запросы контролирует сервер", "Server-owned PromQL")}
+          </span>
+          <h2 id="prometheus-evidence-title">
+            {tr("Состояние по данным Prometheus", "Prometheus operational evidence")}
+          </h2>
         </span>
         <GrafanaLink url={data.summary.grafanaUrl} />
       </div>
       <div className="prometheus-evidence-grid">
-        <Panel eyebrow="probe_success" title="Regional reachability">
+        <Panel
+          eyebrow="probe_success"
+          title={tr("Доступность по регионам", "Regional reachability")}
+        >
           <div className="metric-evidence-value">
             <strong>
               {reachabilityConfigured && data.reachability.length
                 ? `${reachable}/${data.reachability.length}`
                 : reachabilityConfigured
-                  ? "No samples"
-                  : "Not configured"}
-              {reachabilityConfigured && data.reachability.length ? <span> reachable</span> : null}
+                  ? tr("Нет данных", "No samples")
+                  : tr("Не настроено", "Not configured")}
+              {reachabilityConfigured && data.reachability.length ? (
+                <span>{tr(" доступны", " reachable")}</span>
+              ) : null}
             </strong>
-            <small>{data.reachabilityMeta.detail || "No verified probe result returned."}</small>
+            <small>
+              {data.reachabilityMeta.detail ||
+                tr("Результаты проверок ещё не получены.", "No verified probe result returned.")}
+            </small>
           </div>
         </Panel>
-        <Panel eyebrow='ALERTS{alertstate="firing"}' title="Firing alerts">
+        <Panel
+          eyebrow='ALERTS{alertstate="firing"}'
+          title={tr("Активные тревоги", "Firing alerts")}
+        >
           <div className="metric-evidence-value">
             <MetricEvidenceValue result={data.fixedMetrics.firingAlerts} kind="alerts" />
           </div>
         </Panel>
-        <Panel eyebrow="up · key jobs" title="Prometheus / Alertmanager / Blackbox">
+        <Panel
+          eyebrow={tr("up · ключевые сервисы", "up · key jobs")}
+          title="Prometheus / Alertmanager / Blackbox"
+        >
           <div className="metric-evidence-value">
             <MetricEvidenceValue result={data.fixedMetrics.keyJobsUp} kind="jobs" />
           </div>
         </Panel>
-        <Panel eyebrow="up · Alert Hub jobs" title="Alert Hub sync / app health">
+        <Panel
+          eyebrow={tr("up · сервисы Alert Hub", "up · Alert Hub jobs")}
+          title={tr("Синхронизация и состояние Alert Hub", "Alert Hub sync / app health")}
+        >
           <div className="metric-evidence-value">
             <MetricEvidenceValue result={data.fixedMetrics.alertHubHealth} kind="health" />
             <small>
               {reportedLags.length
-                ? `Cluster projection max sync lag ${Math.max(...reportedLags).toFixed(1)}s.`
-                : "Cluster sync lag was not reported."}
+                ? currentUiLanguage() === "ru"
+                  ? `Максимальная задержка синхронизации: ${Math.max(...reportedLags).toFixed(1)} сек.`
+                  : `Cluster projection max sync lag ${Math.max(...reportedLags).toFixed(1)}s.`
+                : tr("Задержка синхронизации не передана.", "Cluster sync lag was not reported.")}
             </small>
           </div>
         </Panel>
@@ -3631,9 +4178,12 @@ function OverviewPage({
   navigate: (path: string) => void;
   onNotifications: () => void;
 }) {
-  const appName = useContext(AppNameContext);
   const active = data.incidents.filter((incident) => incident.status !== "resolved");
   const critical = active.filter((incident) => incident.severity === "critical");
+  const criticalWithoutOwner = critical.filter((incident) => incident.status === "open");
+  const oldestCritical = [...criticalWithoutOwner].sort(
+    (left, right) => Date.parse(left.startsAt) - Date.parse(right.startsAt),
+  )[0];
   const healthyNodes = data.nodes.filter((node) => node.health === "healthy").length;
   const unknownNodes = data.nodes.filter((node) => node.health === "unknown").length;
   const impairedNodes = data.nodes.filter((node) =>
@@ -3649,18 +4199,22 @@ function OverviewPage({
   return (
     <div className="page-stack overview-page">
       <PageHeading
-        eyebrow="Operational console"
-        title="System overview"
-        description="One operational view across every region, even when the network is not whole."
+        eyebrow={tr("Оперативная сводка", "Operational console")}
+        title={tr("Состояние системы", "System overview")}
+        description={
+          currentUiLanguage() === "ru"
+            ? `${data.sources.length} источн. · ${data.channels.filter((channel) => channel.enabled).length} активных каналов · ${data.nodes.length} узл. Данные собраны в одном месте, даже если часть сети недоступна.`
+            : `${data.sources.length} sources · ${data.channels.filter((channel) => channel.enabled).length} active channels · ${data.nodes.length} nodes. A single operational view, even when part of the network is unavailable.`
+        }
         actions={
           <>
             <button className="button button--quiet" onClick={onNotifications} disabled={readOnly}>
               <Icon symbol="◉" />
-              Enable alerts
+              {tr("Включить оповещения", "Enable alerts")}
             </button>
             <button className="button button--primary" onClick={() => navigate("/incidents")}>
               <Icon symbol="!" />
-              Open incidents
+              {tr("Открыть инциденты", "Open incidents")}
             </button>
           </>
         }
@@ -3668,30 +4222,48 @@ function OverviewPage({
 
       <div className="kpi-grid">
         <KpiCard
-          label="Firing now"
+          label={tr("Активны сейчас", "Firing now")}
           value={data.summary.open}
-          note={critical.length ? `${critical.length} critical` : "No critical alerts"}
+          note={
+            criticalWithoutOwner.length
+              ? currentUiLanguage() === "ru"
+                ? `${criticalWithoutOwner.length} критических без реакции · старейший ${formatRelative(oldestCritical.startsAt)}`
+                : `${criticalWithoutOwner.length} critical unacknowledged · oldest ${formatRelative(oldestCritical.startsAt)}`
+              : critical.length
+                ? currentUiLanguage() === "ru"
+                  ? `${critical.length} критических уже в работе`
+                  : `${critical.length} critical acknowledged`
+                : tr("Критических тревог нет", "No critical alerts")
+          }
           tone={critical.length ? "critical" : "success"}
           spark={readOnly ? [2, 2, 3, 2, 4, 3, data.summary.open] : []}
         />
         <KpiCard
-          label="Acknowledged"
+          label={tr("Приняты в работу", "Acknowledged")}
           value={data.summary.acknowledged}
-          note="From the incident ledger"
+          note={tr("По журналу инцидентов", "From the incident log")}
           tone={data.summary.acknowledged ? "warning" : "neutral"}
           spark={readOnly ? [0, 1, 1, 2, 1, 1, data.summary.acknowledged] : []}
         />
         <KpiCard
-          label="Cluster inventory"
-          value={data.nodes.length ? data.nodes.length : "Unknown"}
+          label={tr("Узлы кластера", "Cluster nodes")}
+          value={data.nodes.length ? data.nodes.length : tr("Нет данных", "No data")}
           note={
             !data.nodes.length
-              ? "No node records returned"
+              ? tr("Сведения об узлах не получены", "Node inventory was not returned")
               : unknownNodes
-                ? `${unknownNodes} status unknown`
+                ? currentUiLanguage() === "ru"
+                  ? `${unknownNodes} без актуального статуса`
+                  : `${unknownNodes} without a current status`
                 : healthyNodes === data.nodes.length
-                  ? "All nodes healthy"
-                  : `${impairedNodes} needs attention`
+                  ? reportedLags.length
+                    ? currentUiLanguage() === "ru"
+                      ? `Все работают · макс. задержка ${Math.max(...reportedLags).toFixed(1)} сек.`
+                      : `All healthy · max lag ${Math.max(...reportedLags).toFixed(1)}s`
+                    : tr("Все узлы работают", "All nodes healthy")
+                  : currentUiLanguage() === "ru"
+                    ? `${impairedNodes} требуют внимания`
+                    : `${impairedNodes} need attention`
           }
           tone={
             !data.nodes.length || unknownNodes
@@ -3707,18 +4279,20 @@ function OverviewPage({
           }
         />
         <KpiCard
-          label="Delivery rate"
+          label={tr("Доставка уведомлений", "Delivery rate")}
           value={
             data.summary.deliveryRate == null
-              ? "Not measured"
+              ? tr("Нет данных", "No data")
               : `${data.summary.deliveryRate.toFixed(1)}%`
           }
           note={
             data.summary.deliveries24h == null
-              ? "Delivery metrics unavailable"
+              ? tr("Метрики доставки недоступны", "Delivery metrics unavailable")
               : data.summary.deliveries24h === 0
-                ? "No delivery attempts in 24h"
-                : `${data.summary.deliveries24h} attempts in 24h`
+                ? tr("За 24 часа попыток не было", "No attempts in the last 24 hours")
+                : currentUiLanguage() === "ru"
+                  ? `${data.summary.deliveries24h} попыток · в очереди ${data.summary.outboxPending ?? tr("нет данных", "no data")}`
+                  : `${data.summary.deliveries24h} attempts · ${data.summary.outboxPending ?? "no data"} queued`
           }
           tone={
             data.summary.deliveryRate == null
@@ -3740,11 +4314,11 @@ function OverviewPage({
       <div className="overview-grid">
         <Panel
           className="overview-incidents"
-          eyebrow="Needs attention"
-          title="Active incidents"
+          eyebrow={tr("Требуют внимания", "Needs attention")}
+          title={tr("Активные инциденты", "Active incidents")}
           action={
             <button className="text-button" onClick={() => navigate("/incidents")}>
-              View all <Icon symbol="→" />
+              {tr("Показать все", "View all")} <Icon symbol="→" />
             </button>
           }
         >
@@ -3780,19 +4354,22 @@ function OverviewPage({
           ) : (
             <EmptyState
               icon="✓"
-              title="No active incidents returned"
-              message="The current verified incident snapshot contains no active records."
+              title={tr("Активных инцидентов нет", "No active incidents")}
+              message={tr(
+                "В последнем подтверждённом снимке нет активных записей.",
+                "There are no active records in the latest verified snapshot.",
+              )}
             />
           )}
         </Panel>
 
         <Panel
           className="overview-cluster"
-          eyebrow="Peer health"
-          title="Cluster nodes"
+          eyebrow={tr("Состояние узлов", "Peer health")}
+          title={tr("Кластер", "Cluster nodes")}
           action={
             <button className="text-button" onClick={() => navigate("/cluster")}>
-              Details <Icon symbol="→" />
+              {tr("Подробнее", "Details")} <Icon symbol="→" />
             </button>
           }
         >
@@ -3807,14 +4384,18 @@ function OverviewPage({
                   </small>
                 </span>
                 <span className="node-row__metric">
-                  <small>Sync lag</small>
+                  <small>{tr("Задержка синхронизации", "Sync lag")}</small>
                   <b className={node.syncLag != null && node.syncLag > 10 ? "text-warning" : ""}>
-                    {node.syncLag == null ? "Unknown" : `${node.syncLag.toFixed(1)}s`}
+                    {node.syncLag == null
+                      ? tr("Нет данных", "No data")
+                      : currentUiLanguage() === "ru"
+                        ? `${node.syncLag.toFixed(1)} сек.`
+                        : `${node.syncLag.toFixed(1)}s`}
                   </b>
                 </span>
                 <span className="node-row__health">
                   <StatusDot health={node.health} />
-                  {titleCase(node.health)}
+                  {healthLabel(node.health)}
                 </span>
               </div>
             ))}
@@ -3825,16 +4406,20 @@ function OverviewPage({
               <b>
                 {reportedQueues.length
                   ? reportedQueues.reduce((sum, queue) => sum + queue, 0)
-                  : "Unknown"}
+                  : tr("Нет данных", "No data")}
               </b>{" "}
-              queued
+              {tr("в очереди", "queued")}
             </span>
             <span>
               <Icon symbol="⌖" />
               <b>
-                {reportedLags.length ? `${Math.max(...reportedLags).toFixed(1)}s` : "Unknown"}
+                {reportedLags.length
+                  ? currentUiLanguage() === "ru"
+                    ? `${Math.max(...reportedLags).toFixed(1)} сек.`
+                    : `${Math.max(...reportedLags).toFixed(1)}s`
+                  : tr("Нет данных", "No data")}
               </b>{" "}
-              max lag
+              {tr("макс. задержка", "max lag")}
             </span>
           </div>
         </Panel>
@@ -3843,10 +4428,13 @@ function OverviewPage({
       <div className="overview-grid overview-grid--lower">
         <Panel
           eyebrow="Prometheus · probe_success"
-          title="Regional reachability"
+          title={tr("Доступность по регионам", "Regional reachability")}
           action={
             <button className="text-button" onClick={() => navigate("/reachability")}>
-              {reachRate == null ? "No samples" : `${reachRate}% reachable`} <Icon symbol="→" />
+              {reachRate == null
+                ? tr("Нет данных", "No data")
+                : `${reachRate}% ${tr("доступно", "reachable")}`}{" "}
+              <Icon symbol="→" />
             </button>
           }
         >
@@ -3854,21 +4442,23 @@ function OverviewPage({
           <div className="panel-footnote">
             <span>
               <i className="legend-dot legend-dot--healthy" />
-              Reachable
+              {tr("Доступно", "Reachable")}
             </span>
             <span>
               <i className="legend-dot legend-dot--failed" />
-              Failed
+              {tr("Недоступно", "Failed")}
             </span>
-            <span>Updated {formatRelative(data.reachability[0]?.checkedAt ?? "")}</span>
+            <span>
+              {tr("Обновлено", "Updated")} {formatRelative(data.reachability[0]?.checkedAt ?? "")}
+            </span>
           </div>
         </Panel>
         <Panel
-          eyebrow="Last 24 hours"
-          title="Delivery channels"
+          eyebrow={tr("За последние 24 часа", "Last 24 hours")}
+          title={tr("Каналы доставки", "Delivery channels")}
           action={
             <button className="text-button" onClick={() => navigate("/channels")}>
-              Manage <Icon symbol="→" />
+              {tr("Управлять", "Manage")} <Icon symbol="→" />
             </button>
           }
         >
@@ -3882,9 +4472,9 @@ function OverviewPage({
                   <span>
                     <b>{channel.name}</b>
                     <small>
-                      {channel.delivered24h} delivered ·{" "}
+                      {channel.delivered24h} {tr("доставлено", "delivered")} ·{" "}
                       {channel.successRate == null
-                        ? "not exercised"
+                        ? tr("не проверено", "not exercised")
                         : `${channel.successRate.toFixed(1)}%`}
                     </small>
                   </span>
@@ -3897,20 +4487,17 @@ function OverviewPage({
               <Icon symbol="◉" />
             </span>
             <span>
-              <b>Make this device an alert endpoint</b>
-              <small>Enable Web Push for failover-ready notifications.</small>
+              <b>{tr("Получать оповещения на этом устройстве", "Receive alerts on this device")}</b>
+              <small>
+                {tr(
+                  "Включите Web Push — доставка продолжится при переключении узлов.",
+                  "Enable Web Push so delivery continues across node failover.",
+                )}
+              </small>
             </span>
             <Icon symbol="→" />
           </button>
         </Panel>
-      </div>
-
-      <div className="overview-footer">
-        <span>
-          <StatusDot health={data.sources.length ? "unknown" : "paused"} /> {appName} returned{" "}
-          {data.sources.length} configured source{data.sources.length === 1 ? "" : "s"} on this
-          read.
-        </span>
       </div>
     </div>
   );
@@ -3949,61 +4536,71 @@ function IncidentsPage({
   return (
     <div className="page-stack incidents-page">
       <PageHeading
-        eyebrow="Incident ledger"
-        title="Incidents"
-        description="A convergent history of every firing, operator action, and delivery outcome."
+        eyebrow={tr("Единый журнал", "Unified journal")}
+        title={tr("Инциденты", "Incidents")}
+        description={tr(
+          "Вся история тревог, действий операторов и доставки уведомлений с каждого узла.",
+          "Alert history, operator actions, and delivery evidence from every node.",
+        )}
       />
-      <div className="incident-tabs" role="tablist" aria-label="Incident status">
+      <div
+        className="incident-tabs"
+        role="tablist"
+        aria-label={tr("Статус инцидента", "Incident status")}
+      >
         <button className={status === "active" ? "active" : ""} onClick={() => setStatus("active")}>
-          Active <span>{counts.active}</span>
+          {tr("Активные", "Active")} <span>{counts.active}</span>
         </button>
         <button
           className={status === "acknowledged" ? "active" : ""}
           onClick={() => setStatus("acknowledged")}
         >
-          Acknowledged <span>{counts.acknowledged}</span>
+          {tr("В работе", "Acknowledged")} <span>{counts.acknowledged}</span>
         </button>
         <button
           className={status === "resolved" ? "active" : ""}
           onClick={() => setStatus("resolved")}
         >
-          Resolved <span>{counts.resolved}</span>
+          {tr("Решённые", "Resolved")} <span>{counts.resolved}</span>
         </button>
         <button className={status === "all" ? "active" : ""} onClick={() => setStatus("all")}>
-          All <span>{incidents.length}</span>
+          {tr("Все", "All")} <span>{incidents.length}</span>
         </button>
       </div>
       <Panel className="incident-table-panel">
         <div className="filter-bar">
           <label className="search-field">
             <Icon symbol="⌕" />
-            <span className="sr-only">Search incidents</span>
+            <span className="sr-only">{tr("Поиск инцидентов", "Search incidents")}</span>
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search title, source, label…"
+              placeholder={tr("Название, источник или метка…", "Title, source, or label…")}
             />
             {query && (
-              <button onClick={() => setQuery("")} aria-label="Clear search">
+              <button
+                onClick={() => setQuery("")}
+                aria-label={tr("Очистить поиск", "Clear search")}
+              >
                 ×
               </button>
             )}
           </label>
           <label className="select-field">
-            <span>Severity</span>
+            <span>{tr("Критичность", "Severity")}</span>
             <select
               value={severity}
               onChange={(event) => setSeverity(event.target.value as "all" | Severity)}
             >
-              <option value="all">All severities</option>
-              <option value="critical">Critical</option>
-              <option value="warning">Warning</option>
-              <option value="info">Info</option>
-              <option value="unknown">Unknown</option>
+              <option value="all">{tr("Любая", "Any")}</option>
+              <option value="critical">{tr("Критическая", "Critical")}</option>
+              <option value="warning">{tr("Предупреждение", "Warning")}</option>
+              <option value="info">{tr("Информация", "Info")}</option>
+              <option value="unknown">{tr("Неизвестно", "Unknown")}</option>
             </select>
           </label>
           <span className="filter-result">
-            {filtered.length} result{filtered.length === 1 ? "" : "s"}
+            {tr("Найдено", "Found")}: {filtered.length}
           </span>
         </div>
         {filtered.length ? (
@@ -4011,13 +4608,13 @@ function IncidentsPage({
             <table className="incidents-table">
               <thead>
                 <tr>
-                  <th>Incident</th>
-                  <th>Status</th>
-                  <th>Source / region</th>
-                  <th>Target</th>
-                  <th>Last event</th>
+                  <th>{tr("Инцидент", "Incident")}</th>
+                  <th>{tr("Статус", "Status")}</th>
+                  <th>{tr("Источник / регион", "Source / region")}</th>
+                  <th>{tr("Цель", "Target")}</th>
+                  <th>{tr("Последнее событие", "Last event")}</th>
                   <th>
-                    <span className="sr-only">Open</span>
+                    <span className="sr-only">{tr("Открыть", "Open")}</span>
                   </th>
                 </tr>
               </thead>
@@ -4049,7 +4646,10 @@ function IncidentsPage({
                       <small>{formatDate(incident.lastEventAt)}</small>
                     </td>
                     <td>
-                      <button className="row-open" aria-label={`Open ${incident.title}`}>
+                      <button
+                        className="row-open"
+                        aria-label={`${tr("Открыть", "Open")} ${incident.title}`}
+                      >
                         <Icon symbol="›" />
                       </button>
                     </td>
@@ -4061,8 +4661,11 @@ function IncidentsPage({
         ) : (
           <EmptyState
             icon="⌕"
-            title="No incidents match"
-            message="Try clearing a filter or searching for a different label."
+            title={tr("Ничего не найдено", "No incidents found")}
+            message={tr(
+              "Сбросьте фильтры или измените поисковый запрос.",
+              "Clear the filters or adjust your search query.",
+            )}
             action={
               <button
                 className="button button--quiet"
@@ -4072,7 +4675,7 @@ function IncidentsPage({
                   setSeverity("all");
                 }}
               >
-                Clear filters
+                {tr("Сбросить фильтры", "Reset filters")}
               </button>
             }
           />
@@ -4129,11 +4732,14 @@ function IncidentDetailPage({
     return (
       <EmptyState
         icon="!"
-        title="Incident not found"
-        message="It may have been removed from this local snapshot."
+        title={tr("Инцидент не найден", "Incident not found")}
+        message={tr(
+          "Возможно, его нет в текущем локальном снимке.",
+          "It may not be present in the current local snapshot.",
+        )}
         action={
           <button className="button button--quiet" onClick={() => navigate("/incidents")}>
-            Back to incidents
+            {tr("Вернуться к инцидентам", "Back to incidents")}
           </button>
         }
       />
@@ -4151,7 +4757,11 @@ function IncidentDetailPage({
       const detail = await getJson(`/incidents/${encodeURIComponent(incident.id)}`);
       applyDetail(detail.payload);
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Incident action failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось изменить инцидент.", "Unable to update the incident."),
+      );
     } finally {
       setBusy(null);
     }
@@ -4172,7 +4782,11 @@ function IncidentDetailPage({
       setComment("");
       setCommentOpen(false);
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Comment could not be saved.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось сохранить комментарий.", "Unable to save the comment."),
+      );
     } finally {
       setBusy(null);
     }
@@ -4181,7 +4795,7 @@ function IncidentDetailPage({
     <div className="page-stack incident-detail-page">
       <button className="breadcrumb-button" onClick={() => navigate("/incidents")}>
         <Icon symbol="←" />
-        Incidents
+        {tr("Инциденты", "Incidents")}
       </button>
       <div className="incident-detail-head">
         <div
@@ -4208,7 +4822,7 @@ function IncidentDetailPage({
             </span>
             <span>
               <Icon symbol="◷" />
-              Started {formatRelative(incident.startsAt)}
+              {tr("Начался", "Started")} {formatRelative(incident.startsAt)}
             </span>
           </div>
         </div>
@@ -4220,7 +4834,9 @@ function IncidentDetailPage({
               onClick={() => void mutate("acknowledge")}
             >
               <Icon symbol="✓" />
-              {busy === "acknowledge" ? "Saving…" : "Acknowledge"}
+              {busy === "acknowledge"
+                ? tr("Сохраняем…", "Saving…")
+                : tr("Принять в работу", "Acknowledge")}
             </button>
           )}
           {incident.status !== "resolved" && (
@@ -4230,7 +4846,7 @@ function IncidentDetailPage({
               onClick={() => void mutate("resolve")}
             >
               <Icon symbol="◎" />
-              Resolve
+              {tr("Решить", "Resolve")}
             </button>
           )}
           {incident.status !== "silenced" && incident.status !== "resolved" && (
@@ -4238,7 +4854,7 @@ function IncidentDetailPage({
               className="button button--quiet button--icon-only"
               disabled={busy !== null || readOnly}
               onClick={() => void mutate("silence")}
-              aria-label="Silence incident"
+              aria-label={tr("Приглушить инцидент", "Silence incident")}
             >
               <Icon symbol="∿" />
             </button>
@@ -4253,8 +4869,8 @@ function IncidentDetailPage({
       <div className="incident-detail-grid">
         <Panel
           className="timeline-panel"
-          eyebrow="Append-only history"
-          title="Incident timeline"
+          eyebrow={tr("Неизменяемая история", "Immutable history")}
+          title={tr("Хронология инцидента", "Incident timeline")}
           action={
             readOnly ? null : (
               <button
@@ -4262,7 +4878,7 @@ function IncidentDetailPage({
                 onClick={() => setCommentOpen((value) => !value)}
               >
                 <Icon symbol="+" />
-                Add comment
+                {tr("Добавить комментарий", "Add comment")}
               </button>
             )
           }
@@ -4270,23 +4886,28 @@ function IncidentDetailPage({
           {commentOpen && (
             <form className="comment-composer" onSubmit={submitComment}>
               <label>
-                <span className="sr-only">Incident comment</span>
+                <span className="sr-only">{tr("Комментарий к инциденту", "Incident comment")}</span>
                 <textarea
                   value={comment}
                   onChange={(event) => setComment(event.target.value)}
                   autoFocus
-                  placeholder="Add context for the next operator…"
+                  placeholder={tr(
+                    "Добавьте контекст для следующего оператора…",
+                    "Add context for the next operator…",
+                  )}
                 />
               </label>
               <div>
                 <button type="button" className="text-button" onClick={() => setCommentOpen(false)}>
-                  Cancel
+                  {tr("Отмена", "Cancel")}
                 </button>
                 <button
                   className="button button--primary button--small"
                   disabled={!comment.trim() || busy === "comment"}
                 >
-                  {busy === "comment" ? "Posting…" : "Post comment"}
+                  {busy === "comment"
+                    ? tr("Публикуем…", "Publishing…")
+                    : tr("Опубликовать", "Publish")}
                 </button>
               </div>
             </form>
@@ -4330,42 +4951,51 @@ function IncidentDetailPage({
           ) : (
             <EmptyState
               icon="∷"
-              title="No timeline returned"
-              message="This node did not return incident events for the selected record."
+              title={tr("Хронология пуста", "Timeline is empty")}
+              message={tr(
+                "Узел не вернул события для выбранного инцидента.",
+                "The node returned no events for this incident.",
+              )}
             />
           )}
         </Panel>
         <div className="incident-detail-side">
-          <Panel eyebrow="Current projection" title="Incident context">
+          <Panel
+            eyebrow={tr("Текущее состояние", "Current state")}
+            title={tr("Контекст инцидента", "Incident context")}
+          >
             <dl className="detail-list">
               <div>
-                <dt>Incident ID</dt>
+                <dt>{tr("ID инцидента", "Incident ID")}</dt>
                 <dd>
                   <code>{compactId(incident.id)}</code>
                 </dd>
               </div>
               <div>
-                <dt>Source</dt>
+                <dt>{tr("Источник", "Source")}</dt>
                 <dd>{incident.source}</dd>
               </div>
               <div>
-                <dt>First seen</dt>
+                <dt>{tr("Первое событие", "First event")}</dt>
                 <dd>{formatDate(incident.startsAt, true)}</dd>
               </div>
               <div>
-                <dt>Last event</dt>
+                <dt>{tr("Последнее событие", "Last event")}</dt>
                 <dd>{formatDate(incident.lastEventAt, true)}</dd>
               </div>
               <div>
-                <dt>Timeline entries</dt>
+                <dt>{tr("Событий в хронологии", "Timeline events")}</dt>
                 <dd>{incident.events.length}</dd>
               </div>
             </dl>
           </Panel>
-          <Panel eyebrow="Preserved payload" title="Labels & annotations">
+          <Panel
+            eyebrow={tr("Исходные данные", "Raw metadata")}
+            title={tr("Метки и аннотации", "Labels and annotations")}
+          >
             <div className="metadata-block">
               <h3>
-                Labels <span>{Object.keys(incident.labels).length}</span>
+                {tr("Метки", "Labels")} <span>{Object.keys(incident.labels).length}</span>
               </h3>
               {Object.entries(incident.labels).map(([key, value]) => (
                 <div key={key}>
@@ -4376,7 +5006,8 @@ function IncidentDetailPage({
             </div>
             <div className="metadata-block">
               <h3>
-                Annotations <span>{Object.keys(incident.annotations).length}</span>
+                {tr("Аннотации", "Annotations")}{" "}
+                <span>{Object.keys(incident.annotations).length}</span>
               </h3>
               {Object.entries(incident.annotations).map(([key, value]) => (
                 <div key={key}>
@@ -4405,8 +5036,11 @@ function ReachabilityMatrix({
     return (
       <EmptyState
         icon="∿"
-        title="No probe data yet"
-        message="Connect a Prometheus datasource to populate the regional matrix."
+        title={tr("Данных проверок пока нет", "No probe data yet")}
+        message={tr(
+          "Подключите Prometheus, чтобы заполнить матрицу доступности.",
+          "Connect Prometheus to populate the reachability matrix.",
+        )}
       />
     );
   return (
@@ -4414,14 +5048,14 @@ function ReachabilityMatrix({
       className={`reachability-matrix ${compact ? "reachability-matrix--compact" : ""}`}
       style={{ ["--target-count" as string]: targets.length }}
       role="region"
-      aria-label="Regional reachability matrix"
+      aria-label={tr("Матрица доступности по регионам", "Regional reachability matrix")}
       tabIndex={0}
     >
-      <div className="reachability-matrix__corner">Probe from</div>
+      <div className="reachability-matrix__corner">{tr("Проверка из", "Probe from")}</div>
       {targets.map((target) => (
         <div className="reachability-matrix__target" key={target}>
           <b>{target}</b>
-          {!compact && <small>target</small>}
+          {!compact && <small>{tr("цель", "target")}</small>}
         </div>
       ))}
       {sources.map((source) => (
@@ -4448,11 +5082,11 @@ function ReachabilityMatrix({
                     ? `${source} → ${target}: ${
                         cell.success
                           ? cell.latency == null
-                            ? "reachable"
+                            ? tr("доступно", "reachable")
                             : `${cell.latency} ms`
-                          : "failed"
+                          : tr("недоступно", "failed")
                       }`
-                    : "No data"
+                    : tr("Нет данных", "No data")
                 }
               >
                 <span aria-hidden="true">
@@ -4461,11 +5095,11 @@ function ReachabilityMatrix({
                 <b>
                   {cell?.success
                     ? cell.latency == null
-                      ? "Reachable"
+                      ? tr("Доступно", "Reachable")
                       : `${cell.latency} ms`
                     : status === "failed"
-                      ? "Failed"
-                      : "No data"}
+                      ? tr("Недоступно", "Failed")
+                      : tr("Нет данных", "No data")}
                 </b>
               </div>
             );
@@ -4519,13 +5153,24 @@ function ReachabilityPage({
       updateDatasource(normalizeDatasource(body, 0));
       onRefresh();
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Datasource update failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось обновить источник данных.", "Unable to update the datasource."),
+      );
     } finally {
       setBusy(null);
     }
   };
   const removeDatasource = async (datasource: PrometheusDatasource) => {
-    if (!window.confirm(`Delete Prometheus datasource “${datasource.name}”?`)) return;
+    if (
+      !window.confirm(
+        currentUiLanguage() === "ru"
+          ? `Удалить источник данных Prometheus «${datasource.name}»?`
+          : `Delete Prometheus datasource “${datasource.name}”?`,
+      )
+    )
+      return;
     setBusy(datasource.id);
     setActionError(null);
     try {
@@ -4538,7 +5183,11 @@ function ReachabilityPage({
       }));
       onRefresh();
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Datasource delete failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось удалить источник данных.", "Unable to delete the datasource."),
+      );
     } finally {
       setBusy(null);
     }
@@ -4554,10 +5203,16 @@ function ReachabilityPage({
         }),
       );
       setOutcome(
-        `${datasource.name}: ${String(body.status ?? "completed")} · ${Number(body.samples ?? 0)} sample(s)`,
+        currentUiLanguage() === "ru"
+          ? `${datasource.name}: проверка завершена · значений: ${Number(body.samples ?? 0)}`
+          : `${datasource.name}: test completed · samples: ${Number(body.samples ?? 0)}`,
       );
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Datasource test failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось проверить источник данных.", "Unable to test the datasource."),
+      );
     } finally {
       setTesting(null);
     }
@@ -4565,14 +5220,17 @@ function ReachabilityPage({
   return (
     <div className="page-stack reachability-page">
       <PageHeading
-        eyebrow="Prometheus view"
-        title="Regional reachability"
-        description="The same endpoints observed from every probe region—without copying raw time-series into Alert Hub."
+        eyebrow={tr("Данные Prometheus", "Prometheus evidence")}
+        title={tr("Доступность по регионам", "Regional reachability")}
+        description={tr(
+          "Сравнение одних и тех же целей из каждого региона проверки без копирования временных рядов в Alert Hub.",
+          "Compare the same targets from every probe region without copying time series into Alert Hub.",
+        )}
         actions={
           <>
             <GrafanaLink url={grafanaUrl} />
             <button className="button button--quiet" type="button" onClick={onRefresh}>
-              <Icon symbol="↻" /> Refresh evidence
+              <Icon symbol="↻" /> {tr("Обновить данные", "Refresh evidence")}
             </button>
             <button
               className="button button--primary"
@@ -4580,7 +5238,7 @@ function ReachabilityPage({
               onClick={() => setAdding(true)}
               disabled={readOnly}
             >
-              <Icon symbol="+" /> Add datasource
+              <Icon symbol="+" /> {tr("Добавить Prometheus", "Add Prometheus")}
             </button>
           </>
         }
@@ -4591,7 +5249,7 @@ function ReachabilityPage({
             <Icon symbol="✓" />
           </span>
           <span>
-            <small>Reachable paths</small>
+            <small>{tr("Доступные маршруты", "Reachable paths")}</small>
             <b>
               {reachable}
               <em>/{cells.length}</em>
@@ -4603,7 +5261,7 @@ function ReachabilityPage({
             <Icon symbol="×" />
           </span>
           <span>
-            <small>Failed paths</small>
+            <small>{tr("Недоступные маршруты", "Failed paths")}</small>
             <b>{failed}</b>
           </span>
         </div>
@@ -4612,8 +5270,8 @@ function ReachabilityPage({
             <Icon symbol="∿" />
           </span>
           <span>
-            <small>Datasources queried</small>
-            <b>{meta.datasources == null ? "Unknown" : meta.datasources}</b>
+            <small>{tr("Опрошено источников", "Datasources queried")}</small>
+            <b>{meta.datasources == null ? tr("Нет данных", "No data") : meta.datasources}</b>
           </span>
         </div>
         <div>
@@ -4621,15 +5279,23 @@ function ReachabilityPage({
             <Icon symbol="◷" />
           </span>
           <span>
-            <small>Query status</small>
-            <b>{titleCase(meta.status)}</b>
+            <small>{tr("Статус запроса", "Query status")}</small>
+            <b>
+              {meta.status === "ok"
+                ? tr("Готово", "Ready")
+                : meta.status === "partial"
+                  ? tr("Частично", "Partial")
+                  : meta.status === "not_configured"
+                    ? tr("Не настроено", "Not configured")
+                    : tr("Недоступно", "Unavailable")}
+            </b>
           </span>
         </div>
       </div>
       <Panel
         className="reach-matrix-panel"
         eyebrow="probe_success"
-        title="Probe region × target matrix"
+        title={tr("Регион проверки × цель", "Probe region × target")}
         action={
           <span className="live-stamp">
             <StatusDot
@@ -4641,7 +5307,7 @@ function ReachabilityPage({
                     : "unknown"
               }
             />{" "}
-            {meta.detail || "No reachability status returned"}
+            {meta.detail || tr("Статус доступности не получен", "No reachability status returned")}
           </span>
         }
       >
@@ -4649,24 +5315,27 @@ function ReachabilityPage({
         <div className="matrix-legend">
           <span>
             <i className="legend-dot legend-dot--healthy" />
-            Reachable
+            {tr("Доступно", "Reachable")}
           </span>
           <span>
             <i className="legend-dot legend-dot--slow" />
-            Reachable, slower than 200 ms when latency is supplied
+            {tr("Доступно, но медленнее 200 мс", "Reachable, slower than 200 ms")}
           </span>
           <span>
             <i className="legend-dot legend-dot--failed" />
-            Probe failed
+            {tr("Проверка не прошла", "Probe failed")}
           </span>
           <span>
             <i className="legend-dot legend-dot--unknown" />
-            No data
+            {tr("Нет данных", "No data")}
           </span>
         </div>
       </Panel>
       <div className="reach-detail-grid">
-        <Panel eyebrow="Active failures" title="Paths requiring attention">
+        <Panel
+          eyebrow={tr("Активные проблемы", "Active failures")}
+          title={tr("Маршруты, требующие внимания", "Paths needing attention")}
+        >
           {cells.filter((cell) => !cell.success).length ? (
             <div className="failed-path-list">
               {cells
@@ -4680,7 +5349,10 @@ function ReachabilityPage({
                       <b>
                         {cell.source} → {cell.target}
                       </b>
-                      <small>Probe returned 0 · checked {formatRelative(cell.checkedAt)}</small>
+                      <small>
+                        {tr("Проверка вернула 0", "Probe returned 0")} ·{" "}
+                        {formatRelative(cell.checkedAt)}
+                      </small>
                     </span>
                     {cell.datasourceName && <code>{cell.datasourceName}</code>}
                   </div>
@@ -4689,19 +5361,37 @@ function ReachabilityPage({
           ) : (
             <EmptyState
               icon="✓"
-              title={cells.length ? "No failed paths returned" : "No reachability samples"}
+              title={
+                cells.length
+                  ? tr("Недоступных маршрутов нет", "No failed paths")
+                  : tr("Нет данных о доступности", "No reachability data")
+              }
               message={
                 cells.length
-                  ? "The current probe_success response contains no failed paths."
-                  : meta.detail || "Configure and test a Prometheus datasource."
+                  ? tr(
+                      "В текущем ответе probe_success нет недоступных маршрутов.",
+                      "The current probe_success response contains no failed paths.",
+                    )
+                  : meta.detail ||
+                    tr(
+                      "Настройте и проверьте источник данных Prometheus.",
+                      "Configure and test a Prometheus datasource.",
+                    )
               }
             />
           )}
         </Panel>
-        <Panel eyebrow="Fixed backend query" title="Prometheus datasources">
+        <Panel
+          eyebrow={tr("Фиксированный запрос сервера", "Server-owned query")}
+          title={tr("Источники данных Prometheus", "Prometheus datasources")}
+        >
           <p className="settings-intro">
-            The browser requests the predefined <code>probe_success</code> query; it cannot submit
-            PromQL.
+            {tr("Браузер запрашивает только предопределённый", "The browser can request only the")}{" "}
+            <code>probe_success</code>{" "}
+            {tr(
+              "и не может отправлять произвольный PromQL.",
+              "query and cannot submit arbitrary PromQL.",
+            )}
           </p>
           {datasources.length ? (
             <div className="live-resource-list">
@@ -4711,7 +5401,8 @@ function ReachabilityPage({
                   <span>
                     <b>{datasource.name}</b>
                     <small>
-                      {datasource.url} · {datasource.region ?? "No region"} · {datasource.authType}
+                      {datasource.url} · {datasource.region ?? tr("Без региона", "No region")} ·{" "}
+                      {datasource.authType}
                     </small>
                   </span>
                   <StatusDot health={datasource.enabled ? "unknown" : "paused"} />
@@ -4721,21 +5412,23 @@ function ReachabilityPage({
                       onClick={() => void testDatasource(datasource)}
                       disabled={readOnly || testing === datasource.id || !datasource.enabled}
                     >
-                      {testing === datasource.id ? "Testing…" : "Test"}
+                      {testing === datasource.id
+                        ? tr("Проверяем…", "Testing…")
+                        : tr("Проверить", "Test")}
                     </button>
                     <button
                       className="button button--quiet button--small"
                       onClick={() => void toggleDatasource(datasource)}
                       disabled={readOnly || busy === datasource.id}
                     >
-                      {datasource.enabled ? "Disable" : "Enable"}
+                      {datasource.enabled ? tr("Отключить", "Disable") : tr("Включить", "Enable")}
                     </button>
                     <button
                       className="text-button text-button--danger"
                       onClick={() => void removeDatasource(datasource)}
                       disabled={readOnly || busy === datasource.id}
                     >
-                      Delete
+                      {tr("Удалить", "Delete")}
                     </button>
                   </span>
                 </div>
@@ -4744,14 +5437,20 @@ function ReachabilityPage({
           ) : (
             <EmptyState
               icon="P"
-              title="No Prometheus datasource"
-              message="Add an HTTPS datasource to populate the reachability matrix."
+              title={tr("Prometheus не подключён", "No Prometheus datasource")}
+              message={tr(
+                "Добавьте HTTPS-источник, чтобы заполнить матрицу доступности.",
+                "Add an HTTPS datasource to populate the reachability matrix.",
+              )}
             />
           )}
         </Panel>
       </div>
       {meta.errors.length > 0 && (
-        <Panel eyebrow="Partial results" title="Datasource errors">
+        <Panel
+          eyebrow={tr("Частичные результаты", "Partial result")}
+          title={tr("Ошибки источников данных", "Datasource errors")}
+        >
           <div className="live-error-list">
             {meta.errors.map((error, index) => (
               <div key={`${error.datasourceId}-${error.code}-${index}`}>
@@ -4797,26 +5496,33 @@ function SourceCredentialDetails({ credential }: { credential: SourceCredential 
   const [tokenVisible, setTokenVisible] = useState(true);
   const exampleLabel =
     credential.kind === "alertmanager"
-      ? "Ready Alertmanager receiver fragment"
+      ? tr("Готовый фрагмент receiver для Alertmanager", "Ready-to-use Alertmanager receiver")
       : credential.kind === "generic_json"
-        ? "Ready Generic JSON request"
-        : "Ready heartbeat request";
+        ? tr("Готовый запрос JSON", "Ready-to-use JSON request")
+        : tr("Готовый контрольный запрос", "Ready-to-use heartbeat request");
   return (
     <>
       <div className="one-time-warning">
         <Icon symbol="!" />
         <span>
-          <b>Copy this token now.</b>
-          <small>It cannot be revealed again after you close this window.</small>
+          <b>{tr("Скопируйте токен сейчас.", "Copy the token now.")}</b>
+          <small>
+            {tr(
+              "После закрытия окна его нельзя будет посмотреть снова.",
+              "It cannot be viewed again after this dialog closes.",
+            )}
+          </small>
         </span>
       </div>
       <label className="secret-field">
-        <span>Bearer token</span>
+        <span>{tr("Bearer-токен", "Bearer token")}</span>
         <div>
           <code>{tokenVisible ? credential.token : "•".repeat(32)}</code>
           <button
             onClick={() => setTokenVisible((value) => !value)}
-            aria-label={tokenVisible ? "Hide token" : "Show token"}
+            aria-label={
+              tokenVisible ? tr("Скрыть токен", "Hide token") : tr("Показать токен", "Show token")
+            }
           >
             <Icon symbol={tokenVisible ? "◉" : "⊘"} />
           </button>
@@ -4824,7 +5530,7 @@ function SourceCredentialDetails({ credential }: { credential: SourceCredential 
         </div>
       </label>
       <label className="secret-field">
-        <span>Absolute webhook URL</span>
+        <span>{tr("Полный URL вебхука", "Full webhook URL")}</span>
         <div>
           <code>{credential.webhookUrl}</code>
           <CopyButton value={credential.webhookUrl} />
@@ -4833,15 +5539,23 @@ function SourceCredentialDetails({ credential }: { credential: SourceCredential 
       <div className="config-snippet">
         <div>
           <span>{exampleLabel}</span>
-          <CopyButton value={credential.example} label="Copy example" />
+          <CopyButton value={credential.example} label={tr("Копировать пример", "Copy example")} />
         </div>
         <pre>{credential.example}</pre>
       </div>
       {credential.kind === "generic_json" && (
         <div className="config-snippet">
           <div>
-            <span>Generic JSON schema · required: dedup_key and status</span>
-            <CopyButton value={GENERIC_JSON_SCHEMA_EXAMPLE} label="Copy schema" />
+            <span>
+              {tr(
+                "Схема JSON · обязательны dedup_key и status",
+                "JSON schema · dedup_key and status are required",
+              )}
+            </span>
+            <CopyButton
+              value={GENERIC_JSON_SCHEMA_EXAMPLE}
+              label={tr("Копировать схему", "Copy schema")}
+            />
           </div>
           <pre>{GENERIC_JSON_SCHEMA_EXAMPLE}</pre>
         </div>
@@ -4858,13 +5572,13 @@ function RotatedSourceCredentialModal({
   onClose: () => void;
 }) {
   return (
-    <Modal onClose={onClose} size="large" label="Rotated source token">
+    <Modal onClose={onClose} size="large" label={tr("Новый токен источника", "New source token")}>
       <div className="modal-head">
         <div>
-          <span className="eyebrow">Source credential</span>
-          <h2>Token rotated</h2>
+          <span className="eyebrow">{tr("Доступ источника", "Source access")}</span>
+          <h2>{tr("Токен обновлён", "Token rotated")}</h2>
         </div>
-        <button className="icon-button" onClick={onClose} aria-label="Close">
+        <button className="icon-button" onClick={onClose} aria-label={tr("Закрыть", "Close")}>
           <Icon symbol="×" />
         </button>
       </div>
@@ -4873,7 +5587,7 @@ function RotatedSourceCredentialModal({
       </div>
       <div className="modal-foot">
         <button className="button button--primary" onClick={onClose}>
-          I saved the new token
+          {tr("Я сохранил новый токен", "I saved the new token")}
         </button>
       </div>
     </Modal>
@@ -4905,10 +5619,16 @@ function SourcesPage({
         await mutationJson(`/sources/${encodeURIComponent(source.id)}/test`, { method: "POST" }),
       );
       setOutcome(
-        `${source.name}: accepted ${Number(body.accepted ?? 0)}, duplicates ${Number(body.duplicates ?? 0)}`,
+        currentUiLanguage() === "ru"
+          ? `${source.name}: принято ${Number(body.accepted ?? 0)}, дубликатов ${Number(body.duplicates ?? 0)}`
+          : `${source.name}: accepted ${Number(body.accepted ?? 0)}, duplicates ${Number(body.duplicates ?? 0)}`,
       );
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Source test failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось проверить источник.", "Unable to test the source."),
+      );
     } finally {
       setTesting(null);
     }
@@ -4927,13 +5647,24 @@ function SourcesPage({
         sources: current.sources.map((item) => (item.id === updated.id ? updated : item)),
       }));
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Source update failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось обновить источник.", "Unable to update the source."),
+      );
     } finally {
       setBusy(null);
     }
   };
   const removeSource = async (source: Source) => {
-    if (!window.confirm(`Delete source “${source.name}”? Its token will stop working.`)) return;
+    if (
+      !window.confirm(
+        currentUiLanguage() === "ru"
+          ? `Удалить источник «${source.name}»? Его токен перестанет работать.`
+          : `Delete source “${source.name}”? Its token will stop working.`,
+      )
+    )
+      return;
     setBusy(source.id);
     setActionError(null);
     try {
@@ -4943,7 +5674,11 @@ function SourcesPage({
         sources: current.sources.filter((item) => item.id !== source.id),
       }));
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Source delete failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось удалить источник.", "Unable to delete the source."),
+      );
     } finally {
       setBusy(null);
     }
@@ -4951,7 +5686,9 @@ function SourcesPage({
   const rotateSourceToken = async (source: Source) => {
     if (
       !window.confirm(
-        `Rotate the token for “${source.name}”? The current token will stop working immediately.`,
+        currentUiLanguage() === "ru"
+          ? `Обновить токен для «${source.name}»? Текущий токен сразу перестанет работать.`
+          : `Rotate the token for “${source.name}”? The current token will stop working immediately.`,
       )
     )
       return;
@@ -4964,7 +5701,11 @@ function SourcesPage({
       });
       setRotatedCredential(sourceCredential(payload, source.kind));
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Source token rotation failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось обновить токен источника.", "Unable to rotate the source token."),
+      );
     } finally {
       setBusy(null);
     }
@@ -4973,33 +5714,41 @@ function SourcesPage({
   return (
     <div className="page-stack sources-page">
       <PageHeading
-        eyebrow="Event ingest"
-        title="Sources"
-        description="Normalize Alertmanager, heartbeat, and JSON events at the nearest living node."
+        eyebrow={tr("Приём событий", "Event ingestion")}
+        title={tr("Источники", "Sources")}
+        description={tr(
+          "Alertmanager, контрольные сигналы и JSON-события принимаются ближайшим доступным узлом.",
+          "Alertmanager, heartbeat, and JSON events are accepted by the nearest available node.",
+        )}
         actions={
           <button className="button button--primary" onClick={onAdd} disabled={readOnly}>
             <Icon symbol="+" />
-            Add source
+            {tr("Добавить источник", "Add source")}
           </button>
         }
       />
       <div className="section-summary-bar">
         <span>
           <StatusDot health={sources.length ? "unknown" : "paused"} />
-          <b>{sources.filter((source) => source.enabled).length}</b> enabled
+          <b>{sources.filter((source) => source.enabled).length}</b> {tr("включено", "enabled")}
         </span>
         <span>
           <Icon symbol="⇣" />
           <b>
             {reportedEvents.length
               ? reportedEvents.reduce((sum, count) => sum + count, 0).toLocaleString()
-              : "Unknown"}
+              : tr("Нет данных", "No data")}
           </b>{" "}
-          events / 24h
+          {tr("событий за 24 ч.", "events in 24h")}
         </span>
         <span>
           <Icon symbol="✓" />
-          <b>{sources.filter((source) => source.health === "healthy").length}</b> reported healthy
+          <b>{sources.filter((source) => source.health === "healthy").length}</b>{" "}
+          {tr("работают", "healthy")} ·{" "}
+          <b>
+            {sources.filter((source) => ["degraded", "offline"].includes(source.health)).length}
+          </b>{" "}
+          {tr("требуют внимания", "need attention")}
         </span>
       </div>
       {sources.length ? (
@@ -5014,34 +5763,47 @@ function SourcesPage({
                 <span>
                   <b>{source.name}</b>
                   <small>
-                    {titleCase(source.kind)} · {source.region}
+                    {sourceKindLabel(source.kind)} · {source.region}
                   </small>
                 </span>
               </div>
               <div className="source-card__status">
                 <span>
                   <StatusDot health={source.health} />
-                  {source.enabled ? titleCase(source.health) : "Disabled"}
+                  {source.enabled ? healthLabel(source.health) : tr("Отключён", "Disabled")}
                 </span>
                 <span>
-                  Last event{" "}
-                  <b>{source.lastEvent ? formatRelative(source.lastEvent) : "Unknown"}</b>
+                  {tr("Последнее событие", "Last event")}{" "}
+                  <b>
+                    {source.lastEvent
+                      ? formatRelative(source.lastEvent)
+                      : tr("Нет данных", "No data")}
+                  </b>
                 </span>
               </div>
               <div className="source-card__metrics">
                 <span>
-                  <small>Events · 24h</small>
-                  <b>{source.events24h == null ? "Unknown" : source.events24h.toLocaleString()}</b>
+                  <small>{tr("События · 24 ч.", "Events · 24h")}</small>
+                  <b>
+                    {source.events24h == null
+                      ? tr("Нет данных", "No data")
+                      : source.events24h.toLocaleString(
+                          currentUiLanguage() === "ru" ? "ru-RU" : "en-US",
+                        )}
+                  </b>
                 </span>
                 <span>
-                  <small>Source ID</small>
+                  <small>{tr("ID источника", "Source ID")}</small>
                   <code>{compactId(source.id)}</code>
                 </span>
               </div>
               <div className="source-card__endpoint">
-                <span>Absolute webhook URL</span>
+                <span>{tr("Полный URL вебхука", "Full webhook URL")}</span>
                 <code>{sourceWebhookUrl(source)}</code>
-                <CopyButton value={sourceWebhookUrl(source)} label="Copy URL" />
+                <CopyButton
+                  value={sourceWebhookUrl(source)}
+                  label={tr("Копировать URL", "Copy URL")}
+                />
               </div>
               <div className="source-card__actions">
                 <button
@@ -5050,28 +5812,28 @@ function SourcesPage({
                   onClick={() => void testSource(source)}
                 >
                   <Icon symbol="▷" />
-                  {testing === source.id ? "Testing…" : "Send test"}
+                  {testing === source.id ? tr("Проверяем…", "Testing…") : tr("Проверить", "Test")}
                 </button>
                 <button
                   className="text-button"
                   disabled={readOnly || busy === source.id}
                   onClick={() => void rotateSourceToken(source)}
                 >
-                  Rotate token
+                  {tr("Обновить токен", "Rotate token")}
                 </button>
                 <button
                   className="text-button"
                   disabled={readOnly || busy === source.id}
                   onClick={() => void toggleSource(source)}
                 >
-                  {source.enabled ? "Disable" : "Enable"}
+                  {source.enabled ? tr("Отключить", "Disable") : tr("Включить", "Enable")}
                 </button>
                 <button
                   className="text-button text-button--danger"
                   disabled={readOnly || busy === source.id}
                   onClick={() => void removeSource(source)}
                 >
-                  Delete
+                  {tr("Удалить", "Delete")}
                 </button>
               </div>
             </Panel>
@@ -5081,34 +5843,59 @@ function SourcesPage({
         <Panel>
           <EmptyState
             icon="→"
-            title="No event sources"
-            message="Add Alertmanager, a generic JSON webhook, or a heartbeat monitor."
+            title={tr("Источников пока нет", "No sources yet")}
+            message={tr(
+              "Добавьте Alertmanager, JSON-вебхук или монитор контрольного сигнала.",
+              "Add an Alertmanager, JSON webhook, or heartbeat monitor.",
+            )}
             action={
               <button className="button button--primary" onClick={onAdd} disabled={readOnly}>
-                Add your first source
+                {tr("Добавить первый источник", "Add the first source")}
               </button>
             }
           />
         </Panel>
       )}
-      <Panel eyebrow="Ingest contract" title="Generic JSON schema">
-        <p className="panel-description">
-          Send one JSON object per request. <code>dedup_key</code> and <code>status</code> are
-          required; status must be <code>firing</code> or <code>resolved</code>.
-        </p>
-        <div className="config-snippet">
-          <div>
-            <span>Schema version 1 example</span>
-            <CopyButton value={GENERIC_JSON_SCHEMA_EXAMPLE} label="Copy schema" />
+      <details className="reference-details">
+        <summary>
+          <span>
+            <span className="eyebrow">{tr("Формат приёма", "Ingestion contract")}</span>
+            <b>{tr("Схема JSON и пример запроса", "JSON schema and request example")}</b>
+          </span>
+          <span className="reference-details__action">
+            {tr("Показать справочник", "Show reference")}
+          </span>
+        </summary>
+        <div className="reference-details__body">
+          <p className="panel-description">
+            {tr(
+              "Отправляйте один JSON-объект в запросе. Поля",
+              "Send one JSON object per request. Fields",
+            )}{" "}
+            <code>dedup_key</code> {tr("и", "and")} <code>status</code>{" "}
+            {tr("обязательны; status должен быть", "are required; status must be")}{" "}
+            <code>firing</code> {tr("или", "or")} <code>resolved</code>.
+          </p>
+          <div className="config-snippet">
+            <div>
+              <span>{tr("Пример схемы версии 1", "Version 1 schema example")}</span>
+              <CopyButton
+                value={GENERIC_JSON_SCHEMA_EXAMPLE}
+                label={tr("Копировать схему", "Copy schema")}
+              />
+            </div>
+            <pre>{GENERIC_JSON_SCHEMA_EXAMPLE}</pre>
           </div>
-          <pre>{GENERIC_JSON_SCHEMA_EXAMPLE}</pre>
         </div>
-      </Panel>
+      </details>
       <div className="info-callout">
         <Icon symbol="i" />
         <span>
-          <b>Events are accepted locally first.</b> Every enabled ingest node can receive this
-          source, persist it, then converge with its peers—no quorum required.
+          <b>{tr("События сначала сохраняются локально.", "Events are stored locally first.")}</b>{" "}
+          {tr(
+            "Любой активный узел приёма может получить и сохранить их, а затем синхронизировать с соседями — кворум не требуется.",
+            "Any active ingest node can accept and persist them, then synchronize with peers without requiring quorum.",
+          )}
         </span>
       </div>
       {(outcome || actionError) && (
@@ -5185,7 +5972,9 @@ function ChannelsPage({
         await mutationJson(`/channels/${encodeURIComponent(channel.id)}/test`, { method: "POST" }),
       );
       const statusValue = String(body.status ?? "completed");
-      const detail = String(body.detail ?? "Provider test completed.");
+      const detail = String(
+        body.detail ?? tr("Проверка провайдера завершена.", "Provider check completed."),
+      );
       if (body.ok !== true) {
         const diagnostics = listFrom(body.outcomes, "outcomes")
           .map(asRecord)
@@ -5201,7 +5990,11 @@ function ChannelsPage({
       }
       setOutcome(`${channel.name}: ${statusValue} · ${detail}`);
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Channel test failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось проверить канал.", "Unable to test the channel."),
+      );
     } finally {
       setTesting(null);
     }
@@ -5216,13 +6009,24 @@ function ChannelsPage({
       });
       updateChannel(normalizeChannel(body, 0));
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Channel update failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось обновить канал.", "Unable to update the channel."),
+      );
     } finally {
       setBusy(null);
     }
   };
   const removeChannel = async (channel: Channel) => {
-    if (!window.confirm(`Delete notification channel “${channel.name}”?`)) return;
+    if (
+      !window.confirm(
+        currentUiLanguage() === "ru"
+          ? `Удалить канал уведомлений «${channel.name}»?`
+          : `Delete notification channel “${channel.name}”?`,
+      )
+    )
+      return;
     setBusy(channel.id);
     setActionError(null);
     try {
@@ -5236,7 +6040,11 @@ function ChannelsPage({
         })),
       }));
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Channel delete failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось удалить канал.", "Unable to delete the channel."),
+      );
     } finally {
       setBusy(null);
     }
@@ -5251,13 +6059,24 @@ function ChannelsPage({
       });
       updateRoute(normalizeRoute(body, 0));
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Route update failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось обновить маршрут.", "Unable to update the route."),
+      );
     } finally {
       setBusy(null);
     }
   };
   const removeRoute = async (route: NotificationRoute) => {
-    if (!window.confirm(`Delete notification route “${route.name}”?`)) return;
+    if (
+      !window.confirm(
+        currentUiLanguage() === "ru"
+          ? `Удалить маршрут уведомлений «${route.name}»?`
+          : `Delete notification route “${route.name}”?`,
+      )
+    )
+      return;
     setBusy(route.id);
     setActionError(null);
     try {
@@ -5267,7 +6086,11 @@ function ChannelsPage({
         routes: current.routes.filter((item) => item.id !== route.id),
       }));
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Route delete failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось удалить маршрут.", "Unable to delete the route."),
+      );
     } finally {
       setBusy(null);
     }
@@ -5278,9 +6101,12 @@ function ChannelsPage({
   return (
     <div className="page-stack channels-page">
       <PageHeading
-        eyebrow="Delivery plane"
-        title="Notification channels"
-        description="Route alerts through deterministic node ownership, with visible retry and regional failover."
+        eyebrow={tr("Доставка уведомлений", "Notification delivery")}
+        title={tr("Каналы уведомлений", "Notification channels")}
+        description={tr(
+          "Настройте доставку, повторные попытки и переключение между регионами для каждого типа оповещений.",
+          "Configure delivery, retries, and regional failover for each alert type.",
+        )}
         actions={
           <button
             className="button button--primary"
@@ -5288,7 +6114,7 @@ function ChannelsPage({
             disabled={readOnly}
           >
             <Icon symbol="+" />
-            Add channel
+            {tr("Добавить канал", "Add channel")}
           </button>
         }
       />
@@ -5303,18 +6129,24 @@ function ChannelsPage({
           </span>
         </div>
         <span>
-          <b>{deliveryRate == null ? "No delivery attempts" : "Recorded delivery outcomes"}</b>
+          <b>
+            {deliveryRate == null
+              ? tr("Попыток доставки не было", "No delivery attempts")
+              : tr("Результаты доставки", "Delivery performance")}
+          </b>
           <small>
-            {delivered} succeeded of {attempts} attempts in the last 24 hours
+            {currentUiLanguage() === "ru"
+              ? `Успешно ${delivered} из ${attempts} попыток за последние 24 часа`
+              : `${delivered} of ${attempts} attempts succeeded in the last 24 hours`}
           </small>
         </span>
         <span className="channel-health-banner__metrics">
-          <b>{outboxPending == null ? "Unknown" : outboxPending}</b>
-          <small>outbox pending</small>
+          <b>{outboxPending == null ? tr("Нет данных", "No data") : outboxPending}</b>
+          <small>{tr("в очереди", "queued")}</small>
         </span>
         <span className="channel-health-banner__metrics">
           <b>{channels.filter((channel) => channel.enabled).length}</b>
-          <small>enabled channels</small>
+          <small>{tr("активных каналов", "active channels")}</small>
         </span>
       </div>
       <div className="channel-grid">
@@ -5327,40 +6159,40 @@ function ChannelsPage({
               <ChannelIcon kind={channel.kind} />
               <span>
                 <b>{channel.name}</b>
-                <small>{titleCase(channel.kind)}</small>
+                <small>{channelKindLabel(channel.kind)}</small>
               </span>
               <span className={`health-label health-label--${channel.health}`}>
                 <StatusDot health={channel.health} />
-                {channel.enabled ? titleCase(channel.health) : "Paused"}
+                {channel.enabled ? healthLabel(channel.health) : tr("Приостановлен", "Paused")}
               </span>
             </div>
             <dl className="channel-card__details">
               <div>
-                <dt>Route</dt>
+                <dt>{tr("Маршрут", "Route")}</dt>
                 <dd>
                   {routes.filter((route) => route.channelIds.includes(channel.id)).length
                     ? routes
                         .filter((route) => route.channelIds.includes(channel.id))
                         .map((route) => route.name)
                         .join(", ")
-                    : "No route"}
+                    : tr("Не используется", "Not routed")}
                 </dd>
               </div>
               <div>
-                <dt>Eligible delivery nodes</dt>
+                <dt>{tr("Узлы доставки", "Eligible nodes")}</dt>
                 <dd>{channel.eligible}</dd>
               </div>
             </dl>
             <div className="channel-card__performance">
               <span>
-                <small>Delivered · 24h</small>
+                <small>{tr("Доставлено · 24 ч.", "Delivered · 24h")}</small>
                 <b>{channel.delivered24h}</b>
               </span>
               <span>
-                <small>Success</small>
+                <small>{tr("Успешность", "Success rate")}</small>
                 <b>
                   {channel.successRate == null
-                    ? "Not exercised"
+                    ? tr("Не проверено", "Not exercised")
                     : `${channel.successRate.toFixed(1)}%`}
                 </b>
               </span>
@@ -5375,21 +6207,21 @@ function ChannelsPage({
                 onClick={() => void test(channel)}
               >
                 <Icon symbol="▷" />
-                {testing === channel.id ? "Sending…" : "Send test"}
+                {testing === channel.id ? tr("Отправляем…", "Sending…") : tr("Проверить", "Test")}
               </button>
               <button
                 className="text-button"
                 disabled={readOnly || busy === channel.id}
                 onClick={() => void toggleChannel(channel)}
               >
-                {channel.enabled ? "Disable" : "Enable"}
+                {channel.enabled ? tr("Отключить", "Disable") : tr("Включить", "Enable")}
               </button>
               <button
                 className="text-button text-button--danger"
                 disabled={readOnly || busy === channel.id}
                 onClick={() => void removeChannel(channel)}
               >
-                Delete
+                {tr("Удалить", "Delete")}
               </button>
             </div>
           </Panel>
@@ -5397,8 +6229,8 @@ function ChannelsPage({
       </div>
       <Panel
         className="routing-panel"
-        eyebrow="Ordered evaluation"
-        title="Notification routes"
+        eyebrow={tr("Порядок обработки", "Evaluation order")}
+        title={tr("Маршруты уведомлений", "Notification routes")}
         action={
           <button
             className="button button--quiet button--small"
@@ -5406,7 +6238,7 @@ function ChannelsPage({
             disabled={readOnly || channels.length === 0}
           >
             <Icon symbol="+" />
-            Add route
+            {tr("Добавить маршрут", "Add route")}
           </button>
         }
       >
@@ -5418,8 +6250,10 @@ function ChannelsPage({
                 <span>
                   <b>{route.name}</b>
                   <small>
-                    priority {route.priority} · sources {route.sourceFilter.join(", ") || "any"} ·
-                    severity {route.severityFilter.join(", ") || "any"}
+                    {tr("приоритет", "priority")} {route.priority} · {tr("источники", "sources")}{" "}
+                    {route.sourceFilter.join(", ") || tr("любые", "any")} ·{" "}
+                    {tr("критичность", "severity")}{" "}
+                    {route.severityFilter.join(", ") || tr("любая", "any")}
                   </small>
                 </span>
                 <span className="route-destinations">
@@ -5429,7 +6263,7 @@ function ChannelsPage({
                   })}
                 </span>
                 <span className="route-continue">
-                  {route.continueMatching ? "Continue" : "Stop"}
+                  {route.continueMatching ? tr("Продолжить", "Continue") : tr("Остановить", "Stop")}
                 </span>
                 <span className="live-resource-actions">
                   <button
@@ -5437,14 +6271,14 @@ function ChannelsPage({
                     disabled={readOnly || busy === route.id}
                     onClick={() => void toggleRoute(route)}
                   >
-                    {route.enabled ? "Disable" : "Enable"}
+                    {route.enabled ? tr("Отключить", "Disable") : tr("Включить", "Enable")}
                   </button>
                   <button
                     className="text-button text-button--danger"
                     disabled={readOnly || busy === route.id}
                     onClick={() => void removeRoute(route)}
                   >
-                    Delete
+                    {tr("Удалить", "Delete")}
                   </button>
                 </span>
               </div>
@@ -5453,8 +6287,11 @@ function ChannelsPage({
         ) : (
           <EmptyState
             icon="⇢"
-            title="No notification routes"
-            message="Create a route to connect incident filters to one or more channels."
+            title={tr("Маршрутов пока нет", "No routes yet")}
+            message={tr(
+              "Создайте маршрут, чтобы связать фильтры инцидентов с каналами.",
+              "Create a route to connect incident filters to delivery channels.",
+            )}
           />
         )}
       </Panel>
@@ -5463,8 +6300,13 @@ function ChannelsPage({
           <Icon symbol="◉" />
         </span>
         <span>
-          <b>Register this browser for Web Push</b>
-          <small>Permission is requested only after this action.</small>
+          <b>{tr("Подключить Web Push в этом браузере", "Set up Web Push in this browser")}</b>
+          <small>
+            {tr(
+              "Запрос разрешения появится только после этого действия.",
+              "The permission prompt appears only after this action.",
+            )}
+          </small>
         </span>
         <Icon symbol="→" />
       </button>
@@ -5531,16 +6373,32 @@ function DevicesPage({
         ...current,
         devices: current.devices.filter((item) => item.id !== device.id),
       }));
-      setOutcome(`${device.name} session revoked.`);
+      setOutcome(
+        currentUiLanguage() === "ru"
+          ? `Сессия устройства «${device.name}» отозвана.`
+          : `Session for “${device.name}” was revoked.`,
+      );
     } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : "Session revoke failed.");
+      setActionError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось отозвать сессию.", "Unable to revoke the session."),
+      );
     } finally {
       setBusy(null);
     }
   };
   const revokeOthers = async () => {
     const targets = devices.filter((device) => !device.current);
-    if (!targets.length || !window.confirm(`Revoke ${targets.length} other session(s)?`)) return;
+    if (
+      !targets.length ||
+      !window.confirm(
+        currentUiLanguage() === "ru"
+          ? `Отозвать остальные сессии (${targets.length})?`
+          : `Revoke the other sessions (${targets.length})?`,
+      )
+    )
+      return;
     setBusy("others");
     setActionError(null);
     setOutcome(null);
@@ -5555,10 +6413,16 @@ function DevicesPage({
         ...current,
         devices: current.devices.filter((item) => !targetIds.has(item.id)),
       }));
-      setOutcome(`${targets.length} other session(s) revoked.`);
+      setOutcome(
+        currentUiLanguage() === "ru"
+          ? `Отозвано сессий: ${targets.length}.`
+          : `Sessions revoked: ${targets.length}.`,
+      );
     } catch (reason) {
       setActionError(
-        reason instanceof Error ? reason.message : "Other sessions were not all revoked.",
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось отозвать все остальные сессии.", "Unable to revoke all other sessions."),
       );
     } finally {
       setBusy(null);
@@ -5567,63 +6431,77 @@ function DevicesPage({
   return (
     <div className="page-stack devices-page">
       <PageHeading
-        eyebrow="Account security"
-        title="Devices & sessions"
-        description="Control refresh sessions and Web Push subscriptions independently on every device."
+        eyebrow={tr("Безопасность аккаунта", "Account security")}
+        title={tr("Устройства и сессии", "Devices & sessions")}
+        description={tr(
+          "Управляйте активными сессиями и подписками Web Push отдельно на каждом устройстве.",
+          "Manage active sessions and Web Push subscriptions for each device.",
+        )}
         actions={
           <button className="button button--primary" onClick={onNotifications} disabled={readOnly}>
             <Icon symbol="◉" />
-            Enable notifications
+            {tr("Включить уведомления", "Enable notifications")}
           </button>
         }
       />
       <Panel className="device-readiness">
-        <div className="readiness-graphic">
-          <span>
-            <Icon symbol="◉" />
-          </span>
-          <i />
-          <span>
-            <Icon symbol="⇄" />
-          </span>
-          <i />
-          <span>
-            <Icon symbol="▣" />
-          </span>
-        </div>
         <div>
-          <span className="eyebrow">Push readiness</span>
+          <span className="eyebrow">{tr("Готовность Web Push", "Web Push readiness")}</span>
           <h2>
-            {pushReady ? "This device is registered for Web Push" : "Push setup is incomplete"}
+            {pushReady
+              ? tr("Это устройство получает Web Push", "This device receives Web Push")
+              : tr("Настройка Push не завершена", "Push setup is incomplete")}
           </h2>
-          <p>Permission, service worker, and cluster subscription are checked separately.</p>
+          <p>
+            {tr(
+              "Разрешение, service worker и подписка в кластере проверяются отдельно.",
+              "Permission, service worker, and the cluster subscription are checked separately.",
+            )}
+          </p>
         </div>
         <div className="readiness-checks">
           <span>
             <Icon symbol={secureContext ? "✓" : "×"} />
-            Secure context: {secureContext ? "yes" : "no"}
+            {tr("Защищённое соединение", "Secure context")}:{" "}
+            {secureContext ? tr("да", "yes") : tr("нет", "no")}
           </span>
           <span>
             <Icon symbol={serviceWorkerAvailable ? "✓" : "×"} />
-            Service worker: {serviceWorkerAvailable ? "supported" : "unsupported"}
+            Service worker:{" "}
+            {serviceWorkerAvailable
+              ? tr("поддерживается", "supported")
+              : tr("не поддерживается", "unsupported")}
           </span>
           <span>
             <Icon symbol={currentPush ? "✓" : "×"} />
-            API subscription: {currentPush ? "registered" : "not registered"} · permission{" "}
-            {permission}
+            {tr("Подписка API", "API subscription")}:{" "}
+            {currentPush
+              ? tr("зарегистрирована", "registered")
+              : tr("не зарегистрирована", "not registered")}{" "}
+            · {tr("разрешение", "permission")}{" "}
+            {permission === "granted"
+              ? tr("выдано", "granted")
+              : permission === "denied"
+                ? tr("запрещено", "denied")
+                : permission === "default"
+                  ? tr("не запрошено", "not requested")
+                  : tr("не поддерживается", "unsupported")}
           </span>
         </div>
       </Panel>
       <Panel
-        eyebrow={`${devices.length} active`}
-        title="Signed-in devices"
+        className="device-sessions"
+        eyebrow={`${tr("Активных устройств", "Active devices")}: ${devices.length}`}
+        title={tr("Устройства с активной сессией", "Devices with an active session")}
         action={
           <button
             className="text-button text-button--danger"
             disabled={readOnly || busy !== null || !devices.some((device) => !device.current)}
             onClick={() => void revokeOthers()}
           >
-            {busy === "others" ? "Revoking…" : "Revoke other sessions"}
+            {busy === "others"
+              ? tr("Отзываем…", "Revoking…")
+              : tr("Завершить другие сессии", "Revoke other sessions")}
           </button>
         }
       >
@@ -5637,18 +6515,20 @@ function DevicesPage({
                 <span className="device-row__name">
                   <span>
                     <b>{device.name}</b>
-                    {device.current && <em>Current device</em>}
+                    {device.current && <em>{tr("Текущее устройство", "Current device")}</em>}
                   </span>
                   <small>{device.platform}</small>
                 </span>
                 <span className="device-row__meta">
-                  <small>Last active</small>
+                  <small>{tr("Последняя активность", "Last active")}</small>
                   <b>{formatRelative(device.lastUsed)}</b>
                   <span>{device.location}</span>
                 </span>
                 <span className={`push-state ${device.push ? "push-state--on" : ""}`}>
                   <Icon symbol={device.push ? "◉" : "⊘"} />
-                  {device.push ? "Push enabled" : "Push off"}
+                  {device.push
+                    ? tr("Push включён", "Push enabled")
+                    : tr("Push выключен", "Push off")}
                 </span>
                 {!device.current && (
                   <button
@@ -5656,7 +6536,7 @@ function DevicesPage({
                     disabled={readOnly || busy !== null}
                     onClick={() => void revoke(device)}
                   >
-                    {busy === device.id ? "Revoking…" : "Revoke"}
+                    {busy === device.id ? tr("Завершаем…", "Revoking…") : tr("Завершить", "Revoke")}
                   </button>
                 )}
               </div>
@@ -5665,8 +6545,11 @@ function DevicesPage({
         ) : (
           <EmptyState
             icon="▣"
-            title="No active devices"
-            message="New sessions will appear here after sign-in."
+            title={tr("Активных устройств нет", "No active devices")}
+            message={tr(
+              "Новые сессии появятся здесь после входа.",
+              "New sessions appear here after sign-in.",
+            )}
           />
         )}
       </Panel>
@@ -5681,8 +6564,16 @@ function DevicesPage({
       <div className="security-note">
         <Icon symbol="◇" />
         <span>
-          <b>Refresh tokens rotate on use.</b> Revoking a device signs it out as soon as the cluster
-          event reaches the node it contacts.
+          <b>
+            {tr(
+              "Refresh-токены обновляются при использовании.",
+              "Refresh tokens rotate when used.",
+            )}
+          </b>{" "}
+          {tr(
+            "После отзыва устройство выйдет из системы, как только событие дойдёт до узла подключения.",
+            "After revocation, the device signs out as soon as the event reaches its connected node.",
+          )}
         </span>
       </div>
     </div>
@@ -5705,69 +6596,52 @@ function ClusterPage({
   const cursorEntries = Object.entries(meta.cursor).sort(([left], [right]) =>
     left.localeCompare(right),
   );
+  const healthyNodes = nodes.filter((node) => node.health === "healthy").length;
+  const impairedNodes = nodes.filter((node) =>
+    ["degraded", "offline"].includes(node.health),
+  ).length;
+  const reportedLags = nodes.flatMap((node) => node.syncLag ?? []);
   return (
     <div className="page-stack cluster-page">
       <PageHeading
-        eyebrow="Eventual consistency"
-        title="Cluster"
-        description="Every peer remains useful on its own. Cursors show how the shared event history is converging."
+        eyebrow={tr("Согласование данных", "Data convergence")}
+        title={tr("Кластер", "Cluster")}
+        description={tr(
+          "Каждый узел работает автономно, а курсоры показывают, как синхронизируется общая история событий.",
+          "Each node operates independently while cursors show how the shared event history converges.",
+        )}
         actions={
           <button className="button button--quiet" onClick={onRefresh}>
             <Icon symbol="⇄" />
-            Refresh cluster data
+            {tr("Обновить данные", "Refresh data")}
           </button>
         }
       />
-      <div className="cluster-hero">
-        <div className="cluster-topology" aria-label="Cluster topology">
-          <div className="topology-lines">
-            <i />
-            <i />
-            <i />
-          </div>
-          {nodes.slice(0, 3).map((node, index) => (
-            <button
-              key={node.id}
-              className={`topology-node topology-node--${index + 1} ${selected === node.id ? "active" : ""}`}
-              onClick={() => setSelected(node.id)}
-            >
-              <span className={`topology-node__ring topology-node__ring--${node.health}`}>
-                <b>{node.region}</b>
-              </span>
-              <strong>{node.name}</strong>
-              <small>
-                <StatusDot health={node.health} />
-                {titleCase(node.health)}
-              </small>
-            </button>
-          ))}
-          <div className="topology-center">
-            <span>{nodes.length}</span>
-            <small>known peers</small>
-          </div>
-        </div>
-        <div className="cluster-principle">
-          <span className="eyebrow">Operating principle</span>
-          <h2>No quorum. No single point of failure.</h2>
-          <p>
-            An isolated node continues to ingest, store, notify, and serve the interface. Partitions
-            may produce a duplicate notification—never a discarded event.
-          </p>
-          <div>
-            <span>
-              <Icon symbol="✓" />
-              Local-first writes
-            </span>
-            <span>
-              <Icon symbol="✓" />
-              Append-only events
-            </span>
-            <span>
-              <Icon symbol="✓" />
-              Deterministic merge
-            </span>
-          </div>
-        </div>
+      <div className="section-summary-bar cluster-summary-bar">
+        <span>
+          <Icon symbol="⌘" />
+          <b>{nodes.length}</b> {tr("узл. в составе", "nodes in inventory")}
+        </span>
+        <span>
+          <StatusDot health={impairedNodes ? "degraded" : nodes.length ? "healthy" : "unknown"} />
+          <b>{healthyNodes}</b> {tr("работают", "healthy")} · <b>{impairedNodes}</b>{" "}
+          {tr("с проблемами", "impaired")}
+        </span>
+        <span>
+          <Icon symbol="⇄" />
+          {tr("макс. задержка", "max lag")}{" "}
+          <b>
+            {reportedLags.length
+              ? currentUiLanguage() === "ru"
+                ? `${Math.max(...reportedLags).toFixed(1)} сек.`
+                : `${Math.max(...reportedLags).toFixed(1)}s`
+              : tr("нет данных", "no data")}
+          </b>
+        </span>
+        <span>
+          <Icon symbol="⇡" /> {tr("в очереди", "queued")}{" "}
+          <b>{outboxPending == null ? tr("нет данных", "no data") : outboxPending}</b>
+        </span>
       </div>
       <div className="node-card-grid">
         {nodes.map((node) => (
@@ -5778,7 +6652,7 @@ function ClusterPage({
             <button
               className="node-card__select"
               onClick={() => setSelected(node.id)}
-              aria-label={`Inspect ${node.name}`}
+              aria-label={`${tr("Открыть сведения об узле", "Open details for node")} ${node.name}`}
             />
             <div className="node-card__head">
               <span className={`flag-tag flag-tag--${node.health}`}>{node.region}</span>
@@ -5788,22 +6662,26 @@ function ClusterPage({
               </span>
               <span className={`health-label health-label--${node.health}`}>
                 <StatusDot health={node.health} />
-                {titleCase(node.health)}
+                {healthLabel(node.health)}
               </span>
             </div>
             <div className="node-card__metrics">
               <span>
-                <small>Sync lag</small>
+                <small>{tr("Задержка синхронизации", "Sync lag")}</small>
                 <b className={node.syncLag != null && node.syncLag > 10 ? "text-warning" : ""}>
-                  {node.syncLag == null ? "Unknown" : `${node.syncLag.toFixed(1)}s`}
+                  {node.syncLag == null
+                    ? tr("Нет данных", "No data")
+                    : currentUiLanguage() === "ru"
+                      ? `${node.syncLag.toFixed(1)} сек.`
+                      : `${node.syncLag.toFixed(1)}s`}
                 </b>
               </span>
               <span>
-                <small>Outbox</small>
-                <b>{node.queue == null ? "Unknown" : node.queue}</b>
+                <small>{tr("Очередь отправки", "Outbox queue")}</small>
+                <b>{node.queue == null ? tr("Нет данных", "No data") : node.queue}</b>
               </span>
               <span>
-                <small>Last seen</small>
+                <small>{tr("Последняя связь", "Last seen")}</small>
                 <b>{formatRelative(node.lastSeen)}</b>
               </span>
             </div>
@@ -5820,18 +6698,22 @@ function ClusterPage({
       </div>
       <div className="cluster-detail-grid">
         <Panel
-          eyebrow="Local vector cursor"
-          title={current ? `${current.name} · latest local read` : "Synchronization"}
+          eyebrow={tr("Локальный векторный курсор", "Local vector cursor")}
+          title={
+            current
+              ? `${current.name} · ${tr("последние данные", "latest data")}`
+              : tr("Синхронизация", "Replication")
+          }
           action={
             <span className="live-stamp">
-              <StatusDot health={current?.health ?? "unknown"} /> API evidence
+              <StatusDot health={current?.health ?? "unknown"} /> {tr("Данные API", "API data")}
             </span>
           }
         >
           <div className="cursor-table">
             <div className="cursor-table__head">
-              <span>Origin</span>
-              <span>Local cursor</span>
+              <span>{tr("Источник", "Origin")}</span>
+              <span>{tr("Локальный курсор", "Local cursor")}</span>
             </div>
             {cursorEntries.length ? (
               cursorEntries.map(([origin, sequence]) => (
@@ -5846,28 +6728,40 @@ function ClusterPage({
             ) : (
               <EmptyState
                 icon="⇄"
-                title="No cursor data"
-                message="The current node did not return vector cursor evidence."
+                title={tr("Нет данных курсора", "No cursor data")}
+                message={tr(
+                  "Текущий узел не вернул сведения о векторном курсоре.",
+                  "The current node returned no vector cursor data.",
+                )}
               />
             )}
           </div>
         </Panel>
-        <Panel eyebrow="Node health" title="Runtime signals">
+        <Panel
+          eyebrow={tr("Состояние узлов", "Node runtime")}
+          title={tr("Рабочие показатели", "Operational signals")}
+        >
           <div className="runtime-signals">
             <span>
-              <small>Cluster events</small>
-              <b>{meta.eventCount == null ? "Unknown" : meta.eventCount.toLocaleString()}</b>
+              <small>{tr("События кластера", "Cluster events")}</small>
+              <b>
+                {meta.eventCount == null
+                  ? tr("Нет данных", "No data")
+                  : meta.eventCount.toLocaleString(
+                      currentUiLanguage() === "ru" ? "ru-RU" : "en-US",
+                    )}
+              </b>
             </span>
             <span>
-              <small>Cursor origins</small>
+              <small>{tr("Источники курсора", "Cursor origins")}</small>
               <b>{cursorEntries.length}</b>
             </span>
             <span>
-              <small>Outbox depth</small>
-              <b>{outboxPending == null ? "Unknown" : outboxPending}</b>
+              <small>{tr("Очередь отправки", "Outbox queue")}</small>
+              <b>{outboxPending == null ? tr("Нет данных", "No data") : outboxPending}</b>
             </span>
             <span>
-              <small>Known nodes</small>
+              <small>{tr("Известные узлы", "Known nodes")}</small>
               <b>{nodes.length}</b>
             </span>
           </div>
@@ -5878,7 +6772,7 @@ function ClusterPage({
             rel="noreferrer"
           >
             <Icon symbol="↗" />
-            Open application metrics
+            {tr("Открыть метрики приложения", "Open application metrics")}
           </a>
         </Panel>
       </div>
@@ -5919,7 +6813,7 @@ function AuditPage({
             .toLowerCase()
             .includes(query.toLowerCase()) &&
           (scope === "all" ||
-            (scope === "system" ? item.actor === "system" : item.actor !== "system")) &&
+            (scope === "system" ? isSystemActor(item.actor) : !isSystemActor(item.actor))) &&
           (cutoff == null ||
             (Number.isFinite(Date.parse(item.at)) && Date.parse(item.at) >= cutoff)),
       ),
@@ -5947,24 +6841,32 @@ function AuditPage({
   return (
     <div className="page-stack audit-page">
       <PageHeading
-        eyebrow="Immutable operations trail"
-        title="Audit log"
-        description="Authentication, configuration, and incident actions recorded by the API node serving this session."
+        eyebrow={tr("Неизменяемая история", "Immutable history")}
+        title={tr("Журнал действий", "Audit log")}
+        description={tr(
+          "Входы, изменения конфигурации и действия с инцидентами, записанные обслуживающим API-узлом.",
+          "Sign-ins, configuration changes, and incident actions recorded by the serving API node.",
+        )}
         actions={
           <button className="button button--quiet" onClick={exportLoaded} disabled={!items.length}>
             <Icon symbol="⇩" />
-            Export loaded JSONL
+            {tr("Скачать загруженный JSONL", "Download loaded JSONL")}
           </button>
         }
       />
       <div className={`audit-current-health audit-current-health--${clusterHealth}`}>
         <StatusDot health={clusterHealth} />
         <span>
-          <b>Current cluster status</b>
+          <b>{tr("Текущее состояние кластера", "Current cluster health")}</b>
           <small>
             {nodes.length
-              ? `${healthyNodes}/${nodes.length} nodes healthy. Audit failures below are historical events, not active alarms.`
-              : "Live cluster telemetry is not available."}
+              ? currentUiLanguage() === "ru"
+                ? `${healthyNodes}/${nodes.length} узлов работают. Ошибки ниже — исторические события, а не активные тревоги.`
+                : `${healthyNodes}/${nodes.length} nodes are healthy. Errors below are historical events, not active alerts.`
+              : tr(
+                  "Актуальная телеметрия кластера недоступна.",
+                  "Current cluster telemetry is unavailable.",
+                )}
           </small>
         </span>
       </div>
@@ -5972,44 +6874,44 @@ function AuditPage({
         <div className="filter-bar">
           <label className="search-field">
             <Icon symbol="⌕" />
-            <span className="sr-only">Search audit log</span>
+            <span className="sr-only">{tr("Поиск в журнале действий", "Search audit log")}</span>
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search actor, action, node…"
+              placeholder={tr("Оператор, действие или узел…", "Operator, action, or node…")}
             />
           </label>
           <div className="segmented">
             <button className={scope === "all" ? "active" : ""} onClick={() => setScope("all")}>
-              All
+              {tr("Все", "All")}
             </button>
             <button
               className={scope === "operator" ? "active" : ""}
               onClick={() => setScope("operator")}
             >
-              Operator
+              {tr("Оператор", "Operator")}
             </button>
             <button
               className={scope === "system" ? "active" : ""}
               onClick={() => setScope("system")}
             >
-              System
+              {tr("Система", "System")}
             </button>
           </div>
           <label className="compact-select">
-            <span className="sr-only">Audit date range</span>
+            <span className="sr-only">{tr("Период журнала", "Audit range")}</span>
             <select value={range} onChange={(event) => setRange(event.target.value)}>
-              <option value="7d">Last 7 days</option>
-              <option value="30d">Last 30 days</option>
-              <option value="all">All loaded history</option>
+              <option value="7d">{tr("Последние 7 дней", "Last 7 days")}</option>
+              <option value="30d">{tr("Последние 30 дней", "Last 30 days")}</option>
+              <option value="all">{tr("Вся загруженная история", "All loaded history")}</option>
             </select>
           </label>
         </div>
         <div className="audit-date-row">
           <span>
             {filtered[0]
-              ? `${formatDay(filtered[0].at)} · ${filtered.length} event${filtered.length === 1 ? "" : "s"}`
-              : "Audit trail"}
+              ? `${formatDay(filtered[0].at)} · ${tr("событий", "events")}: ${filtered.length}`
+              : tr("Журнал действий", "Audit log")}
           </span>
           <i />
         </div>
@@ -6033,13 +6935,13 @@ function AuditPage({
                 <span className="audit-item__body">
                   <b>
                     {item.actionCode === "cluster_auth_failed"
-                      ? "Rejected cluster-auth attempt"
+                      ? tr("Отклонённая попытка входа в кластер", "Rejected cluster sign-in")
                       : item.action}
                   </b>
                   <p>{item.detail}</p>
                   <small>
                     <span className="avatar avatar--tiny">
-                      {item.actor === "system" ? "AH" : "OP"}
+                      {isSystemActor(item.actor) ? "AH" : "OP"}
                     </span>
                     {item.actor} <i /> <code>{item.node}</code>
                   </small>
@@ -6048,8 +6950,16 @@ function AuditPage({
                 {item.count > 1 ? (
                   <span
                     className="audit-item__count"
-                    title={`${item.count} identical events from ${formatDate(item.oldestAt)} through ${formatDate(item.at)}`}
-                    aria-label={`${item.count} identical events in this burst`}
+                    title={
+                      currentUiLanguage() === "ru"
+                        ? `${item.count} одинаковых событий с ${formatDate(item.oldestAt)} по ${formatDate(item.at)}`
+                        : `${item.count} identical events from ${formatDate(item.oldestAt)} through ${formatDate(item.at)}`
+                    }
+                    aria-label={
+                      currentUiLanguage() === "ru"
+                        ? `${item.count} одинаковых событий в этой группе`
+                        : `${item.count} identical events in this group`
+                    }
                   >
                     ×{item.count}
                   </span>
@@ -6062,8 +6972,11 @@ function AuditPage({
         ) : (
           <EmptyState
             icon="⌕"
-            title="No matching audit entries"
-            message="Try another actor or search term."
+            title={tr("Записи не найдены", "No entries found")}
+            message={tr(
+              "Измените фильтр или поисковый запрос.",
+              "Adjust the filter or search query.",
+            )}
           />
         )}
         {canLoadMore && (
@@ -6075,8 +6988,8 @@ function AuditPage({
               disabled={loadingMore || readOnly}
             >
               {loadingMore
-                ? "Loading older events…"
-                : `Load older events (${items.length}/${knownTotal})`}
+                ? tr("Загружаем старые события…", "Loading older events…")
+                : `${tr("Загрузить старые события", "Load older events")} (${items.length}/${knownTotal})`}
             </button>
           </div>
         )}
@@ -6088,16 +7001,17 @@ function AuditPage({
         <div className="audit-integrity">
           <Icon symbol="◇" />
           <span>
-            <b>Audit storage policy</b>
+            <b>{tr("Хранение журнала", "Audit retention")}</b>
             <small>
-              Entries are append-only on this node. Burst grouping changes only this view; export
-              retains every field returned by the API for every loaded event. Secrets and
-              authorization headers are never recorded.
+              {tr(
+                "Записи на узле только добавляются. Группировка повторов меняет лишь отображение; экспорт сохраняет все поля API. Секреты и заголовки авторизации не записываются.",
+                "Node records are append-only. Grouping repeated events changes only the display; export preserves every API field. Secrets and authorization headers are not recorded.",
+              )}
             </small>
           </span>
           <span>
             <StatusDot health="unknown" />
-            {items.length}/{knownTotal} loaded
+            {tr("Загружено", "Loaded")} {items.length}/{knownTotal}
           </span>
         </div>
       </Panel>
@@ -6181,40 +7095,51 @@ function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boo
   return (
     <div className="page-stack settings-page">
       <PageHeading
-        eyebrow="Local & cluster configuration"
-        title="Settings"
-        description="Device preferences stay local. Cluster settings replicate as auditable configuration events."
+        eyebrow={tr("Локальная и общая конфигурация", "Local and shared configuration")}
+        title={tr("Настройки", "Settings")}
+        description={tr(
+          "Параметры устройства хранятся локально, а изменения кластера записываются в журнал и реплицируются.",
+          "Device preferences stay local while cluster changes are audited and replicated.",
+        )}
       />
-      <div className="settings-grid">
-        <nav className="settings-nav" aria-label="Settings sections">
-          <button className="active" disabled>
-            <Icon symbol="◫" />
-            General
-          </button>
-        </nav>
+      <div className="settings-grid settings-grid--single">
         <div className="settings-content">
-          <Panel eyebrow="Appearance" title="Interface preferences">
+          <Panel
+            eyebrow={tr("Внешний вид", "Appearance")}
+            title={tr("Параметры интерфейса", "Interface preferences")}
+          >
             <div className="setting-row">
               <span>
-                <b>Theme</b>
-                <small>{appName} uses a dark operations palette.</small>
+                <b>{tr("Тема", "Theme")}</b>
+                <small>
+                  {appName}{" "}
+                  {tr(
+                    "использует тёмную контрастную палитру.",
+                    "uses a high-contrast dark palette.",
+                  )}
+                </small>
               </span>
               <span className="theme-picker">
                 <button className="active" disabled>
                   <i />
-                  Dark
+                  {tr("Тёмная", "Dark")}
                 </button>
                 <button disabled>
                   <i />
-                  System
+                  {tr("Системная", "System")}
                 </button>
               </span>
             </div>
           </Panel>
-          <Panel eyebrow="Resilient client" title="Saved API endpoints">
+          <Panel
+            eyebrow={tr("Отказоустойчивый клиент", "Failover-aware client")}
+            title={tr("Сохранённые адреса API", "Saved API endpoints")}
+          >
             <p className="settings-intro">
-              When the current node is unavailable, the PWA can try another trusted cluster URL for
-              read access.
+              {tr(
+                "Если текущий узел недоступен, PWA может прочитать данные через другой доверенный адрес кластера.",
+                "If the current node is unavailable, the PWA can read through another trusted cluster endpoint.",
+              )}
             </p>
             <div className="endpoint-list">
               {availableEndpoints.map((item, index) => (
@@ -6222,33 +7147,45 @@ function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boo
                   <span className="endpoint-order">{index + 1}</span>
                   <span>
                     <b>{item}</b>
-                    <small>Verified from the authenticated cluster inventory</small>
+                    <small>
+                      {tr(
+                        "Подтверждено авторизованным ответом кластера",
+                        "Verified by an authenticated cluster response",
+                      )}
+                    </small>
                   </span>
                   <StatusDot health={enabledEndpoints.includes(item) ? "unknown" : "paused"} />
                   <button
                     className="button button--quiet button--small"
                     onClick={() => toggleEndpoint(item)}
                     disabled={readOnly}
-                    aria-label={`${enabledEndpoints.includes(item) ? "Disable" : "Enable"} failover to ${item}`}
+                    aria-label={`${enabledEndpoints.includes(item) ? tr("Отключить", "Disable") : tr("Включить", "Enable")} ${tr("переключение на", "failover to")} ${item}`}
                   >
-                    {enabledEndpoints.includes(item) ? "Disable" : "Enable"}
+                    {enabledEndpoints.includes(item)
+                      ? tr("Отключить", "Disable")
+                      : tr("Включить", "Enable")}
                   </button>
                 </div>
               ))}
               {!availableEndpoints.length && (
                 <EmptyState
                   icon="⇄"
-                  title="No saved peer endpoints"
-                  message="Verified HTTPS public API URLs discovered from cluster reads appear here."
+                  title={tr("Нет сохранённых адресов узлов", "No saved node endpoints")}
+                  message={tr(
+                    "Здесь появятся публичные HTTPS-адреса API, подтверждённые данными кластера.",
+                    "Public HTTPS API endpoints verified by cluster data appear here.",
+                  )}
                 />
               )}
             </div>
             <div className="setting-row setting-row--border">
               <span>
-                <b>Automatic read failover</b>
+                <b>{tr("Автоматическое переключение чтения", "Automatic read failover")}</b>
                 <small>
-                  Try enabled, authenticated cluster endpoints when the current API node is
-                  unavailable.
+                  {tr(
+                    "Использовать активные авторизованные адреса кластера, если текущий API-узел недоступен.",
+                    "Use active authenticated cluster endpoints when the current API node is unavailable.",
+                  )}
                 </small>
               </span>
               <Toggle
@@ -6257,32 +7194,44 @@ function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boo
                   setAutoFailover(checked);
                   localStorage.setItem("alert-hub-auto-failover", String(checked));
                 }}
-                label="Automatic read failover"
+                label={tr("Автоматическое переключение чтения", "Automatic read failover")}
                 disabled={readOnly}
               />
             </div>
           </Panel>
-          <Panel eyebrow="Cluster identity" title="Application settings">
+          <Panel
+            eyebrow={tr("Идентификация кластера", "Cluster identity")}
+            title={tr("Параметры приложения", "Application settings")}
+          >
             <div className="form-grid">
               <label>
-                <span>Display name</span>
+                <span>{tr("Название", "Name")}</span>
                 <input value={appName} readOnly aria-readonly="true" />
               </label>
             </div>
             <div className="settings-actions">
               <span>
                 <Icon symbol="i" />
-                Display name is controlled by the server-side APP_NAME setting and is read-only
-                here.
+                {tr(
+                  "Название задаётся серверной переменной APP_NAME и доступно здесь только для чтения.",
+                  "The name comes from the APP_NAME server variable and is read-only here.",
+                )}
               </span>
             </div>
           </Panel>
-          <Panel className="danger-panel" eyebrow="Maintenance" title="Local application data">
+          <Panel
+            className="danger-panel"
+            eyebrow={tr("Обслуживание", "Maintenance")}
+            title={tr("Локальные данные приложения", "Local application data")}
+          >
             <div className="setting-row">
               <span>
-                <b>Clear cached snapshot</b>
+                <b>{tr("Очистить сохранённый снимок", "Clear saved snapshot")}</b>
                 <small>
-                  Removes read-only incident data from this device. Cluster data is unaffected.
+                  {tr(
+                    "Удаляет с устройства локальную копию данных. Данные кластера не изменятся.",
+                    "Removes the local data copy from this device. Cluster data is unchanged.",
+                  )}
                 </small>
               </span>
               <button
@@ -6290,10 +7239,15 @@ function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boo
                 disabled={readOnly}
                 onClick={() => {
                   pruneReadCaches(null);
-                  setCacheMessage("Authenticated read caches were cleared on this device.");
+                  setCacheMessage(
+                    tr(
+                      "Локальный кэш данных очищен на этом устройстве.",
+                      "The local data cache was cleared on this device.",
+                    ),
+                  );
                 }}
               >
-                Clear cache
+                {tr("Очистить кэш", "Clear cache")}
               </button>
             </div>
             {cacheMessage && (
@@ -6345,7 +7299,13 @@ function Modal({
   );
 }
 
-function CopyButton({ value, label = "Copy" }: { value: string; label?: string }) {
+function CopyButton({
+  value,
+  label = tr("Копировать", "Copy"),
+}: {
+  value: string;
+  label?: string;
+}) {
   const [copied, setCopied] = useState(false);
   return (
     <button
@@ -6358,7 +7318,7 @@ function CopyButton({ value, label = "Copy" }: { value: string; label?: string }
       }}
     >
       <Icon symbol={copied ? "✓" : "□"} />
-      {copied ? "Copied" : label}
+      {copied ? tr("Скопировано", "Copied") : label}
     </button>
   );
 }
@@ -6406,7 +7366,10 @@ function SourceWizard({
                   interval_seconds: Number(interval),
                   grace_seconds: Number(grace),
                   severity: heartbeatSeverity,
-                  labels: parseKeyValueLines(heartbeatLabels, "Heartbeat labels"),
+                  labels: parseKeyValueLines(
+                    heartbeatLabels,
+                    tr("Метки контрольного сигнала", "Heartbeat labels"),
+                  ),
                 }
               : {},
         }),
@@ -6416,7 +7379,11 @@ function SourceWizard({
       onCreated(normalizeSource(body, 0));
       setStep(3);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Source could not be created.");
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось создать источник.", "Source could not be created."),
+      );
     } finally {
       setSaving(false);
     }
@@ -6430,41 +7397,56 @@ function SourceWizard({
         await mutationJson(`/sources/${encodeURIComponent(created.id)}/test`, { method: "POST" }),
       );
       setTestOutcome(
-        `Accepted ${Number(body.accepted ?? 0)} event; incident ${String(body.incident_id ?? "returned by API")}.`,
+        currentUiLanguage() === "ru"
+          ? `Принято событий: ${Number(body.accepted ?? 0)}; инцидент: ${String(body.incident_id ?? "возвращён API")}.`
+          : `Accepted ${Number(body.accepted ?? 0)} event; incident ${String(body.incident_id ?? "returned by API")}.`,
       );
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Source test failed.");
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось проверить источник.", "Source test failed."),
+      );
     }
   };
   return (
-    <Modal onClose={onClose} size="large" label="Add source">
+    <Modal onClose={onClose} size="large" label={tr("Добавить источник", "Add source")}>
       <div className="modal-head">
         <div>
-          <span className="eyebrow">Source onboarding</span>
-          <h2>{step === 3 ? "Source created" : "Add event source"}</h2>
+          <span className="eyebrow">{tr("Подключение источника", "Source onboarding")}</span>
+          <h2>
+            {step === 3
+              ? tr("Источник создан", "Source created")
+              : tr("Добавить источник событий", "Add event source")}
+          </h2>
         </div>
-        <button className="icon-button" onClick={onClose} aria-label="Close">
+        <button className="icon-button" onClick={onClose} aria-label={tr("Закрыть", "Close")}>
           <Icon symbol="×" />
         </button>
       </div>
       <div className="wizard-progress">
         <span className={step >= 1 ? "active" : ""}>
-          <i>{step > 1 ? "✓" : "1"}</i>Type
+          <i>{step > 1 ? "✓" : "1"}</i>
+          {tr("Тип", "Type")}
         </span>
         <b />
         <span className={step >= 2 ? "active" : ""}>
-          <i>{step > 2 ? "✓" : "2"}</i>Configure
+          <i>{step > 2 ? "✓" : "2"}</i>
+          {tr("Настройка", "Configure")}
         </span>
         <b />
         <span className={step >= 3 ? "active" : ""}>
-          <i>3</i>Connect
+          <i>3</i>
+          {tr("Подключение", "Connect")}
         </span>
       </div>
       {step === 1 && (
         <div className="wizard-body">
           <p className="wizard-intro">
-            Choose how events will enter this cluster. You can change routing later without rotating
-            the source token.
+            {tr(
+              "Выберите способ приёма событий. Маршрутизацию можно изменить позже без обновления токена источника.",
+              "Choose how events will enter this cluster. You can change routing later without rotating the source token.",
+            )}
           </p>
           <div className="source-type-picker">
             <button
@@ -6475,9 +7457,12 @@ function SourceWizard({
               <span>
                 <b>Alertmanager</b>
                 <small>
-                  Official grouped webhook payload. Each alert is normalized independently.
+                  {tr(
+                    "Официальный сгруппированный вебхук. Каждая тревога обрабатывается отдельно.",
+                    "Official grouped webhook payload. Each alert is normalized independently.",
+                  )}
                 </small>
-                <em>Recommended</em>
+                <em>{tr("Рекомендуется", "Recommended")}</em>
               </span>
               <i />
             </button>
@@ -6487,8 +7472,12 @@ function SourceWizard({
             >
               <SourceKindIcon kind="generic_json" />
               <span>
-                <b>Generic JSON</b>
-                <small>Send events using the stable {appName} schema.</small>
+                <b>{tr("JSON-вебхук", "Generic JSON")}</b>
+                <small>
+                  {currentUiLanguage() === "ru"
+                    ? `Отправляйте события по стабильной схеме ${appName}.`
+                    : `Send events using the stable ${appName} schema.`}
+                </small>
               </span>
               <i />
             </button>
@@ -6498,8 +7487,13 @@ function SourceWizard({
             >
               <SourceKindIcon kind="heartbeat" />
               <span>
-                <b>Heartbeat</b>
-                <small>Fire when a scheduled signal misses its grace window.</small>
+                <b>{tr("Контрольный сигнал", "Heartbeat")}</b>
+                <small>
+                  {tr(
+                    "Создаёт тревогу, если ожидаемый сигнал не пришёл вовремя.",
+                    "Fire when a scheduled signal misses its grace window.",
+                  )}
+                </small>
               </span>
               <i />
             </button>
@@ -6510,42 +7504,52 @@ function SourceWizard({
         <form id="source-config-form" className="wizard-body source-config-form" onSubmit={create}>
           <div className="form-grid">
             <label>
-              <span>Source name</span>
+              <span>{tr("Название источника", "Source name")}</span>
               <input
                 required
                 autoFocus
                 value={name}
                 onChange={(event) => setName(event.target.value)}
-                placeholder={kind === "heartbeat" ? "Billing heartbeat" : "Prometheus EU"}
+                placeholder={
+                  kind === "heartbeat"
+                    ? tr("Контроль биллинга", "Billing heartbeat")
+                    : "Prometheus EU"
+                }
               />
             </label>
             <label>
-              <span>Nearest region</span>
+              <span>{tr("Ближайший регион", "Nearest region")}</span>
               <input
                 value={region}
                 onChange={(event) => setRegion(event.target.value)}
-                placeholder="Region label (optional)"
+                placeholder={tr("Метка региона (необязательно)", "Region label (optional)")}
               />
             </label>
           </div>
           {kind !== "heartbeat" && (
             <label className="full-field">
               <span>
-                Allowed source IP / CIDR <em>Optional</em>
+                {tr("Разрешённый IP / CIDR", "Allowed source IP / CIDR")}{" "}
+                <em>{tr("Необязательно", "Optional")}</em>
               </span>
               <input
                 value={cidr}
                 onChange={(event) => setCidr(event.target.value)}
                 placeholder="10.14.0.0/16"
               />
-              <small>Requests still require the bearer token. Private CIDRs are recommended.</small>
+              <small>
+                {tr(
+                  "Bearer-токен всё равно обязателен. Рекомендуются приватные CIDR.",
+                  "Requests still require the bearer token. Private CIDRs are recommended.",
+                )}
+              </small>
             </label>
           )}
           {kind === "heartbeat" && (
             <>
               <div className="form-grid">
                 <label>
-                  <span>Expected interval</span>
+                  <span>{tr("Ожидаемый интервал", "Expected interval")}</span>
                   <div className="input-suffix">
                     <input
                       type="number"
@@ -6553,11 +7557,11 @@ function SourceWizard({
                       value={interval}
                       onChange={(event) => setIntervalValue(event.target.value)}
                     />
-                    <span>seconds</span>
+                    <span>{tr("секунд", "seconds")}</span>
                   </div>
                 </label>
                 <label>
-                  <span>Grace period</span>
+                  <span>{tr("Допустимая задержка", "Grace period")}</span>
                   <div className="input-suffix">
                     <input
                       type="number"
@@ -6565,39 +7569,54 @@ function SourceWizard({
                       value={grace}
                       onChange={(event) => setGrace(event.target.value)}
                     />
-                    <span>seconds</span>
+                    <span>{tr("секунд", "seconds")}</span>
                   </div>
                 </label>
                 <label>
-                  <span>Missed heartbeat severity</span>
+                  <span>{tr("Критичность пропуска", "Missed heartbeat severity")}</span>
                   <select
                     value={heartbeatSeverity}
                     onChange={(event) => setHeartbeatSeverity(event.target.value as Severity)}
                   >
-                    <option value="critical">Critical</option>
-                    <option value="warning">Warning</option>
-                    <option value="info">Info</option>
-                    <option value="unknown">Unknown</option>
+                    <option value="critical">{tr("Критическая", "Critical")}</option>
+                    <option value="warning">{tr("Предупреждение", "Warning")}</option>
+                    <option value="info">{tr("Информация", "Info")}</option>
+                    <option value="unknown">{tr("Неизвестно", "Unknown")}</option>
                   </select>
                 </label>
               </div>
               <label className="full-field">
-                <span>Heartbeat labels · one key=value per line</span>
+                <span>
+                  {tr(
+                    "Метки сигнала · одна пара key=value в строке",
+                    "Heartbeat labels · one key=value per line",
+                  )}
+                </span>
                 <textarea
                   value={heartbeatLabels}
                   onChange={(event) => setHeartbeatLabels(event.target.value)}
                   placeholder={"service=billing\nenvironment=production"}
                   rows={3}
                 />
-                <small>These labels are attached to the missed-heartbeat incident.</small>
+                <small>
+                  {tr(
+                    "Эти метки добавляются к инциденту о пропущенном сигнале.",
+                    "These labels are attached to the missed-heartbeat incident.",
+                  )}
+                </small>
               </label>
             </>
           )}
           <div className="token-safety-note">
             <Icon symbol="◇" />
             <span>
-              <b>The bearer token is stored as a hash.</b> It will be shown exactly once after
-              creation. Losing it requires rotation.
+              <b>
+                {tr("Bearer-токен хранится в виде хэша.", "The bearer token is stored as a hash.")}
+              </b>{" "}
+              {tr(
+                "После создания он показывается один раз. Если токен потерян, его придётся обновить.",
+                "It will be shown exactly once after creation. Losing it requires rotation.",
+              )}
             </span>
           </div>
           {error && (
@@ -6625,15 +7644,18 @@ function SourceWizard({
           )}
           <div className="verification-note">
             <span>
-              <b>1</b>Copy the credential
+              <b>1</b>
+              {tr("Скопировать данные доступа", "Copy the credential")}
             </span>
             <i />
             <span>
-              <b>2</b>Apply and validate config
+              <b>2</b>
+              {tr("Применить и проверить конфигурацию", "Apply and validate config")}
             </span>
             <i />
             <span>
-              <b>3</b>Send a test event
+              <b>3</b>
+              {tr("Отправить тестовое событие", "Send a test event")}
             </span>
           </div>
         </div>
@@ -6642,10 +7664,10 @@ function SourceWizard({
         {step === 1 && (
           <>
             <button className="text-button" onClick={onClose}>
-              Cancel
+              {tr("Отмена", "Cancel")}
             </button>
             <button className="button button--primary" onClick={() => setStep(2)}>
-              Continue <Icon symbol="→" />
+              {tr("Продолжить", "Continue")} <Icon symbol="→" />
             </button>
           </>
         )}
@@ -6653,7 +7675,7 @@ function SourceWizard({
           <>
             <button className="text-button" onClick={() => setStep(1)}>
               <Icon symbol="←" />
-              Back
+              {tr("Назад", "Back")}
             </button>
             <button
               className="button button--primary"
@@ -6661,7 +7683,7 @@ function SourceWizard({
               form="source-config-form"
               disabled={!name.trim() || saving}
             >
-              {saving ? "Creating…" : "Create source"}
+              {saving ? tr("Создаём…", "Creating…") : tr("Создать источник", "Create source")}
             </button>
           </>
         )}
@@ -6669,10 +7691,10 @@ function SourceWizard({
           <>
             <button className="button button--quiet" onClick={() => void testCreatedSource()}>
               <Icon symbol="▷" />
-              Send test event
+              {tr("Отправить тестовое событие", "Send test event")}
             </button>
             <button className="button button--primary" onClick={onClose}>
-              I saved the token
+              {tr("Я сохранил токен", "I saved the token")}
             </button>
           </>
         )}
@@ -6694,10 +7716,20 @@ function parseKeyValueLines(value: string, label: string) {
     const line = raw.trim();
     if (!line) continue;
     const separator = line.indexOf("=");
-    if (separator <= 0) throw new Error(`${label} line ${index + 1} must use key=value.`);
+    if (separator <= 0)
+      throw new Error(
+        currentUiLanguage() === "ru"
+          ? `${label}: строка ${index + 1} должна иметь вид key=value.`
+          : `${label} line ${index + 1} must use key=value.`,
+      );
     const key = line.slice(0, separator).trim();
     const item = line.slice(separator + 1).trim();
-    if (!key || !item) throw new Error(`${label} line ${index + 1} cannot be blank.`);
+    if (!key || !item)
+      throw new Error(
+        currentUiLanguage() === "ru"
+          ? `${label}: строка ${index + 1} не может быть пустой.`
+          : `${label} line ${index + 1} cannot be blank.`,
+      );
     entries.push([key, item]);
   }
   return Object.fromEntries(entries);
@@ -6710,10 +7742,19 @@ function parseHeaderLines(value: string) {
     if (!line) continue;
     const separator = line.indexOf(":");
     if (separator <= 0)
-      throw new Error(`Webhook header line ${index + 1} must use Header-Name: value.`);
+      throw new Error(
+        currentUiLanguage() === "ru"
+          ? `Строка заголовка вебхука ${index + 1} должна иметь вид Header-Name: value.`
+          : `Webhook header line ${index + 1} must use Header-Name: value.`,
+      );
     const name = line.slice(0, separator).trim();
     const item = line.slice(separator + 1).trim();
-    if (!name || !item) throw new Error(`Webhook header line ${index + 1} cannot be blank.`);
+    if (!name || !item)
+      throw new Error(
+        currentUiLanguage() === "ru"
+          ? `Строка заголовка вебхука ${index + 1} не может быть пустой.`
+          : `Webhook header line ${index + 1} cannot be blank.`,
+      );
     entries.push([name, item]);
   }
   return Object.fromEntries(entries);
@@ -6785,26 +7826,38 @@ function ChannelWizard({
       });
       onCreated(normalizeChannel(body, 0));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Channel could not be created.");
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось создать канал.", "Channel could not be created."),
+      );
     } finally {
       setSaving(false);
     }
   };
   return (
-    <Modal onClose={onClose} size="large" label="Add notification channel">
+    <Modal
+      onClose={onClose}
+      size="large"
+      label={tr("Добавить канал уведомлений", "Add notification channel")}
+    >
       <div className="modal-head">
         <div>
-          <span className="eyebrow">Live delivery provider</span>
-          <h2>Add notification channel</h2>
+          <span className="eyebrow">{tr("Провайдер доставки", "Live delivery provider")}</span>
+          <h2>{tr("Добавить канал уведомлений", "Add notification channel")}</h2>
         </div>
-        <button className="icon-button" onClick={onClose} aria-label="Close channel dialog">
+        <button
+          className="icon-button"
+          onClick={onClose}
+          aria-label={tr("Закрыть окно канала", "Close channel dialog")}
+        >
           <Icon symbol="×" />
         </button>
       </div>
       <form id="channel-create-form" className="wizard-body source-config-form" onSubmit={submit}>
         <div className="form-grid">
           <label>
-            <span>Channel name</span>
+            <span>{tr("Название канала", "Channel name")}</span>
             <input
               value={name}
               onChange={(event) => setName(event.target.value)}
@@ -6813,7 +7866,7 @@ function ChannelWizard({
             />
           </label>
           <label>
-            <span>Provider type</span>
+            <span>{tr("Тип провайдера", "Provider type")}</span>
             <select
               value={kind}
               onChange={(event) => setKind(event.target.value as Channel["kind"])}
@@ -6821,14 +7874,14 @@ function ChannelWizard({
               <option value="web_push">Web Push</option>
               <option value="telegram">Telegram</option>
               <option value="smtp">SMTP</option>
-              <option value="generic_webhook">Generic webhook</option>
+              <option value="generic_webhook">{tr("Вебхук", "Generic webhook")}</option>
             </select>
           </label>
         </div>
         {kind === "telegram" && (
           <div className="form-grid">
             <label>
-              <span>Bot token · write-only field</span>
+              <span>{tr("Токен бота · только для записи", "Bot token · write-only field")}</span>
               <input
                 type="password"
                 autoComplete="new-password"
@@ -6838,7 +7891,7 @@ function ChannelWizard({
               />
             </label>
             <label>
-              <span>Chat ID</span>
+              <span>{tr("ID чата", "Chat ID")}</span>
               <input value={chatId} onChange={(event) => setChatId(event.target.value)} required />
             </label>
           </div>
@@ -6847,7 +7900,7 @@ function ChannelWizard({
           <>
             <div className="form-grid">
               <label>
-                <span>SMTP host</span>
+                <span>{tr("Сервер SMTP", "SMTP host")}</span>
                 <input
                   value={smtpHost}
                   onChange={(event) => setSmtpHost(event.target.value)}
@@ -6855,7 +7908,7 @@ function ChannelWizard({
                 />
               </label>
               <label>
-                <span>Port</span>
+                <span>{tr("Порт", "Port")}</span>
                 <input
                   type="number"
                   min="1"
@@ -6866,14 +7919,14 @@ function ChannelWizard({
                 />
               </label>
               <label>
-                <span>TLS mode</span>
+                <span>{tr("Режим TLS", "TLS mode")}</span>
                 <select value={smtpTls} onChange={(event) => setSmtpTls(event.target.value)}>
                   <option value="starttls">STARTTLS</option>
-                  <option value="implicit">Implicit TLS</option>
+                  <option value="implicit">{tr("Неявный TLS", "Implicit TLS")}</option>
                 </select>
               </label>
               <label>
-                <span>From address</span>
+                <span>{tr("Адрес отправителя", "From address")}</span>
                 <input
                   type="email"
                   value={smtpFrom}
@@ -6882,7 +7935,7 @@ function ChannelWizard({
                 />
               </label>
               <label>
-                <span>Recipients · comma separated</span>
+                <span>{tr("Получатели · через запятую", "Recipients · comma separated")}</span>
                 <input
                   value={smtpTo}
                   onChange={(event) => setSmtpTo(event.target.value)}
@@ -6890,7 +7943,7 @@ function ChannelWizard({
                 />
               </label>
               <label>
-                <span>Username · optional</span>
+                <span>{tr("Имя пользователя · необязательно", "Username · optional")}</span>
                 <input
                   autoComplete="username"
                   value={smtpUsername}
@@ -6898,7 +7951,7 @@ function ChannelWizard({
                 />
               </label>
               <label>
-                <span>Password · write-only field</span>
+                <span>{tr("Пароль · только для записи", "Password · write-only field")}</span>
                 <input
                   type="password"
                   autoComplete="new-password"
@@ -6914,7 +7967,7 @@ function ChannelWizard({
           <>
             <div className="form-grid">
               <label>
-                <span>HTTPS webhook URL</span>
+                <span>{tr("HTTPS URL вебхука", "HTTPS webhook URL")}</span>
                 <input
                   type="url"
                   value={webhookUrl}
@@ -6923,7 +7976,12 @@ function ChannelWizard({
                 />
               </label>
               <label>
-                <span>HMAC secret · optional, write-only field</span>
+                <span>
+                  {tr(
+                    "Секрет HMAC · необязательно, только для записи",
+                    "HMAC secret · optional, write-only field",
+                  )}
+                </span>
                 <input
                   type="password"
                   autoComplete="new-password"
@@ -6932,7 +7990,7 @@ function ChannelWizard({
                 />
               </label>
               <label>
-                <span>HMAC signature header</span>
+                <span>{tr("Заголовок подписи HMAC", "HMAC signature header")}</span>
                 <input
                   value={signatureHeader}
                   onChange={(event) => setSignatureHeader(event.target.value)}
@@ -6942,7 +8000,12 @@ function ChannelWizard({
               </label>
             </div>
             <label className="full-field">
-              <span>Custom headers · one Header-Name: value per line</span>
+              <span>
+                {tr(
+                  "Свои заголовки · один Header-Name: value в строке",
+                  "Custom headers · one Header-Name: value per line",
+                )}
+              </span>
               <textarea
                 value={webhookHeaders}
                 onChange={(event) => setWebhookHeaders(event.target.value)}
@@ -6951,7 +8014,10 @@ function ChannelWizard({
                 autoComplete="off"
               />
               <small>
-                Header values are encrypted as provider credentials and never returned by the API.
+                {tr(
+                  "Значения шифруются как данные доступа провайдера и не возвращаются через API.",
+                  "Header values are encrypted as provider credentials and never returned by the API.",
+                )}
               </small>
             </label>
           </>
@@ -6960,13 +8026,16 @@ function ChannelWizard({
           <div className="token-safety-note">
             <Icon symbol="i" />
             <span>
-              Web Push uses server VAPID configuration and registered browser subscriptions.
+              {tr(
+                "Web Push использует серверную конфигурацию VAPID и подписки браузеров.",
+                "Web Push uses server VAPID configuration and registered browser subscriptions.",
+              )}
             </span>
           </div>
         )}
         <div className="form-grid">
           <label>
-            <span>Eligible regions · optional</span>
+            <span>{tr("Допустимые регионы · необязательно", "Eligible regions · optional")}</span>
             <input
               value={regions}
               onChange={(event) => setRegions(event.target.value)}
@@ -6974,7 +8043,7 @@ function ChannelWizard({
             />
           </label>
           <label>
-            <span>Eligible node IDs · optional</span>
+            <span>{tr("ID допустимых узлов · необязательно", "Eligible node IDs · optional")}</span>
             <input
               value={nodeIds}
               onChange={(event) => setNodeIds(event.target.value)}
@@ -6984,7 +8053,12 @@ function ChannelWizard({
         </div>
         <div className="token-safety-note">
           <Icon symbol="◇" />
-          <span>Provider secrets are encrypted at rest and never returned after this request.</span>
+          <span>
+            {tr(
+              "Секреты провайдера шифруются и больше не возвращаются после этого запроса.",
+              "Provider secrets are encrypted at rest and never returned after this request.",
+            )}
+          </span>
         </div>
         {error && (
           <div className="permission-message permission-message--warning" role="alert">
@@ -6994,7 +8068,7 @@ function ChannelWizard({
       </form>
       <div className="modal-foot">
         <button className="text-button" onClick={onClose}>
-          Cancel
+          {tr("Отмена", "Cancel")}
         </button>
         <button
           className="button button--primary"
@@ -7002,7 +8076,7 @@ function ChannelWizard({
           form="channel-create-form"
           disabled={saving || !name.trim()}
         >
-          {saving ? "Creating…" : "Create channel"}
+          {saving ? tr("Создаём…", "Creating…") : tr("Создать канал", "Create channel")}
         </button>
       </div>
     </Modal>
@@ -7047,7 +8121,11 @@ function RouteWizard({
       });
       onCreated(normalizeRoute(body, 0));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Route could not be created.");
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось создать маршрут.", "Route could not be created."),
+      );
     } finally {
       setSaving(false);
     }
@@ -7058,20 +8136,28 @@ function RouteWizard({
       (!["exists", "not_exists"].includes(matcher.operator) && !matcher.value),
   );
   return (
-    <Modal onClose={onClose} size="large" label="Add notification route">
+    <Modal
+      onClose={onClose}
+      size="large"
+      label={tr("Добавить маршрут уведомлений", "Add notification route")}
+    >
       <div className="modal-head">
         <div>
-          <span className="eyebrow">Ordered evaluation</span>
-          <h2>Add notification route</h2>
+          <span className="eyebrow">{tr("Порядок обработки", "Ordered evaluation")}</span>
+          <h2>{tr("Добавить маршрут уведомлений", "Add notification route")}</h2>
         </div>
-        <button className="icon-button" onClick={onClose} aria-label="Close route dialog">
+        <button
+          className="icon-button"
+          onClick={onClose}
+          aria-label={tr("Закрыть окно маршрута", "Close route dialog")}
+        >
           <Icon symbol="×" />
         </button>
       </div>
       <form id="route-create-form" className="wizard-body source-config-form" onSubmit={submit}>
         <div className="form-grid">
           <label>
-            <span>Route name</span>
+            <span>{tr("Название маршрута", "Route name")}</span>
             <input
               value={name}
               onChange={(event) => setName(event.target.value)}
@@ -7080,7 +8166,9 @@ function RouteWizard({
             />
           </label>
           <label>
-            <span>Priority · lower evaluates first</span>
+            <span>
+              {tr("Приоритет · меньшее число раньше", "Priority · lower evaluates first")}
+            </span>
             <input
               type="number"
               min="-1000000"
@@ -7092,15 +8180,25 @@ function RouteWizard({
           </label>
         </div>
         <label className="full-field">
-          <span>Source IDs · optional, comma separated</span>
+          <span>
+            {tr(
+              "ID источников · необязательно, через запятую",
+              "Source IDs · optional, comma separated",
+            )}
+          </span>
           <input
             value={sources}
             onChange={(event) => setSources(event.target.value)}
-            placeholder="Empty matches any source"
+            placeholder={tr(
+              "Пустое поле соответствует любому источнику",
+              "Empty matches any source",
+            )}
           />
         </label>
         <fieldset className="choice-fieldset">
-          <legend>Severities · empty matches any</legend>
+          <legend>
+            {tr("Критичность · пустой выбор соответствует любой", "Severities · empty matches any")}
+          </legend>
           {["critical", "warning", "info", "unknown"].map((severity) => (
             <label key={severity}>
               <input
@@ -7114,16 +8212,21 @@ function RouteWizard({
                   )
                 }
               />{" "}
-              {titleCase(severity)}
+              {severityLabel(severity as Severity)}
             </label>
           ))}
         </fieldset>
         <fieldset className="matcher-builder">
-          <legend>Label matchers · all configured matchers must pass</legend>
+          <legend>
+            {tr(
+              "Условия по меткам · должны выполниться все",
+              "Label matchers · all configured matchers must pass",
+            )}
+          </legend>
           {labelMatchers.map((matcher, index) => (
             <div className="matcher-builder__row" key={index}>
               <label>
-                <span>Label name</span>
+                <span>{tr("Название метки", "Label name")}</span>
                 <input
                   value={matcher.name}
                   onChange={(event) =>
@@ -7137,7 +8240,7 @@ function RouteWizard({
                 />
               </label>
               <label>
-                <span>Operator</span>
+                <span>{tr("Оператор", "Operator")}</span>
                 <select
                   value={matcher.operator}
                   onChange={(event) =>
@@ -7148,16 +8251,18 @@ function RouteWizard({
                     )
                   }
                 >
-                  <option value="equals">Equals</option>
-                  <option value="not_equals">Does not equal</option>
-                  <option value="regex">Regex full match</option>
-                  <option value="not_regex">Does not regex-match</option>
-                  <option value="exists">Exists</option>
-                  <option value="not_exists">Does not exist</option>
+                  <option value="equals">{tr("Равно", "Equals")}</option>
+                  <option value="not_equals">{tr("Не равно", "Does not equal")}</option>
+                  <option value="regex">{tr("Полное совпадение regex", "Regex full match")}</option>
+                  <option value="not_regex">
+                    {tr("Не совпадает с regex", "Does not regex-match")}
+                  </option>
+                  <option value="exists">{tr("Существует", "Exists")}</option>
+                  <option value="not_exists">{tr("Не существует", "Does not exist")}</option>
                 </select>
               </label>
               <label>
-                <span>Value</span>
+                <span>{tr("Значение", "Value")}</span>
                 <input
                   value={matcher.value}
                   onChange={(event) =>
@@ -7179,9 +8284,13 @@ function RouteWizard({
                     current.filter((_, itemIndex) => itemIndex !== index),
                   )
                 }
-                aria-label={`Remove label matcher ${index + 1}`}
+                aria-label={
+                  currentUiLanguage() === "ru"
+                    ? `Удалить условие по метке ${index + 1}`
+                    : `Remove label matcher ${index + 1}`
+                }
               >
-                Remove
+                {tr("Удалить", "Remove")}
               </button>
             </div>
           ))}
@@ -7195,11 +8304,11 @@ function RouteWizard({
               ])
             }
           >
-            <Icon symbol="+" /> Add label matcher
+            <Icon symbol="+" /> {tr("Добавить условие", "Add label matcher")}
           </button>
         </fieldset>
         <fieldset className="choice-fieldset">
-          <legend>Destination channels</legend>
+          <legend>{tr("Каналы назначения", "Destination channels")}</legend>
           {channels.map((channel) => (
             <label key={channel.id}>
               <input
@@ -7213,7 +8322,7 @@ function RouteWizard({
                   )
                 }
               />{" "}
-              {channel.name} · {titleCase(channel.kind)}
+              {channel.name} · {channelKindLabel(channel.kind)}
             </label>
           ))}
         </fieldset>
@@ -7223,7 +8332,10 @@ function RouteWizard({
             checked={continueMatching}
             onChange={(event) => setContinueMatching(event.target.checked)}
           />{" "}
-          Continue evaluating later routes after a match
+          {tr(
+            "После совпадения проверять следующие маршруты",
+            "Continue evaluating later routes after a match",
+          )}
         </label>
         {error && (
           <div className="permission-message permission-message--warning" role="alert">
@@ -7233,7 +8345,7 @@ function RouteWizard({
       </form>
       <div className="modal-foot">
         <button className="text-button" onClick={onClose}>
-          Cancel
+          {tr("Отмена", "Cancel")}
         </button>
         <button
           className="button button--primary"
@@ -7241,7 +8353,7 @@ function RouteWizard({
           form="route-create-form"
           disabled={saving || !name.trim() || channelIds.length === 0 || invalidMatcher}
         >
-          {saving ? "Creating…" : "Create route"}
+          {saving ? tr("Создаём…", "Creating…") : tr("Создать маршрут", "Create route")}
         </button>
       </div>
     </Modal>
@@ -7289,19 +8401,33 @@ function DatasourceWizard({
       });
       onCreated(normalizeDatasource(body, 0));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Datasource could not be created.");
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось добавить источник данных.", "Datasource could not be created."),
+      );
     } finally {
       setSaving(false);
     }
   };
   return (
-    <Modal onClose={onClose} size="large" label="Add Prometheus datasource">
+    <Modal
+      onClose={onClose}
+      size="large"
+      label={tr("Добавить источник данных Prometheus", "Add Prometheus datasource")}
+    >
       <div className="modal-head">
         <div>
-          <span className="eyebrow">Fixed-query integration</span>
-          <h2>Add Prometheus datasource</h2>
+          <span className="eyebrow">
+            {tr("Интеграция с фиксированными запросами", "Fixed-query integration")}
+          </span>
+          <h2>{tr("Добавить Prometheus", "Add Prometheus datasource")}</h2>
         </div>
-        <button className="icon-button" onClick={onClose} aria-label="Close datasource dialog">
+        <button
+          className="icon-button"
+          onClick={onClose}
+          aria-label={tr("Закрыть окно источника данных", "Close datasource dialog")}
+        >
           <Icon symbol="×" />
         </button>
       </div>
@@ -7312,7 +8438,7 @@ function DatasourceWizard({
       >
         <div className="form-grid">
           <label>
-            <span>Datasource name</span>
+            <span>{tr("Название источника", "Datasource name")}</span>
             <input
               value={name}
               onChange={(event) => setName(event.target.value)}
@@ -7330,28 +8456,28 @@ function DatasourceWizard({
             />
           </label>
           <label>
-            <span>Owning node ID · optional</span>
+            <span>{tr("ID обслуживающего узла · необязательно", "Owning node ID · optional")}</span>
             <input value={nodeId} onChange={(event) => setNodeId(event.target.value)} />
           </label>
           <label>
-            <span>Region · optional</span>
+            <span>{tr("Регион · необязательно", "Region · optional")}</span>
             <input value={region} onChange={(event) => setRegion(event.target.value)} />
           </label>
           <label>
-            <span>Authentication</span>
+            <span>{tr("Аутентификация", "Authentication")}</span>
             <select
               value={authType}
               onChange={(event) => setAuthType(event.target.value as "none" | "bearer" | "basic")}
             >
-              <option value="none">None</option>
-              <option value="bearer">Bearer token</option>
-              <option value="basic">Basic auth</option>
+              <option value="none">{tr("Без аутентификации", "None")}</option>
+              <option value="bearer">{tr("Bearer-токен", "Bearer token")}</option>
+              <option value="basic">{tr("Логин и пароль", "Basic auth")}</option>
             </select>
           </label>
         </div>
         {authType === "bearer" && (
           <label className="full-field">
-            <span>Bearer token · write-only field</span>
+            <span>{tr("Bearer-токен · только для записи", "Bearer token · write-only field")}</span>
             <input
               type="password"
               autoComplete="new-password"
@@ -7364,7 +8490,9 @@ function DatasourceWizard({
         {authType === "basic" && (
           <div className="form-grid">
             <label>
-              <span>Username · write-only field</span>
+              <span>
+                {tr("Имя пользователя · только для записи", "Username · write-only field")}
+              </span>
               <input
                 autoComplete="username"
                 value={username}
@@ -7373,7 +8501,7 @@ function DatasourceWizard({
               />
             </label>
             <label>
-              <span>Password · write-only field</span>
+              <span>{tr("Пароль · только для записи", "Password · write-only field")}</span>
               <input
                 type="password"
                 autoComplete="new-password"
@@ -7387,8 +8515,10 @@ function DatasourceWizard({
         <div className="token-safety-note">
           <Icon symbol="◇" />
           <span>
-            Credentials are encrypted and responses expose only the authentication type and
-            configured field names.
+            {tr(
+              "Данные доступа шифруются. В ответах видны только тип аутентификации и названия настроенных полей.",
+              "Credentials are encrypted and responses expose only the authentication type and configured field names.",
+            )}
           </span>
         </div>
         {error && (
@@ -7399,7 +8529,7 @@ function DatasourceWizard({
       </form>
       <div className="modal-foot">
         <button className="text-button" onClick={onClose}>
-          Cancel
+          {tr("Отмена", "Cancel")}
         </button>
         <button
           className="button button--primary"
@@ -7407,7 +8537,7 @@ function DatasourceWizard({
           form="datasource-create-form"
           disabled={saving || !name.trim() || !url.trim()}
         >
-          {saving ? "Creating…" : "Create datasource"}
+          {saving ? tr("Создаём…", "Creating…") : tr("Добавить источник", "Create datasource")}
         </button>
       </div>
     </Modal>
@@ -7415,6 +8545,26 @@ function DatasourceWizard({
 }
 
 type PushSetupMessage = { tone: "success" | "warning"; text: string };
+
+function localizedBlockedPermissionHelp(
+  environment: ReturnType<typeof currentPushClientEnvironment>,
+) {
+  let english: string;
+  if (environment.ios) {
+    english =
+      "Notifications are blocked for this Home Screen app. Open iOS/iPadOS Settings → Notifications, select this installed app, allow notifications, then reopen it.";
+  } else if (environment.browser === "safari") {
+    english =
+      "Notifications are blocked. Open Safari → Settings → Websites → Notifications, set this site to Allow, then reload.";
+  } else if (environment.browser === "firefox") {
+    english =
+      "Notifications are blocked. Open the site permissions beside the address bar, reset Notifications, then reload and allow the prompt.";
+  } else {
+    english =
+      "Notifications are blocked. Open this site's permissions beside the address bar, set Notifications to Allow, then reload.";
+  }
+  return tr(blockedPermissionHelp(environment), english);
+}
 
 async function pushApiRequest(
   path: string,
@@ -7463,7 +8613,7 @@ function NotificationOnboarding({
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<PushSetupMessage | null>(() =>
     typeof Notification !== "undefined" && Notification.permission === "denied"
-      ? { tone: "warning", text: blockedPermissionHelp(environment) }
+      ? { tone: "warning", text: localizedBlockedPermissionHelp(environment) }
       : null,
   );
   const mounted = useRef(true);
@@ -7491,27 +8641,36 @@ function NotificationOnboarding({
       setPermission("unsupported");
       setMessage({
         tone: "warning",
-        text: "This browser does not expose the Notifications, Service Worker, and Push APIs required for Web Push.",
+        text: tr(
+          "Этот браузер не поддерживает Notifications, Service Worker и Push API, необходимые для Web Push.",
+          "This browser does not expose the Notifications, Service Worker, and Push APIs required for Web Push.",
+        ),
       });
       return;
     }
     if (!window.isSecureContext) {
       setMessage({
         tone: "warning",
-        text: "Web Push requires a secure HTTPS context. Reopen Alert Hub through its HTTPS address.",
+        text: tr(
+          "Для Web Push требуется защищённое HTTPS-соединение. Откройте Alert Hub по HTTPS-адресу.",
+          "Web Push requires a secure HTTPS context. Reopen Alert Hub through its HTTPS address.",
+        ),
       });
       return;
     }
     if (environment.ios && !environment.standalone) {
       setMessage({
         tone: "warning",
-        text: "On iPhone and iPad, install Alert Hub with Share → Add to Home Screen, open that installed app, sign in, and enable notifications there.",
+        text: tr(
+          "На iPhone и iPad установите Alert Hub через «Поделиться» → «На экран Домой», откройте приложение, войдите и включите уведомления там.",
+          "On iPhone and iPad, install Alert Hub with Share → Add to Home Screen, open that installed app, sign in, and enable notifications there.",
+        ),
       });
       return;
     }
     if (Notification.permission === "denied") {
       setPermission("denied");
-      setMessage({ tone: "warning", text: blockedPermissionHelp(environment) });
+      setMessage({ tone: "warning", text: localizedBlockedPermissionHelp(environment) });
       return;
     }
     const operationGeneration = authGeneration;
@@ -7545,8 +8704,11 @@ function NotificationOnboarding({
           tone: "warning",
           text:
             result === "denied"
-              ? blockedPermissionHelp(environment)
-              : "Notification permission was not granted. Try again when you are ready to accept the browser prompt.",
+              ? localizedBlockedPermissionHelp(environment)
+              : tr(
+                  "Разрешение на уведомления не выдано. Повторите, когда будете готовы подтвердить запрос браузера.",
+                  "Notification permission was not granted. Try again when you are ready to accept the browser prompt.",
+                ),
         });
         return;
       }
@@ -7557,13 +8719,19 @@ function NotificationOnboarding({
           return navigator.serviceWorker.ready;
         })(),
         10_000,
-        "Service worker registration timed out. Reload the page and try again.",
+        tr(
+          "Регистрация service worker заняла слишком много времени. Перезагрузите страницу и повторите.",
+          "Service worker registration timed out. Reload the page and try again.",
+        ),
       );
       assertActive();
       const keyResponse = await pushApiRequest(
         "/push/vapid-public-key",
         {},
-        "The API did not return its Web Push key in time.",
+        tr(
+          "API не успел вернуть ключ Web Push.",
+          "The API did not return its Web Push key in time.",
+        ),
         controller.signal,
         operationGeneration,
         operationSessionId,
@@ -7572,7 +8740,9 @@ function NotificationOnboarding({
       if (!keyResponse.ok) {
         const detail = await apiError(
           keyResponse,
-          `This API node cannot publish a Web Push key (${keyResponse.status}).`,
+          currentUiLanguage() === "ru"
+            ? `Этот узел API не может выдать ключ Web Push (${keyResponse.status}).`
+            : `This API node cannot publish a Web Push key (${keyResponse.status}).`,
         );
         assertActive();
         throw new Error(detail);
@@ -7580,11 +8750,14 @@ function NotificationOnboarding({
       const keyBody = asRecord(await keyResponse.json().catch(() => ({})));
       assertActive();
       const vapidKey = String(keyBody.public_key ?? keyBody.vapid_public_key ?? "");
-      const applicationServerKey = decodeApplicationServerKey(vapidKey);
+      const applicationServerKey = decodeApplicationServerKey(vapidKey, currentUiLanguage());
       let subscription = await withPushTimeout(
         registration.pushManager.getSubscription(),
         10_000,
-        "The browser did not return its current Push subscription in time.",
+        tr(
+          "Браузер не успел вернуть текущую Push-подписку.",
+          "The browser did not return its current Push subscription in time.",
+        ),
       );
       assertActive();
       if (
@@ -7597,10 +8770,19 @@ function NotificationOnboarding({
         const removed = await withPushTimeout(
           subscription.unsubscribe(),
           10_000,
-          "The browser could not replace its outdated Push subscription in time.",
+          tr(
+            "Браузер не успел заменить устаревшую Push-подписку.",
+            "The browser could not replace its outdated Push subscription in time.",
+          ),
         );
         assertActive();
-        if (!removed) throw new Error("The browser refused to replace its outdated Push key.");
+        if (!removed)
+          throw new Error(
+            tr(
+              "Браузер отказался заменить устаревший Push-ключ.",
+              "The browser refused to replace its outdated Push key.",
+            ),
+          );
         subscription = null;
       }
       if (!subscription) {
@@ -7610,14 +8792,22 @@ function NotificationOnboarding({
             applicationServerKey,
           }),
           15_000,
-          "The browser Push service did not create a subscription in time.",
+          tr(
+            "Push-сервис браузера не успел создать подписку.",
+            "The browser Push service did not create a subscription in time.",
+          ),
         );
         subscription = createdSubscription;
         assertActive();
       }
       const body = subscription.toJSON();
       if (!body.endpoint || !body.keys?.p256dh || !body.keys.auth) {
-        throw new Error("The browser returned an incomplete Push subscription.");
+        throw new Error(
+          tr(
+            "Браузер вернул неполную Push-подписку.",
+            "The browser returned an incomplete Push subscription.",
+          ),
+        );
       }
       assertActive();
       registrationStarted = true;
@@ -7627,11 +8817,14 @@ function NotificationOnboarding({
           method: "POST",
           body: JSON.stringify({
             ...body,
-            device_name: currentPushDeviceName(),
+            device_name: currentPushDeviceName(currentUiLanguage()),
             user_agent: navigator.userAgent,
           }),
         },
-        "The API did not save this Push subscription in time.",
+        tr(
+          "API не успел сохранить Push-подписку.",
+          "The API did not save this Push subscription in time.",
+        ),
         controller.signal,
         operationGeneration,
         operationSessionId,
@@ -7640,7 +8833,9 @@ function NotificationOnboarding({
       if (!response.ok) {
         const detail = await apiError(
           response,
-          `The API rejected this Push subscription (${response.status}).`,
+          currentUiLanguage() === "ru"
+            ? `API отклонил Push-подписку (${response.status}).`
+            : `The API rejected this Push subscription (${response.status}).`,
         );
         assertActive();
         throw new Error(detail);
@@ -7649,7 +8844,10 @@ function NotificationOnboarding({
       assertActive();
       setMessage({
         tone: "success",
-        text: "This device is subscribed. Use Channels → Send test to verify visible delivery.",
+        text: tr(
+          "Устройство подписано. Откройте «Каналы» → «Проверить», чтобы убедиться в доставке.",
+          "This device is subscribed. Use Channels → Send test to verify visible delivery.",
+        ),
       });
       assertActive();
       onSubscribed();
@@ -7659,7 +8857,10 @@ function NotificationOnboarding({
           await withPushTimeout(
             createdSubscription.unsubscribe(),
             2_000,
-            "Push subscription cleanup timed out.",
+            tr(
+              "Очистка Push-подписки заняла слишком много времени.",
+              "Push subscription cleanup timed out.",
+            ),
           ).catch(() => undefined);
         }
         if (
@@ -7668,17 +8869,23 @@ function NotificationOnboarding({
         ) {
           setMessage({
             tone: "warning",
-            text: "Your authenticated session changed while notifications were being configured. Reload the page and try again.",
+            text: tr(
+              "Во время настройки уведомлений изменилась активная сессия. Перезагрузите страницу и повторите.",
+              "Your authenticated session changed while notifications were being configured. Reload the page and try again.",
+            ),
           });
         }
         return;
       }
       const detail =
         reason instanceof DOMException && reason.name === "NotAllowedError"
-          ? blockedPermissionHelp(environment)
+          ? localizedBlockedPermissionHelp(environment)
           : reason instanceof Error && reason.message
             ? reason.message
-            : "The browser or API could not complete the Push subscription.";
+            : tr(
+                "Браузер или API не смог завершить настройку Push-подписки.",
+                "The browser or API could not complete the Push subscription.",
+              );
       setMessage({ tone: "warning", text: detail });
     } finally {
       if (activeOperation.current === controller) activeOperation.current = null;
@@ -7686,13 +8893,18 @@ function NotificationOnboarding({
     }
   };
   return (
-    <Modal onClose={requestClose} label="Enable notifications">
+    <Modal onClose={requestClose} label={tr("Включить уведомления", "Enable notifications")}>
       <div className="modal-head">
         <div>
-          <span className="eyebrow">Web Push onboarding</span>
-          <h2>Never miss a cluster alert</h2>
+          <span className="eyebrow">{tr("Настройка Web Push", "Web Push onboarding")}</span>
+          <h2>{tr("Получайте важные оповещения вовремя", "Never miss a cluster alert")}</h2>
         </div>
-        <button className="icon-button" onClick={requestClose} aria-label="Close" disabled={busy}>
+        <button
+          className="icon-button"
+          onClick={requestClose}
+          aria-label={tr("Закрыть", "Close")}
+          disabled={busy}
+        >
           <Icon symbol="×" />
         </button>
       </div>
@@ -7708,9 +8920,11 @@ function NotificationOnboarding({
             <i />
           </span>
           <span>
-            <small>{appName.toUpperCase()} · NOW</small>
-            <b>Core API latency breach</b>
-            <p>Critical · NL → api-core</p>
+            <small>
+              {appName.toUpperCase()} · {tr("СЕЙЧАС", "NOW")}
+            </small>
+            <b>{tr("Высокая задержка основного API", "Core API latency breach")}</b>
+            <p>{tr("Критический · NL → api-core", "Critical · NL → api-core")}</p>
           </span>
         </div>
       </div>
@@ -7718,9 +8932,18 @@ function NotificationOnboarding({
         <p>
           {environment.ios
             ? environment.standalone
-              ? "This installed Home Screen app can request Web Push after the action below."
-              : "On iPhone and iPad, Web Push works only from the installed Home Screen app."
-            : "Permission is requested only after the action below. Alert Hub then registers this browser with the cluster."}
+              ? tr(
+                  "Установленное приложение может запросить доступ к Web Push после действия ниже.",
+                  "This installed Home Screen app can request Web Push after the action below.",
+                )
+              : tr(
+                  "На iPhone и iPad Web Push работает только в приложении, установленном на экран «Домой».",
+                  "On iPhone and iPad, Web Push works only from the installed Home Screen app.",
+                )
+            : tr(
+                "Разрешение будет запрошено только после действия ниже. Затем Alert Hub зарегистрирует браузер в кластере.",
+                "Permission is requested only after the action below. Alert Hub then registers this browser with the cluster.",
+              )}
         </p>
         <ol className="onboarding-steps">
           {environment.ios && !environment.standalone ? (
@@ -7728,22 +8951,36 @@ function NotificationOnboarding({
               <li>
                 <span>1</span>
                 <p>
-                  <b>Open in Safari</b>
-                  <small>Use the Share menu for this site.</small>
+                  <b>{tr("Откройте в Safari", "Open in Safari")}</b>
+                  <small>
+                    {tr(
+                      "Используйте меню «Поделиться» на этой странице.",
+                      "Use the Share menu for this site.",
+                    )}
+                  </small>
                 </p>
               </li>
               <li>
                 <span>2</span>
                 <p>
-                  <b>Add to Home Screen</b>
-                  <small>Launch {appName} from its new icon and sign in.</small>
+                  <b>{tr("Добавьте на экран «Домой»", "Add to Home Screen")}</b>
+                  <small>
+                    {currentUiLanguage() === "ru"
+                      ? `Запустите ${appName} с нового значка и войдите.`
+                      : `Launch ${appName} from its new icon and sign in.`}
+                  </small>
                 </p>
               </li>
               <li>
                 <span>3</span>
                 <p>
-                  <b>Enable notifications</b>
-                  <small>Approve the system prompt from the installed app.</small>
+                  <b>{tr("Включите уведомления", "Enable notifications")}</b>
+                  <small>
+                    {tr(
+                      "Подтвердите системный запрос в установленном приложении.",
+                      "Approve the system prompt from the installed app.",
+                    )}
+                  </small>
                 </p>
               </li>
             </>
@@ -7752,22 +8989,37 @@ function NotificationOnboarding({
               <li>
                 <span>1</span>
                 <p>
-                  <b>Allow notifications</b>
-                  <small>Approve the browser or system prompt.</small>
+                  <b>{tr("Разрешите уведомления", "Allow notifications")}</b>
+                  <small>
+                    {tr(
+                      "Подтвердите запрос браузера или системы.",
+                      "Approve the browser or system prompt.",
+                    )}
+                  </small>
                 </p>
               </li>
               <li>
                 <span>2</span>
                 <p>
-                  <b>Register this device</b>
-                  <small>The subscription is encrypted and stored by the cluster.</small>
+                  <b>{tr("Зарегистрируйте устройство", "Register this device")}</b>
+                  <small>
+                    {tr(
+                      "Подписка шифруется и сохраняется в кластере.",
+                      "The subscription is encrypted and stored by the cluster.",
+                    )}
+                  </small>
                 </p>
               </li>
               <li>
                 <span>3</span>
                 <p>
-                  <b>Send a test</b>
-                  <small>Verify delivery from the Web Push channel.</small>
+                  <b>{tr("Отправьте проверку", "Send a test")}</b>
+                  <small>
+                    {tr(
+                      "Убедитесь, что канал Web Push доставляет уведомления.",
+                      "Verify delivery from the Web Push channel.",
+                    )}
+                  </small>
                 </p>
               </li>
             </>
@@ -7776,7 +9028,10 @@ function NotificationOnboarding({
         {permission === "unsupported" && (
           <div className="permission-message permission-message--warning">
             <Icon symbol="!" />
-            This browser does not expose Notifications and Service Worker support.
+            {tr(
+              "Этот браузер не поддерживает Notifications и Service Worker.",
+              "This browser does not expose Notifications and Service Worker support.",
+            )}
           </div>
         )}
         {message && (
@@ -7791,7 +9046,7 @@ function NotificationOnboarding({
       </div>
       <div className="modal-foot modal-foot--stack-mobile">
         <button className="text-button" onClick={requestClose} disabled={busy}>
-          Maybe later
+          {tr("Позже", "Maybe later")}
         </button>
         <button
           className="button button--primary"
@@ -7800,12 +9055,12 @@ function NotificationOnboarding({
         >
           <Icon symbol="◉" />
           {busy
-            ? "Connecting…"
+            ? tr("Подключаем…", "Connecting…")
             : message?.tone === "success" || permission === "granted"
-              ? "Verify subscription"
+              ? tr("Проверить подписку", "Verify subscription")
               : permission === "denied"
-                ? "Show recovery steps"
-                : "Enable notifications"}
+                ? tr("Как вернуть разрешение", "Show recovery steps")
+                : tr("Включить уведомления", "Enable notifications")}
         </button>
       </div>
     </Modal>
