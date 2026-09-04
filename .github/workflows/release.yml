@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version as vX.Y.Z or X.Y.Z
+        description: Optional version as vX.Y.Z or X.Y.Z; defaults to VERSION
         type: string
         required: false
-        default: v0.0.0
+        default: ""
 
 permissions:
   contents: write
@@ -37,10 +37,14 @@ jobs:
           persist-credentials: false
       - name: Validate release version and source revision
         run: |
-          backend_version=$(python3 -c 'import tomllib; print(tomllib.load(open("backend/pyproject.toml", "rb"))["project"]["version"])')
-          frontend_version=$(jq -er '.version' frontend/package.json)
+          product_version=$(<VERSION)
+          if [[ ! "${product_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            printf 'VERSION must contain X.Y.Z without a leading v; found %q\n' \
+              "${product_version}" >&2
+            exit 1
+          fi
           if [[ "${GITHUB_EVENT_NAME}" == workflow_dispatch ]]; then
-            requested_version=${RELEASE_VERSION_INPUT:-${backend_version}}
+            requested_version=${RELEASE_VERSION_INPUT:-${product_version}}
           else
             requested_version=${GITHUB_REF_NAME}
           fi
@@ -59,8 +63,11 @@ jobs:
             [[ "${tag_commit}" == "${GITHUB_SHA}" ]]
             git merge-base --is-ancestor "${tag_commit}" refs/remotes/origin/main
           fi
-          [[ "${release_version}" == "v${backend_version}" ]]
-          [[ "${release_version}" == "v${frontend_version}" ]]
+          if [[ "${release_version}" != "v${product_version}" ]]; then
+            printf 'Requested release %s does not match repository VERSION v%s\n' \
+              "${release_version}" "${product_version}" >&2
+            exit 1
+          fi
       - name: Derive release compatibility from the reviewed API contract
         run: echo "ALERT_HUB_COMPATIBILITY=openapi-sha256:$(sha256sum docs/openapi-contract.json | cut -d' ' -f1)" >>"${GITHUB_ENV}"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -426,13 +433,13 @@ jobs:
         with:
           subject-name: ${{ steps.publish.outputs.api_name }}
           subject-digest: ${{ steps.publish.outputs.api_digest }}
-          push-to-registry: true
+          push-to-registry: false
       - name: Attest web image provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.publish.outputs.web_name }}
           subject-digest: ${{ steps.publish.outputs.web_digest }}
-          push-to-registry: true
+          push-to-registry: false
       - name: Publish or verify the exact GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

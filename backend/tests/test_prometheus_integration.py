@@ -161,6 +161,7 @@ def test_datasource_crud_encrypts_redacts_auth_and_tests_connection(
     assert body["auth_type"] == "bearer"
     assert body["configured_fields"] == ["bearer_token"]
     assert body["url"] == "https://1.1.1.1:9090/monitoring"
+    assert body["reachability_label_mode"] == "canonical"
 
     tested = client.post(
         f"/api/v1/prometheus-datasources/{body['id']}/test",
@@ -175,17 +176,19 @@ def test_datasource_crud_encrypts_redacts_auth_and_tests_connection(
         f"/api/v1/prometheus-datasources/{body['id']}",
         headers=auth,
         json={
+            "reachability_label_mode": "server",
             "auth": {
                 "auth_type": "basic",
                 "username": username,
                 "password": password,
-            }
+            },
         },
     )
     assert updated.status_code == 200, updated.text
     assert username not in updated.text
     assert password not in updated.text
     assert updated.json()["configured_fields"] == ["username", "password"]
+    assert updated.json()["reachability_label_mode"] == "server"
     second_test = client.post(
         f"/api/v1/prometheus-datasources/{body['id']}/test",
         headers=auth,
@@ -202,6 +205,7 @@ def test_datasource_crud_encrypts_redacts_auth_and_tests_connection(
     with app.state.session_factory() as db:
         datasource = db.get(PrometheusDatasource, body["id"])
         assert datasource is not None and datasource.encrypted_credentials is not None
+        assert datasource.reachability_label_mode == "server"
         assert bearer.encode() not in datasource.encrypted_credentials
         assert password.encode() not in datasource.encrypted_credentials
         credentials = app.state.envelope_cipher.decrypt_json(
@@ -327,6 +331,108 @@ def test_reachability_merges_actual_labels_and_reports_partial_failures(
     assert client.get("/api/v1/metrics/queries/arbitrary", headers=auth).status_code == 422
 
 
+def test_reachability_default_mode_uses_only_canonical_labels(
+    client: TestClient,
+    auth: dict[str, str],
+    app,
+) -> None:
+    def prometheus(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["query"] == FIXED_PROMQL["reachability"]
+        return httpx.Response(
+            200,
+            request=request,
+            json=_vector(
+                (
+                    {
+                        "source_region": "eu",
+                        "source_server": "nl-2",
+                        "target_region": "eu",
+                        "target_server": "de-2",
+                    },
+                    1,
+                    200,
+                ),
+                (
+                    {
+                        "source_region": "ru",
+                        "source_server": "ru-2",
+                        "target_name": "canonical-target",
+                        "target_server": "legacy-target",
+                    },
+                    0,
+                    201,
+                ),
+            ),
+        )
+
+    app.state.prometheus_http_transport = httpx.MockTransport(prometheus)
+    created = client.post(
+        "/api/v1/prometheus-datasources",
+        headers=auth,
+        json={"name": "Central Prometheus", "url": "https://1.1.1.1:9090"},
+    )
+    assert created.status_code == 201, created.text
+
+    response = client.get("/api/v1/metrics/reachability", headers=auth)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "partial"
+    assert [
+        (cell["source"], cell["target"], cell["probe_success"]) for cell in payload["cells"]
+    ] == [
+        ("ru", "canonical-target", 0.0),
+    ]
+    assert payload["errors"][0]["code"] == "missing_labels"
+    assert "(canonical)" in payload["errors"][0]["detail"]
+
+
+def test_reachability_server_label_mode_is_explicit(
+    client: TestClient,
+    auth: dict[str, str],
+    app,
+) -> None:
+    def prometheus(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["query"] == FIXED_PROMQL["reachability"]
+        return httpx.Response(
+            200,
+            request=request,
+            json=_vector(
+                (
+                    {
+                        "source_region": "eu",
+                        "source_server": "nl-2",
+                        "target_name": "canonical-target",
+                        "target_server": "de-2",
+                    },
+                    1,
+                    200,
+                )
+            ),
+        )
+
+    app.state.prometheus_http_transport = httpx.MockTransport(prometheus)
+    created = client.post(
+        "/api/v1/prometheus-datasources",
+        headers=auth,
+        json={
+            "name": "Central Prometheus",
+            "url": "https://1.1.1.1:9090",
+            "reachability_label_mode": "server",
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["reachability_label_mode"] == "server"
+
+    response = client.get("/api/v1/metrics/reachability", headers=auth)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert [
+        (cell["source"], cell["target"], cell["probe_success"]) for cell in payload["cells"]
+    ] == [("nl-2", "de-2", 1.0)]
+    assert payload["errors"] == []
+
+
 def test_prometheus_datasource_cluster_projection_and_tombstone(tmp_path: Path) -> None:
     shared = {
         "environment": "test",
@@ -370,6 +476,7 @@ def test_prometheus_datasource_cluster_projection_and_tombstone(tmp_path: Path) 
             json={
                 "name": "Replicated Prometheus",
                 "url": "https://1.1.1.1:9090",
+                "reachability_label_mode": "server",
                 "credentials": {"auth_type": "bearer", "bearer_token": secret},
             },
         )
@@ -399,6 +506,7 @@ def test_prometheus_datasource_cluster_projection_and_tombstone(tmp_path: Path) 
         with app_b.state.session_factory() as db:
             replicated = db.get(PrometheusDatasource, datasource_id)
             assert replicated is not None and replicated.encrypted_credentials is not None
+            assert replicated.reachability_label_mode == "server"
             credentials = app_b.state.envelope_cipher.decrypt_json(
                 replicated.encrypted_credentials,
                 context=f"prometheus_datasource:{datasource_id}:credentials",

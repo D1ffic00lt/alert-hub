@@ -34,6 +34,8 @@ type MockState = {
   refreshGate: Promise<void> | null;
   refreshRequests: number;
   refreshStarted: (() => void) | null;
+  datasourcePatchRequest?: Record<string, unknown> | null;
+  datasourceRequest?: Record<string, unknown> | null;
   sourceRequest: Record<string, unknown> | null;
   liveEventSource?: boolean;
   loginRequest?: Record<string, unknown> | null;
@@ -173,6 +175,44 @@ async function installApi(page: Page, state: MockState) {
       });
       return;
     }
+    if (method === "POST" && path === "/prometheus-datasources") {
+      state.datasourceRequest = request.postDataJSON() as Record<string, unknown>;
+      await fulfill(
+        route,
+        {
+          id: "prometheus-created",
+          name: "Central Prometheus",
+          url: "https://grafana.example.test/api/datasources/proxy/uid/prometheus",
+          node_id: "ru",
+          region: "RU",
+          reachability_label_mode: "server",
+          enabled: true,
+          auth_type: "bearer",
+          credentials_configured: true,
+          configured_fields: ["bearer_token"],
+          credentials_available: true,
+        },
+        201,
+      );
+      return;
+    }
+    if (method === "PATCH" && path === "/prometheus-datasources/prometheus-created") {
+      state.datasourcePatchRequest = request.postDataJSON() as Record<string, unknown>;
+      await fulfill(route, {
+        id: "prometheus-created",
+        name: "Central Prometheus",
+        url: "https://grafana.example.test/api/datasources/proxy/uid/prometheus",
+        node_id: "ru",
+        region: "RU",
+        reachability_label_mode: state.datasourcePatchRequest.reachability_label_mode,
+        enabled: true,
+        auth_type: "bearer",
+        credentials_configured: true,
+        configured_fields: ["bearer_token"],
+        credentials_available: true,
+      });
+      return;
+    }
 
     if (state.authoritativeUnauthorized && method === "GET") {
       await fulfill(route, { detail: "session revoked" }, 401);
@@ -225,7 +265,26 @@ async function installApi(page: Page, state: MockState) {
       return;
     }
     if (method === "GET" && path === "/prometheus-datasources") {
-      await fulfill(route, { datasources: [] });
+      await fulfill(route, {
+        datasources: state.datasourceRequest
+          ? [
+              {
+                id: "prometheus-created",
+                name: "Central Prometheus",
+                url: "https://grafana.example.test/api/datasources/proxy/uid/prometheus",
+                node_id: "ru",
+                region: "RU",
+                reachability_label_mode:
+                  state.datasourcePatchRequest?.reachability_label_mode ?? "server",
+                enabled: true,
+                auth_type: "bearer",
+                credentials_configured: true,
+                configured_fields: ["bearer_token"],
+                credentials_available: true,
+              },
+            ]
+          : [],
+      });
       return;
     }
     if (method === "GET" && path === "/devices") {
@@ -769,6 +828,59 @@ test("bootstrap, deep-link navigation, live source creation, failover trust, and
   await expect
     .poll(() => page.evaluate(() => localStorage.getItem("alert-hub-session-partition-v1")))
     .toBeNull();
+});
+
+test("creates a Prometheus datasource with explicit server reachability labels", async ({
+  page,
+}) => {
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    datasourcePatchRequest: null,
+    datasourceRequest: null,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+
+  await page.getByRole("button", { name: "Доступность" }).click();
+  await page.getByRole("button", { name: "Добавить Prometheus" }).click();
+  const datasourceDialog = page.getByRole("dialog", {
+    name: "Добавить источник данных Prometheus",
+  });
+  await datasourceDialog.getByLabel("Название источника").fill("Central Prometheus");
+  await datasourceDialog
+    .getByLabel("Prometheus HTTPS URL")
+    .fill("https://grafana.example.test/api/datasources/proxy/uid/prometheus");
+  await datasourceDialog.getByLabel("ID обслуживающего узла · необязательно").fill("ru");
+  await datasourceDialog.getByLabel("Регион · необязательно").fill("RU");
+  await datasourceDialog.getByLabel("Метки матрицы доступности").selectOption("server");
+  await datasourceDialog.getByLabel("Аутентификация").selectOption("bearer");
+  await datasourceDialog.getByLabel("Bearer-токен · только для записи").fill("grafana-token");
+  await datasourceDialog.getByRole("button", { name: "Добавить источник" }).click();
+
+  const labelModeSelect = page.getByLabel("Метки матрицы для Central Prometheus");
+  await expect(labelModeSelect).toHaveValue("server");
+  expect(state.datasourceRequest).toMatchObject({
+    name: "Central Prometheus",
+    node_id: "ru",
+    region: "RU",
+    reachability_label_mode: "server",
+    credentials: { auth_type: "bearer", bearer_token: "grafana-token" },
+  });
+
+  await labelModeSelect.selectOption("canonical");
+  await expect
+    .poll(() => state.datasourcePatchRequest)
+    .toEqual({
+      reachability_label_mode: "canonical",
+    });
+  await expect(labelModeSelect).toHaveValue("canonical");
 });
 
 test("logout waits for an in-flight refresh and rejects its stale token", async ({ page }) => {

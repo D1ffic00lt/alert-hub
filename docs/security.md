@@ -149,7 +149,9 @@ docker buildx imagetools inspect ghcr.io/OWNER/alert-hub-web:vX.Y.Z
 ```
 
 Compare both reported digests and compatibility labels with the node state after deployment.
-`latest` is neither published by the release workflow nor accepted as a deployment version.
+Provenance is stored by GitHub's attestation service and is not pushed to GHCR as a synthetic
+`sha256-*` package version. `latest` and commit-SHA candidates are neither published by the
+workflows nor accepted as deployment versions.
 
 The dedicated runner account must not be in the Docker group. Root-owned node scripts validate the
 operation/version/component, hold a lock, validate paths and config, and invoke fixed commands.

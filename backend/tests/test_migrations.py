@@ -61,6 +61,11 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
     assert session_foreign_key["constrained_columns"] == ["session_id"]
     assert session_foreign_key["options"].get("ondelete") == "SET NULL"
 
+    prometheus_columns = {
+        column["name"]: column for column in inspect(engine).get_columns("prometheus_datasources")
+    }
+    assert prometheus_columns["reachability_label_mode"]["nullable"] is False
+
     command.downgrade(config, "0001_initial")
     downgraded_columns = {
         column["name"] for column in inspect(engine).get_columns("push_subscriptions")
@@ -70,6 +75,42 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
 
     command.downgrade(config, "base")
     assert inspect(engine).get_table_names() == ["alembic_version"]
+    engine.dispose()
+
+
+def test_reachability_label_mode_migration_preserves_existing_datasources(
+    tmp_path: Path,
+) -> None:
+    backend_dir = Path(__file__).parents[1]
+    database = tmp_path / "legacy-prometheus.db"
+    config = Config(str(backend_dir / "alembic.ini"))
+    config.set_main_option("script_location", str(backend_dir / "migrations"))
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database}")
+    command.upgrade(config, "0002_push_session")
+
+    engine = create_engine(f"sqlite:///{database}")
+    created_at = "2026-09-04 12:00:00"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO prometheus_datasources "
+                "(id, name, url, node_id, region, encrypted_credentials, enabled, created_at, "
+                "updated_at) VALUES "
+                "('legacy-prometheus', 'Legacy Prometheus', 'https://prometheus.example', "
+                "NULL, NULL, NULL, 1, :created_at, :created_at)"
+            ),
+            {"created_at": created_at},
+        )
+
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        label_mode = connection.execute(
+            text(
+                "SELECT reachability_label_mode FROM prometheus_datasources "
+                "WHERE id = 'legacy-prometheus'"
+            )
+        ).scalar_one()
+    assert label_mode == "canonical"
     engine.dispose()
 
 

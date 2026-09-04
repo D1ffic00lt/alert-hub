@@ -132,9 +132,10 @@ web image. Disabling a role must not silently broaden another network boundary.
 
 The release workflow builds version-tagged API and web GHCR images, tests their exact compatible
 pair, and records both digest-qualified references in `release-manifest.json`. It accepts either
-an existing version tag or a manually confirmed version on `main`; in the latter flow it creates
-the immutable tag in the same validated workflow. A release is not complete unless both artifacts,
-both SBOMs, and both provenance attestations succeed.
+an existing version tag or a manual run on `main`; both must match the single product version in
+the root `VERSION` file. In the manual flow it creates the immutable tag in the same validated
+workflow. A release is not complete unless both artifacts, both SBOMs, and both provenance
+attestations succeed.
 
 Each node records current and historical component manifests beneath `/opt/alert-hub`. The
 root-owned deployment wrapper is the privileged interface used by a dedicated self-hosted runner.

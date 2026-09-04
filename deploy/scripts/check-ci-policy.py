@@ -42,6 +42,7 @@ REQUIRED_AGENT_MARKERS = {
     "## Tests and definition of done",
 }
 PRODUCTION_WORKFLOWS = {"deploy.yml", "rollback.yml"}
+RELEASE_WORKFLOW = "release.yml"
 GITHUB_HOSTED_RUNNERS = {"ubuntu-24.04"}
 PRODUCTION_RUNNER_LABELS = {
     ("self-hosted", "alert-hub-ru"),
@@ -279,6 +280,39 @@ def _action_errors(path: Path, workflow: Mapping[str, Any]) -> list[str]:
     return failures
 
 
+def _publication_errors(path: Path, workflow: Mapping[str, Any]) -> list[str]:
+    """Keep every registry mutation inside the dedicated release workflow."""
+
+    if path.name == RELEASE_WORKFLOW:
+        return []
+
+    failures: list[str] = []
+    top_permissions = workflow.get("permissions", {})
+    if not isinstance(top_permissions, Mapping):
+        top_permissions = {}
+    jobs = workflow.get("jobs", {})
+    if isinstance(jobs, Mapping):
+        for job_name, job in jobs.items():
+            if not isinstance(job, Mapping):
+                continue
+            permissions = job.get("permissions", top_permissions)
+            package_access = (
+                str(permissions.get("packages", "")).lower()
+                if isinstance(permissions, Mapping)
+                else ""
+            )
+            if package_access == "write":
+                failures.append(
+                    f"{path}: only {RELEASE_WORKFLOW} may request packages: write "
+                    f"(job {job_name!r})"
+                )
+
+    for step in _steps(workflow):
+        if "docker push" in str(step.get("run", "")).lower():
+            failures.append(f"{path}: only {RELEASE_WORKFLOW} may execute docker push")
+    return failures
+
+
 def _is_production_self_hosted_job(path: Path, job: Mapping[str, Any]) -> bool:
     runs_on = job.get("runs-on")
     if path.name not in PRODUCTION_WORKFLOWS or not isinstance(runs_on, list):
@@ -473,6 +507,7 @@ def check_repository(repository: Path) -> list[str]:
             continue
         failures.extend(_trigger_errors(path, workflow))
         failures.extend(_action_errors(path, workflow))
+        failures.extend(_publication_errors(path, workflow))
         failures.extend(_runner_errors(path, workflow))
         failures.extend(_production_workflow_errors(path, workflow))
         if path.name == "ci.yml":

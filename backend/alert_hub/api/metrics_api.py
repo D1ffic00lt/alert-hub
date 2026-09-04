@@ -129,8 +129,12 @@ async def metrics_reachability(
     for result in results:
         missing_labels = 0
         for sample in result.samples:
-            source_region = sample.labels.get("source_region", "").strip()
-            target_name = sample.labels.get("target_name", "").strip()
+            if result.reachability_label_mode == "server":
+                source_region = sample.labels.get("source_server", "").strip()
+                target_name = sample.labels.get("target_server", "").strip()
+            else:
+                source_region = sample.labels.get("source_region", "").strip()
+                target_name = sample.labels.get("target_name", "").strip()
             if not source_region or not target_name:
                 missing_labels += 1
                 continue
@@ -150,7 +154,10 @@ async def metrics_reachability(
                     result.datasource_id,
                     result.datasource_name,
                     "missing_labels",
-                    f"Ignored {missing_labels} samples without source_region and target_name",
+                    (
+                        f"Ignored {missing_labels} samples without the configured reachability "
+                        f"label pair ({result.reachability_label_mode})"
+                    ),
                 )
             )
     cells = [

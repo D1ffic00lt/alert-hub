@@ -268,6 +268,9 @@ class PrometheusDatasource(Base):
     url: Mapped[str] = mapped_column(String(2048))
     node_id: Mapped[str | None] = mapped_column(String(128), index=True)
     region: Mapped[str | None] = mapped_column(String(128), index=True)
+    reachability_label_mode: Mapped[str] = mapped_column(
+        String(32), default="canonical", server_default="canonical"
+    )
     encrypted_credentials: Mapped[bytes | None] = mapped_column(LargeBinary)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
