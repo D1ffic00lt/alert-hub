@@ -1081,24 +1081,32 @@ def test_ci_keeps_images_local_and_release_publishes_exact_pair() -> None:
     ci_source = (REPOSITORY / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "bundle-image" not in jobs
     assert "candidate" not in jobs
+    assert "api-image" not in jobs
+    assert "web-image" not in jobs
     assert "packages: write" not in ci_source
     assert "docker login" not in ci_source
     assert "docker push" not in ci_source
-    api = jobs["api-image"]
-    web = jobs["web-image"]
     integration = jobs["container-integration"]
-    api_run = _job_run(api)
-    web_run = _job_run(web)
     integration_run = _job_run(integration)
 
-    api_needs = api["needs"] if isinstance(api["needs"], list) else [api["needs"]]
-    assert "frontend" not in api_needs
-    assert "--file backend/Dockerfile" in api_run
-    assert "--tag alert-hub-api:ci" in api_run
-    assert "docker save alert-hub-api:ci" in api_run
-    assert "--file frontend/Dockerfile" in web_run
-    assert "--tag alert-hub-web:ci" in web_run
-    assert "docker save alert-hub-web:ci" in web_run
+    assert set(integration["needs"]) == {
+        "repository-quality",
+        "backend",
+        "frontend",
+        "security",
+        "operations",
+    }
+    assert len(re.findall(r"(?m)^docker build(?:x)?(?:\s|$)", integration_run)) == 2
+    assert "--file backend/Dockerfile" in integration_run
+    assert "--tag alert-hub-api:ci" in integration_run
+    assert "--file frontend/Dockerfile" in integration_run
+    assert "--tag alert-hub-web:ci" in integration_run
+    assert "docker save" not in integration_run
+    assert "docker load" not in integration_run
+    assert not any(
+        action.startswith(("actions/upload-artifact@", "actions/download-artifact@"))
+        for action in _job_actions(integration)
+    )
     assert "ci-image-matrix-smoke.sh" in integration_run
     assert "alert-hub-api:ci alert-hub-web:ci" in integration_run
     assert "ci-three-node-failure.sh alert-hub-api:ci" in integration_run
@@ -1159,13 +1167,11 @@ def test_ci_keeps_images_local_and_release_publishes_exact_pair() -> None:
     assert all(step["with"]["push-to-registry"] is False for step in attestation_steps)
 
 
-def test_ci_runs_for_main_and_release_tags() -> None:
+def test_ci_runs_for_main_while_release_owns_version_tags() -> None:
     source = (REPOSITORY / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert re.search(r"(?m)^  pull_request:\n    branches: \[main\]$", source)
-    assert re.search(
-        r'(?m)^  push:\n    branches: \[main\]\n    tags: \["v\*\.\*\.\*"\]$',
-        source,
-    )
+    assert re.search(r"(?m)^  push:\n    branches: \[main\]$", source)
+    assert "tags:" not in source
 
 
 def test_manual_release_reserves_tag_and_publishes_assets_idempotently() -> None:
@@ -1963,6 +1969,10 @@ def test_controlled_three_node_peers_use_literal_private_addresses() -> None:
 
 def test_pr_codeql_is_a_read_only_failing_sarif_gate() -> None:
     workflow = _workflow("codeql.yml")
+    assert workflow["concurrency"] == {
+        "group": "codeql-${{ github.workflow }}-${{ github.ref }}",
+        "cancel-in-progress": True,
+    }
     for job_name in ("analyze-pr", "analyze-main"):
         job = workflow["jobs"][job_name]
         assert job["strategy"]["matrix"]["language"] == [

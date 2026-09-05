@@ -330,9 +330,9 @@ disabled rather than inventing a topology.
 ## Release and deploy behavior
 
 Pull requests and pushes to `main` build and test API and web independently and together with
-read-only permissions; they never publish or deploy. Semver-like `v*.*.*` tags also run that
-normal CI matrix without publishing images. A
-version tag separately runs the complete release gate. The root `VERSION` file is the sole product
+read-only permissions; they never publish or deploy. The two images are built in one gated,
+ephemeral integration job so the exact pair can be exercised without uploading Docker archives as
+Actions artifacts. A version tag runs only the complete release gate. The root `VERSION` file is the sole product
 release version source. An operator may instead run the Release workflow on `main` without entering
 a version; the workflow reads `VERSION`, validates the main revision, creates the immutable tag, and
 publishes the release. An optional explicit `vX.Y.Z` input and any pushed version tag must match

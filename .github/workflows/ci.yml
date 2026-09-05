@@ -5,7 +5,6 @@ on:
     branches: [main]
   push:
     branches: [main]
-    tags: ["v*.*.*"]
 
 permissions:
   contents: read
@@ -282,19 +281,19 @@ jobs:
       - name: Exercise online backup and restore
         run: sudo bash deploy/scripts/test-backup-tool.sh
 
-  api-image:
-    name: Build backend-only API image
-    needs: [repository-quality, backend]
+  container-integration:
+    name: Build and exercise exact compatible API and web images
+    needs: [repository-quality, backend, frontend, security, operations]
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Derive API compatibility from the reviewed contract
+      - name: Derive compatibility from the reviewed contract
         id: compatibility
         run: echo "value=openapi-sha256:$(sha256sum docs/openapi-contract.json | cut -d' ' -f1)" >>"${GITHUB_OUTPUT}"
-      - name: Build API without frontend inputs or publishing
+      - name: Build backend-only API image without publishing
         env:
           DOCKER_BUILDKIT: "1"
         run: |
@@ -310,36 +309,7 @@ jobs:
             backend
           [[ $(docker image inspect alert-hub-api:ci --format '{{index .Config.Labels "org.alert-hub.component"}}') == api ]]
           [[ $(docker image inspect alert-hub-api:ci --format '{{index .Config.Labels "org.alert-hub.compatibility"}}') == "${{ steps.compatibility.outputs.value }}" ]]
-      - name: Export exact API image
-        run: |
-          docker image inspect alert-hub-api:ci --format '{{.Id}}' >alert-hub-api-ci.id
-          docker save alert-hub-api:ci | gzip -9 >alert-hub-api-ci.tar.gz
-          sha256sum alert-hub-api-ci.tar.gz >alert-hub-api-ci.tar.gz.sha256
-      - name: Transfer exact API image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: tested-api-image-${{ github.run_id }}
-          path: |
-            alert-hub-api-ci.tar.gz
-            alert-hub-api-ci.tar.gz.sha256
-            alert-hub-api-ci.id
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-
-  web-image:
-    name: Build standalone web image
-    needs: [repository-quality, frontend]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Derive web compatibility from the reviewed contract
-        id: compatibility
-        run: echo "value=openapi-sha256:$(sha256sum docs/openapi-contract.json | cut -d' ' -f1)" >>"${GITHUB_OUTPUT}"
-      - name: Build web without publishing
+      - name: Build standalone web image without publishing
         env:
           DOCKER_BUILDKIT: "1"
         run: |
@@ -355,46 +325,8 @@ jobs:
             frontend
           [[ $(docker image inspect alert-hub-web:ci --format '{{index .Config.Labels "org.alert-hub.component"}}') == web ]]
           [[ $(docker image inspect alert-hub-web:ci --format '{{index .Config.Labels "org.alert-hub.compatibility"}}') == "${{ steps.compatibility.outputs.value }}" ]]
-      - name: Export exact web image
+      - name: Verify exact component compatibility
         run: |
-          docker image inspect alert-hub-web:ci --format '{{.Id}}' >alert-hub-web-ci.id
-          docker save alert-hub-web:ci | gzip -9 >alert-hub-web-ci.tar.gz
-          sha256sum alert-hub-web-ci.tar.gz >alert-hub-web-ci.tar.gz.sha256
-      - name: Transfer exact web image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: tested-web-image-${{ github.run_id }}
-          path: |
-            alert-hub-web-ci.tar.gz
-            alert-hub-web-ci.tar.gz.sha256
-            alert-hub-web-ci.id
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-
-  container-integration:
-    name: Exercise exact compatible API and web images
-    needs: [api-image, web-image, security, operations]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: tested-*-image-${{ github.run_id }}
-          path: tested-images
-          merge-multiple: true
-      - name: Load and verify exact component images
-        working-directory: tested-images
-        run: |
-          sha256sum --check alert-hub-api-ci.tar.gz.sha256
-          sha256sum --check alert-hub-web-ci.tar.gz.sha256
-          gzip --decompress --stdout alert-hub-api-ci.tar.gz | docker load
-          gzip --decompress --stdout alert-hub-web-ci.tar.gz | docker load
-          [[ $(docker image inspect alert-hub-api:ci --format '{{.Id}}') == $(cat alert-hub-api-ci.id) ]]
-          [[ $(docker image inspect alert-hub-web:ci --format '{{.Id}}') == $(cat alert-hub-web-ci.id) ]]
           api_compatibility=$(docker image inspect alert-hub-api:ci --format '{{index .Config.Labels "org.alert-hub.compatibility"}}')
           web_compatibility=$(docker image inspect alert-hub-web:ci --format '{{index .Config.Labels "org.alert-hub.compatibility"}}')
           [[ "${api_compatibility}" == "${web_compatibility}" ]]
