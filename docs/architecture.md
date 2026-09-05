@@ -8,6 +8,9 @@ visualization surface. A replicated, validated Grafana URL supplies an authentic
 credential or query surface. Administrators can select bounded `job` globs for named `up` queries;
 the server constructs PromQL and never accepts browser-authored PromQL. Each Alert Hub node owns a
 local SQLite database and is intended to remain useful when peers are unreachable.
+The overview can aggregate bounded `24h`, `7d`, or `30d` incident and delivery history from that
+node-local replicated projection. This remains an eventually consistent operational summary;
+Prometheus and Grafana continue to own detailed infrastructure time-series.
 
 ```mermaid
 flowchart LR

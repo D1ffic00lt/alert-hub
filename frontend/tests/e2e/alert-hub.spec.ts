@@ -370,6 +370,90 @@ async function installApi(page: Page, state: MockState) {
       });
       return;
     }
+    if (method === "GET" && path === "/metrics/statistics") {
+      await fulfill(route, {
+        window: "7d",
+        generated_at: "2026-09-02T12:00:00Z",
+        starts_at: "2026-08-26T12:00:00Z",
+        ends_at: "2026-09-02T12:00:00Z",
+        bucket_seconds: 21600,
+        totals: {
+          incidents_started: 12,
+          incidents_resolved: 9,
+          active_incidents: 3,
+          active_critical: 1,
+          acknowledgement_rate: 83.3,
+          resolution_rate: 75,
+          mean_time_to_acknowledge_seconds: 540,
+          mean_time_to_resolve_seconds: 4200,
+          deliveries: 48,
+          deliveries_succeeded: 46,
+          deliveries_failed: 2,
+          delivery_success_rate: 95.8,
+        },
+        timeline: [
+          {
+            starts_at: "2026-08-30T12:00:00Z",
+            incidents_started: 2,
+            incidents_resolved: 1,
+            deliveries_succeeded: 8,
+            deliveries_failed: 1,
+          },
+          {
+            starts_at: "2026-08-31T12:00:00Z",
+            incidents_started: 4,
+            incidents_resolved: 3,
+            deliveries_succeeded: 11,
+            deliveries_failed: 0,
+          },
+          {
+            starts_at: "2026-09-01T12:00:00Z",
+            incidents_started: 3,
+            incidents_resolved: 2,
+            deliveries_succeeded: 14,
+            deliveries_failed: 1,
+          },
+          {
+            starts_at: "2026-09-02T06:00:00Z",
+            incidents_started: 3,
+            incidents_resolved: 3,
+            deliveries_succeeded: 13,
+            deliveries_failed: 0,
+          },
+        ],
+        severities: [
+          { severity: "critical", count: 3 },
+          { severity: "warning", count: 6 },
+          { severity: "info", count: 2 },
+          { severity: "unknown", count: 1 },
+        ],
+        sources: [
+          { source_id: "prometheus-eu", name: "Prometheus EU", region: "NL", count: 7 },
+          { source_id: "blackbox-ru", name: "Blackbox RU", region: "RU", count: 5 },
+        ],
+        channels: [
+          {
+            channel_id: "telegram-ops",
+            name: "Telegram Ops",
+            kind: "telegram",
+            total: 30,
+            succeeded: 29,
+            failed: 1,
+            success_rate: 96.7,
+          },
+          {
+            channel_id: "web-push",
+            name: "Web Push",
+            kind: "web_push",
+            total: 18,
+            succeeded: 17,
+            failed: 1,
+            success_rate: 94.4,
+          },
+        ],
+      });
+      return;
+    }
     if (method === "GET" && path === "/metrics/summary") {
       const monitoring = state.applicationSettingsRequest ?? {};
       await fulfill(route, {
@@ -810,6 +894,16 @@ test("bootstrap, deep-link navigation, live source creation, failover trust, and
   await rotatedDialog.getByRole("button", { name: "Я сохранил новый токен" }).click();
 
   await page.getByRole("button", { name: "Обзор" }).click();
+  await expect(page.getByRole("heading", { name: "Статистика за 7 дней" })).toBeVisible();
+  await expect(
+    page.locator(".statistics-kpi").filter({ hasText: "Началось инцидентов" }),
+  ).toContainText("12");
+  await expect(page.locator(".statistics-chart")).toHaveCount(2);
+  await expect(page.getByText("Prometheus EU", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Подробнее в Grafana" })).toHaveAttribute(
+    "href",
+    "https://grafana.example.test/d/alert-hub",
+  );
   await expect(page.getByRole("heading", { name: "Состояние по данным Prometheus" })).toBeVisible();
   await expect(
     page.getByRole("heading", { name: "Доступность по регионам" }).first(),
@@ -1610,6 +1704,31 @@ test.describe("service-worker offline lifecycle", () => {
           errors: [],
           samples: [],
           status: "ok",
+        },
+        "/api/v1/metrics/statistics?window=7d": {
+          window: "7d",
+          generated_at: "2026-09-02T12:00:00Z",
+          starts_at: "2026-08-26T12:00:00Z",
+          ends_at: "2026-09-02T12:00:00Z",
+          bucket_seconds: 21600,
+          totals: {
+            incidents_started: 0,
+            incidents_resolved: 0,
+            active_incidents: 0,
+            active_critical: 0,
+            acknowledgement_rate: null,
+            resolution_rate: null,
+            mean_time_to_acknowledge_seconds: null,
+            mean_time_to_resolve_seconds: null,
+            deliveries: 0,
+            deliveries_succeeded: 0,
+            deliveries_failed: 0,
+            delivery_success_rate: null,
+          },
+          timeline: [],
+          severities: [],
+          sources: [],
+          channels: [],
         },
       };
       await Promise.all(
