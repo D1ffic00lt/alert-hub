@@ -4,7 +4,7 @@ This page distinguishes code that exists in this repository from the complete di
 acceptance described by the product specification. Automated or controlled Docker evidence does
 not prove the operator's real network, providers, runners, proxy, or iPhone.
 
-The latest local backend verification completed 374 tests at 85.95% branch coverage, above the 75%
+The latest local backend verification completed 406 tests at 86.05% branch coverage, above the 75%
 CI gate. Frontend lint/types, 70 unit tests, the production build, and fifteen Playwright paths also
 passed. The repository retains separately recorded local passes for the two-image Docker matrix and
 controlled three-node gate. These results become durable evidence for a reviewed commit only after

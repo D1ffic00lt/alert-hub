@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from alert_hub.application import checks as checks_application
 from alert_hub.application.checks import (
     CHECK_QUERY_NAMES,
     MAX_CANARIES_PER_RESULT,
@@ -310,6 +311,59 @@ def test_invalid_identifiers_values_and_display_secrets_are_bounded() -> None:
     assert {"invalid_status", "invalid_timestamp", "invalid_duration", "invalid_ttfb"} <= set(
         result.diagnostics
     )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://internal.example/path",
+        "HtTpS://internal.example/path",
+        "Bearer private-value",
+        "password : private-value",
+        "API-Key = private-value",
+        "ſecret=private-value",
+        "apiKey=private-value",
+        "apİkey=private-value",
+        "apıkey=private-value",
+        "Node [fd00::1]:443",
+        "Node [fe80::1%eth0]:443",
+        "edge 2001:db8::1",
+        "target 10.0.0.1:443",
+        "Node 10.0.0.1.",
+        "ip:10.0.0.1:443",
+        "Node:10.0.0.1",
+        "ip:[fd00::1]:443",
+        "Node:[fd00::1]:443",
+        "Node:2001:db8::1",
+        "fd00::1.example",
+        "fd00::1.a",
+        "node.fd00::1",
+        "node%fd00::1",
+        "node]fd00::1",
+        "fd00::1[abc]",
+    ],
+)
+def test_safe_display_rejects_sensitive_and_address_shaped_values(value: str) -> None:
+    assert checks_application._safe_display(value, max_length=255) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a" * 255,
+        ":" * 255,
+        "0" * 255,
+        "release dead:beef",
+        "ratio 12:34:56",
+        "release v1.2.3.4",
+    ],
+)
+def test_safe_display_handles_adversarial_repetition_with_bounded_scans(value: str) -> None:
+    assert checks_application._safe_display(value, max_length=255) == value
+
+
+def test_safe_display_rejects_input_above_the_fixed_display_limit() -> None:
+    assert checks_application._safe_display("a" * 256, max_length=1_000) is None
 
 
 def test_future_clock_tolerance_is_inclusive() -> None:
