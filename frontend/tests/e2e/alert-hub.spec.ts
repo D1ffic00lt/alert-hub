@@ -26,6 +26,7 @@ async function fulfill(route: Route, body: unknown, status = 200) {
 }
 
 type MockState = {
+  applicationSettingsRequest?: Record<string, unknown> | null;
   auditPageGate?: Promise<void> | null;
   auditPageStarted?: (() => void) | null;
   auditItems?: unknown[];
@@ -34,6 +35,11 @@ type MockState = {
   clusterRequestStarted?: (() => void) | null;
   clusterUnavailable?: boolean;
   clusterStatus?: unknown;
+  checksDetails?: Record<string, Record<string, unknown>>;
+  checksItems?: Array<Record<string, unknown>>;
+  checksMode?: "disabled" | "ready" | "unavailable";
+  checksWarningCodes?: string[];
+  incidents?: Array<Record<string, unknown>>;
   lateTokenRequests: string[];
   logoutRequests: number;
   primaryUnavailable: boolean;
@@ -219,6 +225,11 @@ async function installApi(page: Page, state: MockState) {
       });
       return;
     }
+    if (method === "PATCH" && path === "/application-settings") {
+      state.applicationSettingsRequest = request.postDataJSON() as Record<string, unknown>;
+      await fulfill(route, state.applicationSettingsRequest);
+      return;
+    }
 
     if (state.authoritativeUnauthorized && method === "GET") {
       await fulfill(route, { detail: "session revoked" }, 401);
@@ -228,8 +239,135 @@ async function installApi(page: Page, state: MockState) {
       await fulfill(route, { detail: "temporarily unavailable" }, 503);
       return;
     }
+    if (method === "GET" && (path === "/checks" || path === "/checks/summary")) {
+      const checksMode = state.checksMode ?? "disabled";
+      const common = {
+        enabled: checksMode !== "disabled",
+        data_state:
+          checksMode === "disabled"
+            ? "disabled"
+            : checksMode === "unavailable"
+              ? "unavailable"
+              : "ready",
+        snapshot_id: checksMode === "ready" ? "e2e-checks-snapshot" : null,
+        fetched_at: checksMode === "ready" ? "2026-09-05T12:00:00Z" : null,
+        evaluated_at: checksMode === "ready" ? "2026-09-05T12:00:01Z" : null,
+        cache_expires_at: checksMode === "ready" ? "2026-09-05T12:00:05Z" : null,
+        warning_codes: state.checksWarningCodes ?? [],
+        error_code: checksMode === "unavailable" ? "prometheus_unavailable" : null,
+      };
+      if (checksMode === "unavailable") {
+        await fulfill(
+          route,
+          path === "/checks"
+            ? { ...common, items: [], total: 0, limit: 50, offset: 0 }
+            : {
+                ...common,
+                total: 0,
+                up: 0,
+                degraded: 0,
+                down: 0,
+                stale: 0,
+                unknown: 0,
+                problem_checks: [],
+              },
+          503,
+        );
+        return;
+      }
+      const statusFilter = url.searchParams.get("status");
+      const groupFilter = url.searchParams.get("group");
+      const search = (url.searchParams.get("search") ?? "").toLowerCase();
+      const filtered = (state.checksItems ?? []).filter((item) => {
+        if (statusFilter && item.status !== statusFilter) return false;
+        if (groupFilter && item.group !== groupFilter) return false;
+        if (
+          search &&
+          !`${item.check_id ?? ""} ${item.name ?? ""} ${item.target ?? ""}`
+            .toLowerCase()
+            .includes(search)
+        )
+          return false;
+        return true;
+      });
+      if (path === "/checks") {
+        const limit = Number(url.searchParams.get("limit") ?? 50);
+        const offset = Number(url.searchParams.get("offset") ?? 0);
+        await fulfill(route, {
+          ...common,
+          items: filtered.slice(offset, offset + limit),
+          total: filtered.length,
+          limit,
+          offset,
+        });
+        return;
+      }
+      const counts = Object.fromEntries(
+        ["up", "degraded", "down", "stale", "unknown"].map((status) => [
+          status,
+          filtered.filter((item) => item.status === status).length,
+        ]),
+      );
+      const priority = new Map([
+        ["down", 0],
+        ["degraded", 1],
+        ["unknown", 2],
+        ["stale", 3],
+      ]);
+      const problemChecks = filtered
+        .filter((item) => item.status !== "up")
+        .sort(
+          (left, right) =>
+            (priority.get(String(left.status)) ?? 9) - (priority.get(String(right.status)) ?? 9) ||
+            String(left.check_id).localeCompare(String(right.check_id)),
+        )
+        .slice(0, 5);
+      await fulfill(route, {
+        ...common,
+        total: filtered.length,
+        ...counts,
+        problem_checks: problemChecks,
+      });
+      return;
+    }
+    if (method === "GET" && path.startsWith("/checks/")) {
+      const checksMode = state.checksMode ?? "disabled";
+      const checkId = decodeURIComponent(path.slice("/checks/".length));
+      const check = state.checksDetails?.[checkId] ?? null;
+      const common = {
+        enabled: checksMode !== "disabled",
+        data_state:
+          checksMode === "disabled"
+            ? "disabled"
+            : checksMode === "unavailable"
+              ? "unavailable"
+              : "ready",
+        snapshot_id: checksMode === "ready" ? "e2e-checks-snapshot" : null,
+        fetched_at: checksMode === "ready" ? "2026-09-05T12:00:00Z" : null,
+        evaluated_at: checksMode === "ready" ? "2026-09-05T12:00:01Z" : null,
+        cache_expires_at: checksMode === "ready" ? "2026-09-05T12:00:05Z" : null,
+        warning_codes: state.checksWarningCodes ?? [],
+        error_code: checksMode === "unavailable" ? "prometheus_unavailable" : null,
+      };
+      if (checksMode === "unavailable") {
+        await fulfill(route, { ...common, check: null }, 503);
+      } else if (checksMode === "disabled") {
+        await fulfill(route, { ...common, check: null });
+      } else if (!check) {
+        await fulfill(route, { ...common, check: null, error_code: "check_not_found" }, 404);
+      } else {
+        await fulfill(route, { ...common, check });
+      }
+      return;
+    }
     if (method === "GET" && path === "/incidents") {
-      await fulfill(route, { incidents: [] });
+      await fulfill(route, { incidents: state.incidents ?? [] });
+      return;
+    }
+    if (method === "GET" && path.startsWith("/incidents/")) {
+      const incidentId = decodeURIComponent(path.slice("/incidents/".length));
+      const incident = state.incidents?.find((item) => item.id === incidentId);
+      await fulfill(route, incident ?? { detail: "incident not found" }, incident ? 200 : 404);
       return;
     }
     if (method === "GET" && path === "/cluster/status") {
@@ -364,7 +502,92 @@ async function installApi(page: Page, state: MockState) {
       });
       return;
     }
+    if (method === "GET" && path === "/metrics/statistics") {
+      await fulfill(route, {
+        window: "7d",
+        generated_at: "2026-09-02T12:00:00Z",
+        starts_at: "2026-08-26T12:00:00Z",
+        ends_at: "2026-09-02T12:00:00Z",
+        bucket_seconds: 21600,
+        totals: {
+          incidents_started: 12,
+          incidents_resolved: 9,
+          active_incidents: 3,
+          active_critical: 1,
+          acknowledgement_rate: 83.3,
+          resolution_rate: 75,
+          mean_time_to_acknowledge_seconds: 540,
+          mean_time_to_resolve_seconds: 4200,
+          deliveries: 48,
+          deliveries_succeeded: 46,
+          deliveries_failed: 2,
+          delivery_success_rate: 95.8,
+        },
+        timeline: [
+          {
+            starts_at: "2026-08-30T12:00:00Z",
+            incidents_started: 2,
+            incidents_resolved: 1,
+            deliveries_succeeded: 8,
+            deliveries_failed: 1,
+          },
+          {
+            starts_at: "2026-08-31T12:00:00Z",
+            incidents_started: 4,
+            incidents_resolved: 3,
+            deliveries_succeeded: 11,
+            deliveries_failed: 0,
+          },
+          {
+            starts_at: "2026-09-01T12:00:00Z",
+            incidents_started: 3,
+            incidents_resolved: 2,
+            deliveries_succeeded: 14,
+            deliveries_failed: 1,
+          },
+          {
+            starts_at: "2026-09-02T06:00:00Z",
+            incidents_started: 3,
+            incidents_resolved: 3,
+            deliveries_succeeded: 13,
+            deliveries_failed: 0,
+          },
+        ],
+        severities: [
+          { severity: "critical", count: 3 },
+          { severity: "warning", count: 6 },
+          { severity: "info", count: 2 },
+          { severity: "unknown", count: 1 },
+        ],
+        sources: [
+          { source_id: "prometheus-eu", name: "Prometheus EU", region: "NL", count: 7 },
+          { source_id: "blackbox-ru", name: "Blackbox RU", region: "RU", count: 5 },
+        ],
+        channels: [
+          {
+            channel_id: "telegram-ops",
+            name: "Telegram Ops",
+            kind: "telegram",
+            total: 30,
+            succeeded: 29,
+            failed: 1,
+            success_rate: 96.7,
+          },
+          {
+            channel_id: "web-push",
+            name: "Web Push",
+            kind: "web_push",
+            total: 18,
+            succeeded: 17,
+            failed: 1,
+            success_rate: 94.4,
+          },
+        ],
+      });
+      return;
+    }
     if (method === "GET" && path === "/metrics/summary") {
+      const monitoring = state.applicationSettingsRequest ?? {};
       await fulfill(route, {
         open: 0,
         acknowledged: 0,
@@ -374,7 +597,15 @@ async function installApi(page: Page, state: MockState) {
         delivery_rate: null,
         outbox_pending: 0,
         channels_enabled: 0,
-        grafana_url: "https://grafana.example.test/d/alert-hub",
+        grafana_url: Object.prototype.hasOwnProperty.call(monitoring, "grafana_url")
+          ? monitoring.grafana_url
+          : "https://grafana.example.test/d/alert-hub",
+        key_job_globs: monitoring.key_job_globs ?? ["prometheus", "alertmanager", "blackbox*"],
+        alert_hub_job_globs: monitoring.alert_hub_job_globs ?? [
+          "alert-hub*",
+          "alert_hub*",
+          "alerthub*",
+        ],
       });
       return;
     }
@@ -502,6 +733,344 @@ async function signIn(page: Page) {
   await page.getByRole("button", { name: "Войти" }).last().click();
   await expect(page.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
 }
+
+function checksFixtures() {
+  const common = {
+    last_checked_at: "2026-09-05T12:00:00Z",
+    oldest_checked_at: "2026-09-05T11:59:58Z",
+    sources_total: 2,
+    sources_up: 1,
+    stale_results: 0,
+    data_incomplete: false,
+    latency_seconds: 0.42,
+    scenarios: ["availability"],
+    active_alerts: 0,
+    diagnostic_codes: [],
+  };
+  const items = [
+    {
+      ...common,
+      check_id: "simple-check",
+      name: "Simple check",
+      group: "basics",
+      target: null,
+      status: "up",
+      status_reason: null,
+      sources_total: 1,
+      sources_up: 1,
+      latency_seconds: null,
+    },
+    {
+      ...common,
+      check_id: "complex-check",
+      name: "Complex customer path",
+      group: "customer-paths",
+      target: "Checkout",
+      status: "degraded",
+      status_reason: "mixed_results",
+      active_alerts: 1,
+    },
+    {
+      ...common,
+      check_id: "down-check",
+      name: "Down check",
+      group: "customer-paths",
+      target: "Billing",
+      status: "down",
+      status_reason: "confirmed_failures",
+      sources_up: 0,
+    },
+    {
+      ...common,
+      check_id: "stale-check",
+      name: "Stale check",
+      group: null,
+      target: null,
+      status: "stale",
+      status_reason: "expired_measurements",
+      stale_results: 2,
+      sources_up: 0,
+      latency_seconds: null,
+    },
+    {
+      ...common,
+      check_id: "unknown-check",
+      name: "Unknown check",
+      group: null,
+      target: null,
+      status: "unknown",
+      status_reason: "insufficient_sources",
+      sources_up: 0,
+      data_incomplete: true,
+      latency_seconds: null,
+      active_alerts: null,
+    },
+  ];
+  return {
+    items,
+    details: {
+      "simple-check": {
+        ...items[0],
+        results: [
+          {
+            source: null,
+            scenario: null,
+            variant: null,
+            target: null,
+            status: "up",
+            status_reason: null,
+            success: true,
+            last_run_at: "2026-09-05T12:00:00Z",
+            duration_seconds: null,
+            ttfb_seconds: null,
+            stale: false,
+            data_incomplete: false,
+            diagnostic_codes: [],
+            canaries: [],
+            assertions: [],
+          },
+        ],
+        parts: [],
+        related_alerts: [],
+        incidents: [],
+        alerts_available: true,
+        related_alerts_total: 0,
+        incidents_total: 0,
+        relations_incomplete: false,
+        relation_warning_codes: [],
+        grafana_url: null,
+      },
+      "complex-check": {
+        ...items[1],
+        results: [
+          {
+            source: "eu-west",
+            scenario: "purchase",
+            variant: "member",
+            target: "Checkout",
+            status: "up",
+            status_reason: null,
+            success: true,
+            last_run_at: "2026-09-05T12:00:00Z",
+            duration_seconds: 0.31,
+            ttfb_seconds: 0.12,
+            stale: false,
+            data_incomplete: false,
+            diagnostic_codes: [],
+            canaries: [],
+            assertions: [],
+          },
+          {
+            source: "us-east",
+            scenario: "purchase",
+            variant: "guest",
+            target: "Checkout",
+            status: "down",
+            status_reason: "invalid_data",
+            success: false,
+            last_run_at: "2026-09-05T12:00:00Z",
+            duration_seconds: 0.42,
+            ttfb_seconds: 0.18,
+            stale: false,
+            data_incomplete: false,
+            diagnostic_codes: [],
+            canaries: [{ canary: "control", success: true, status_reason: null }],
+            assertions: [{ key: "egress_match", success: false, status_reason: "mismatch" }],
+          },
+          {
+            source: "eu-west",
+            scenario: "refund",
+            variant: null,
+            target: "Checkout",
+            status: "up",
+            status_reason: null,
+            success: true,
+            last_run_at: "2026-09-05T12:00:00Z",
+            duration_seconds: 0,
+            ttfb_seconds: null,
+            stale: false,
+            data_incomplete: false,
+            diagnostic_codes: [],
+            canaries: [],
+            assertions: [],
+          },
+        ],
+        parts: [],
+        related_alerts: [
+          {
+            id: "alert-checkout",
+            name: "Checkout path failed",
+            severity: "critical",
+            status: "firing",
+            starts_at: "2026-09-05T11:58:00Z",
+            last_event_at: "2026-09-05T12:00:00Z",
+            resolved_at: null,
+            href: "/incidents/incident-checkout",
+          },
+        ],
+        incidents: [],
+        alerts_available: true,
+        related_alerts_total: 2,
+        incidents_total: 3,
+        relations_incomplete: true,
+        relation_warning_codes: ["related_alerts_truncated", "related_incidents_truncated"],
+        grafana_url: "https://grafana.example.test/d/checks?var-check_id=complex-check",
+      },
+    },
+  };
+}
+
+test("Checks dashboard, filters, grouping, matrix details, links, and mobile accessibility", async ({
+  page,
+}) => {
+  const fixtures = checksFixtures();
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    checksDetails: fixtures.details,
+    checksItems: fixtures.items,
+    checksMode: "ready",
+    checksWarningCodes: ["check_ttfb_unavailable"],
+    incidents: [
+      {
+        id: "incident-checkout",
+        title: "Checkout incident",
+        description: "The synthetic customer path is failing.",
+        severity: "critical",
+        status: "open",
+        source_name: "Prometheus",
+        region: "EU",
+        target: "Checkout",
+        starts_at: "2026-09-05T11:58:00Z",
+        last_event_at: "2026-09-05T12:00:00Z",
+        labels: { check_id: "must-not-become-a-link" },
+        annotations: {},
+        timeline: [],
+        related_checks: [{ check_id: "complex-check", href: "/checks/complex-check" }],
+        checks_relation_state: "available",
+      },
+    ],
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+
+  const widget = page.locator(".checks-widget");
+  await expect(widget.getByRole("heading", { name: "Автоматизированные проверки" })).toBeVisible();
+  await expect(widget.locator(".checks-problem-row").first()).toContainText("Down check");
+  await expect(widget.locator(".checks-summary__item--up strong")).toHaveText("1");
+  await expect(widget.getByText("check_ttfb_unavailable")).toBeVisible();
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Checks" }).click();
+
+  await expect(page.getByRole("heading", { name: "Checks", level: 1 })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "customer-paths" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Без группы" })).toBeVisible();
+  await page
+    .locator(".checks-summary")
+    .getByRole("button", { name: /Не работает/ })
+    .click();
+  await expect(page.locator(".checks-table tbody tr")).toHaveCount(1);
+  await expect(page.locator(".checks-table tbody tr")).toContainText("Down check");
+  await page.locator(".checks-summary").getByRole("button", { name: /Всего/ }).click();
+  await page.getByRole("search").getByPlaceholder("ID, название или Target…").fill("No match");
+  await page.getByRole("search").getByRole("button", { name: "Найти" }).click();
+  await expect(page.getByRole("heading", { name: "Ничего не найдено" })).toBeVisible();
+  await expect(page.getByText(/Подключите совместимого исполнителя/)).toHaveCount(0);
+  await page.locator(".checks-state").getByRole("button", { name: "Сбросить фильтры" }).click();
+  await expect(page.locator(".checks-table tbody tr")).toHaveCount(fixtures.items.length);
+  await page.getByRole("search").getByPlaceholder("ID, название или Target…").fill("Complex");
+  await page.getByRole("search").getByRole("button", { name: "Найти" }).click();
+  await expect(page.locator(".checks-table tbody tr")).toHaveCount(1);
+  await page.getByRole("button", { name: "Открыть Check Complex customer path" }).click();
+
+  await expect(page.getByRole("heading", { name: "Complex customer path" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Матрица Source × Scenario" })).toBeVisible();
+  const variantSummary = page.locator("summary").filter({ hasText: "Variant · guest" });
+  await variantSummary.focus();
+  await expect(variantSummary).toBeFocused();
+  await variantSummary.press("Enter");
+  expect(
+    await variantSummary.evaluate((element) => getComputedStyle(element).outlineStyle),
+  ).not.toBe("none");
+  await expect(page.getByText("control")).toBeVisible();
+  await expect(page.getByText("egress_match")).toBeVisible();
+  await expect(page.getByRole("link", { name: /Grafana/ })).toHaveAttribute(
+    "href",
+    /var-check_id=complex-check/,
+  );
+  await expect(page.getByText("Checkout path failed")).toBeVisible();
+  await expect(page.getByText(/Получено активных алертов/)).toContainText("1/2");
+  await expect(page.getByText("related_alerts_truncated")).toBeVisible();
+  await expect(page.getByText("related_incidents_truncated")).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const overflow = await page.evaluate(() => ({
+    documentWidth: document.documentElement.scrollWidth,
+    viewportWidth: window.innerWidth,
+  }));
+  expect(overflow.documentWidth).toBe(overflow.viewportWidth);
+  const results = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa"]).analyze();
+  expect(
+    results.violations.filter((violation) =>
+      ["serious", "critical"].includes(violation.impact ?? ""),
+    ),
+  ).toEqual([]);
+  await page.getByRole("button", { name: /Подробнее/ }).click();
+  await expect(page.getByRole("heading", { name: "Checkout incident" })).toBeVisible();
+  const relatedChecks = page.getByRole("navigation", { name: "Связанные Checks" });
+  await expect(relatedChecks).toContainText("complex-check");
+  await expect(relatedChecks.getByRole("button", { name: /must-not-become-a-link/ })).toHaveCount(
+    0,
+  );
+});
+
+test("Checks disabled route is explicit and a refresh failure clears the previous success", async ({
+  page,
+}) => {
+  const fixtures = checksFixtures();
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    checksDetails: fixtures.details,
+    checksItems: fixtures.items,
+    checksMode: "disabled",
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+  await expect(page.locator(".sidebar__nav").getByRole("button", { name: "Checks" })).toHaveCount(
+    0,
+  );
+  await page.evaluate(() => {
+    history.pushState({}, "", "/checks");
+    dispatchEvent(new PopStateEvent("popstate"));
+  });
+  await expect(page.getByText("Модуль Checks отключён")).toBeVisible();
+
+  state.checksMode = "ready";
+  state.checksWarningCodes = ["check_ttfb_unavailable"];
+  await page.getByRole("button", { name: "Обновить", exact: true }).click();
+  await expect(page.getByText("Simple check")).toBeVisible();
+  await page.getByRole("button", { name: "Открыть Check Simple check" }).click();
+  await expect(page.locator(".check-detail-hero")).toContainText("Работает");
+
+  state.checksMode = "unavailable";
+  await page.locator(".check-detail-actions").getByRole("button", { name: "Обновить" }).click();
+  await expect(page.getByText("Результаты Checks недоступны")).toBeVisible();
+  await expect(page.locator(".check-detail-hero")).toHaveCount(0);
+  await expect(page.getByText(/Прежний успешный результат скрыт/)).toBeVisible();
+  await expect(page.getByText("check_ttfb_unavailable")).toBeVisible();
+});
 
 test("Web Push surfaces node errors, rotates stale keys, and binds the login device", async ({
   page,
@@ -753,7 +1322,7 @@ test("bootstrap, deep-link navigation, live source creation, failover trust, and
     ],
     theme_color: "#0A0A0B",
   });
-  await expect(page).toHaveTitle("E2E Operations — центр мониторинга");
+  await expect(page).toHaveTitle("E2E Operations — Центр мониторинга");
   await expect(page.getByRole("heading", { name: "Запуск кластера" })).toBeVisible();
   await page.getByLabel("Токен первичной настройки").fill("one-time-bootstrap-token");
   await page.getByLabel("Имя пользователя").fill("admin");
@@ -795,14 +1364,22 @@ test("bootstrap, deep-link navigation, live source creation, failover trust, and
   await rotatedDialog.getByRole("button", { name: "Я сохранил новый токен" }).click();
 
   await page.getByRole("button", { name: "Обзор" }).click();
+  await expect(page.getByRole("heading", { name: "Статистика за 7 дней" })).toBeVisible();
+  await expect(
+    page.locator(".statistics-kpi").filter({ hasText: "Началось инцидентов" }),
+  ).toContainText("12");
+  await expect(page.locator(".statistics-chart")).toHaveCount(2);
+  await expect(page.getByText("Prometheus EU", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Подробнее в Grafana" })).toHaveAttribute(
+    "href",
+    "https://grafana.example.test/d/alert-hub",
+  );
   await expect(page.getByRole("heading", { name: "Состояние по данным Prometheus" })).toBeVisible();
   await expect(
     page.getByRole("heading", { name: "Доступность по регионам" }).first(),
   ).toBeVisible();
   await expect(page.getByRole("heading", { name: "Активные тревоги" })).toBeVisible();
-  await expect(
-    page.getByRole("heading", { name: "Prometheus / Alertmanager / Blackbox" }),
-  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Выбранные ключевые job" })).toBeVisible();
   await expect(
     page.getByRole("heading", { name: "Синхронизация и состояние Alert Hub" }),
   ).toBeVisible();
@@ -887,6 +1464,40 @@ test("creates a Prometheus datasource with explicit server reachability labels",
       reachability_label_mode: "canonical",
     });
   await expect(labelModeSelect).toHaveValue("canonical");
+});
+
+test("updates the Grafana link and safe job patterns from settings", async ({ page }) => {
+  const state: MockState = {
+    applicationSettingsRequest: null,
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+
+  await page.getByRole("button", { name: "Настройки", exact: true }).click();
+  await page.getByLabel("Ссылка на Grafana").fill("https://grafana.example.test/d/new-operations");
+  await page.getByLabel("Ключевые сервисы · job").fill("vless_blackbox_*, vps_nodes");
+  await page.getByLabel("Сервисы Alert Hub · job").fill("alert-hub-api-*");
+  await page.getByRole("button", { name: "Сохранить мониторинг" }).click();
+
+  await expect(page.getByRole("status")).toContainText("Настройки мониторинга сохранены");
+  expect(state.applicationSettingsRequest).toEqual({
+    grafana_url: "https://grafana.example.test/d/new-operations",
+    key_job_globs: ["vless_blackbox_*", "vps_nodes"],
+    alert_hub_job_globs: ["alert-hub-api-*"],
+  });
+  await page.getByRole("button", { name: "Обзор", exact: true }).click();
+  await expect(page.getByRole("link", { name: "Открыть Grafana" })).toHaveAttribute(
+    "href",
+    "https://grafana.example.test/d/new-operations",
+  );
 });
 
 test("logout waits for an in-flight refresh and rejects its stale token", async ({ page }) => {
@@ -1335,6 +1946,7 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
     rootLocked: true,
   });
   await expect(page.locator(".auth-screen .language-switch")).toBeVisible();
+  await expect(page.locator(".auth-story > .brand small")).toHaveText("Центр мониторинга");
   await expect(page.getByRole("button", { name: "RU", exact: true })).toHaveAttribute(
     "aria-pressed",
     "true",
@@ -1343,6 +1955,7 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole("button", { name: /Открыть демо/ }).click();
   await expect(page.getByRole("main")).toBeVisible();
+  await expect(page.locator(".overview-page .language-switch")).toHaveCount(0);
   await expect(page.getByRole("status").getByText("демо-режим", { exact: true })).toBeVisible();
   await expect(page.locator("html")).not.toHaveClass(/auth-open/);
   await expect(page.getByLabel("Grafana не настроена")).toBeVisible();
@@ -1447,6 +2060,8 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
   await page.getByRole("button", { name: "Настройки", exact: true }).click();
   await page.getByRole("button", { name: "EN", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
+  await expect(page.locator(".sidebar .brand small")).toHaveText("Monitoring center");
+  await expect(page).toHaveTitle("E2E Operations — Monitoring center");
   await expect(page.getByRole("button", { name: "EN", exact: true })).toHaveAttribute(
     "aria-pressed",
     "true",
@@ -1494,7 +2109,7 @@ test.describe("service-worker offline lifecycle", () => {
         JSON.stringify({ partition, savedAt: Date.now(), version: 1 }),
       );
       localStorage.removeItem("alert-hub-local-logout-v1");
-      const shell = await caches.open("alert-hub-v6-shell");
+      const shell = await caches.open("alert-hub-v7-shell");
       const shellUrls = [
         "/",
         ...[...document.querySelectorAll<HTMLScriptElement>("script[src]")].map(
@@ -1559,6 +2174,31 @@ test.describe("service-worker offline lifecycle", () => {
           errors: [],
           samples: [],
           status: "ok",
+        },
+        "/api/v1/metrics/statistics?window=7d": {
+          window: "7d",
+          generated_at: "2026-09-02T12:00:00Z",
+          starts_at: "2026-08-26T12:00:00Z",
+          ends_at: "2026-09-02T12:00:00Z",
+          bucket_seconds: 21600,
+          totals: {
+            incidents_started: 0,
+            incidents_resolved: 0,
+            active_incidents: 0,
+            active_critical: 0,
+            acknowledgement_rate: null,
+            resolution_rate: null,
+            mean_time_to_acknowledge_seconds: null,
+            mean_time_to_resolve_seconds: null,
+            deliveries: 0,
+            deliveries_succeeded: 0,
+            deliveries_failed: 0,
+            delivery_success_rate: null,
+          },
+          timeline: [],
+          severities: [],
+          sources: [],
+          channels: [],
         },
       };
       await Promise.all(

@@ -86,6 +86,7 @@ class Incident(Base):
     __table_args__ = (
         UniqueConstraint("source_id", "fingerprint", name="uq_incidents_source_fingerprint"),
         Index("ix_incidents_status_last_event", "status", "last_event_at"),
+        Index("ix_incidents_status_severity", "status", "severity"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -118,7 +119,18 @@ class IncidentEvent(Base):
     __table_args__ = (
         UniqueConstraint("origin_node_id", "origin_seq", name="uq_incident_events_origin_seq"),
         UniqueConstraint("event_key", name="uq_incident_events_event_key"),
-        Index("ix_incident_events_incident_time", "incident_id", "occurred_at"),
+        Index(
+            "ix_incident_events_incident_time_key",
+            "incident_id",
+            "occurred_at",
+            "event_key",
+        ),
+        Index(
+            "ix_incident_events_type_time_incident",
+            "event_type",
+            "occurred_at",
+            "incident_id",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -233,6 +245,12 @@ class ClusterEvent(Base):
     __table_args__ = (
         UniqueConstraint("origin_node_id", "origin_seq", name="uq_cluster_events_origin_seq"),
         Index("ix_cluster_events_origin_cursor", "origin_node_id", "origin_seq"),
+        Index(
+            "ix_cluster_events_type_operation_time",
+            "entity_type",
+            "operation",
+            "occurred_at",
+        ),
     )
 
     event_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -273,6 +291,17 @@ class PrometheusDatasource(Base):
     )
     encrypted_credentials: Mapped[bytes | None] = mapped_column(LargeBinary)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
+
+
+class ApplicationSetting(Base):
+    __tablename__ = "application_settings"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    grafana_url: Mapped[str | None] = mapped_column(String(2048))
+    key_job_globs: Mapped[list[str]] = mapped_column(JSON)
+    alert_hub_job_globs: Mapped[list[str]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
 

@@ -3,6 +3,8 @@
 This guide installs one Alert Hub node without replacing its existing
 Prometheus, Alertmanager, Blackbox, Nginx, Caddy, or firewall configuration.
 Repeat it for every node and keep every SQLite database local to that node.
+Enabling Checks adds fixed read-only Prometheus queries; it does not install,
+configure, or require Blackbox or any other prober/executor service.
 
 ## Deployment artifacts
 
@@ -275,12 +277,39 @@ APP_NAME
 PEER_URLS
 PEER_ALLOWED_CIDRS
 VAPID_PUBLIC_KEY
+CHECKS_ENABLED
+CHECKS_STALE_AFTER_SECONDS
+CHECKS_MIN_FAILURE_SOURCES
+CHECKS_GRAFANA_BASE_URL
+CHECKS_CACHE_TTL_SECONDS
+CHECKS_FUTURE_TOLERANCE_SECONDS
+CHECKS_MAX_SERIES
 ```
 
 `APP_NAME` defaults to `Alert Hub`. `PEER_URLS` is a comma-separated list of the
 other nodes' exact HTTPS peer origins; setting it also requires their exact
 public IPv4 `/32` values in `PEER_ALLOWED_CIDRS`. `VAPID_PUBLIC_KEY` may be
 omitted because the API derives it from the P-256 private key.
+
+Checks defaults to disabled. When these optional variables are omitted, the
+API deployment writes `false`, 180 seconds stale age, one failure source, no
+Checks-specific Grafana link, a five-second cache TTL, 30 seconds of future
+timestamp tolerance, and a combined 5,000-sample refresh/registry limit. The
+accepted configuration ranges are 1–86,400 seconds for stale age, 1–1,000
+failure sources, 0.1–5 seconds for cache TTL, 0–300 seconds for future
+tolerance, and 1–100,000 series. `CHECKS_GRAFANA_BASE_URL` is non-secret
+navigation metadata; use an absolute HTTPS URL without credentials. An invalid
+or disallowed URL disables only the link.
+
+The workflow passes Checks variables only to `api` and `all` deployment steps.
+The root-owned engine validates them, writes them to the private runtime env,
+and includes them in its content-addressed config checksum. Consequently, a
+settings-only API deployment with the same image digest still recreates the API
+and records rollback state. Web-only deployment and rollback receive no new
+Checks values and continue to use the activated config snapshot. Refresh the
+reviewed root-owned provisioner before relying on these variables so its
+sudoers `env_keep` allowlist, the workflow policy allowlist, and the installed
+deploy engine agree.
 
 `PUBLIC_DOMAIN` is a DNS hostname without a scheme. `PEER_PUBLIC_URL` is this
 node's dedicated peer origin, such as `https://peer-node.example.invalid`, with
@@ -330,9 +359,9 @@ disabled rather than inventing a topology.
 ## Release and deploy behavior
 
 Pull requests and pushes to `main` build and test API and web independently and together with
-read-only permissions; they never publish or deploy. Semver-like `v*.*.*` tags also run that
-normal CI matrix without publishing images. A
-version tag separately runs the complete release gate. The root `VERSION` file is the sole product
+read-only permissions; they never publish or deploy. The two images are built in one gated,
+ephemeral integration job so the exact pair can be exercised without uploading Docker archives as
+Actions artifacts. A version tag runs only the complete release gate. The root `VERSION` file is the sole product
 release version source. An operator may instead run the Release workflow on `main` without entering
 a version; the workflow reads `VERSION`, validates the main revision, creates the immutable tag, and
 publishes the release. An optional explicit `vX.Y.Z` input and any pushed version tag must match
@@ -600,6 +629,13 @@ Status validates the exact runtime network set: API must have only edge, egress,
 and the optional configured monitoring network; web must have only edge and
 ingress. A stale or unexpected attachment is unhealthy rather than silently
 reported as disabled.
+
+Checks queries every enabled Alert Hub Prometheus datasource. Before setting
+`CHECKS_ENABLED=true`, verify the intended `synthetic_check_*` recording or
+executor metrics are visible from those datasources and that `check_id` is
+unique across their combined view. Keep the executor and scrape configuration
+outside Alert Hub. The API uses its existing bounded monitoring egress and does
+not need a new container, published port, shared database, Redis, or broker.
 
 The sanitized `deploy/scripts/host-readiness.sh` field
 `sudo_unrestricted_nopasswd` checks whether the current account can run an

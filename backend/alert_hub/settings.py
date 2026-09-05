@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import re
 import unicodedata
 from functools import lru_cache
@@ -12,7 +13,10 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from alert_hub.domain.monitoring import normalize_grafana_url
 from alert_hub.infrastructure.request_security import parse_cidr_setting
+
+logger = logging.getLogger("alert_hub.settings")
 
 
 def _normalize_peer_hostname(host: str, *, label: str) -> str:
@@ -105,6 +109,13 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("PEER_PUBLIC_URL", "PRIVATE_PEER_URL"),
     )
     grafana_url: str | None = None
+    checks_enabled: bool = False
+    checks_stale_after_seconds: int = Field(default=180, gt=0, le=86_400)
+    checks_min_failure_sources: int = Field(default=1, ge=1, le=1_000)
+    checks_grafana_base_url: str | None = None
+    checks_cache_ttl_seconds: float = Field(default=5.0, ge=0.1, le=5.0)
+    checks_future_tolerance_seconds: float = Field(default=30.0, ge=0.0, le=300.0)
+    checks_max_series: int = Field(default=5_000, ge=1, le=100_000)
     ingest_enabled: bool = True
     notify_enabled: bool = True
     sync_enabled: bool = True
@@ -334,31 +345,24 @@ class Settings(BaseSettings):
     @field_validator("grafana_url")
     @classmethod
     def validate_grafana_url(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        candidate = value.strip()
-        if "*" in candidate or any(character.isspace() for character in candidate):
-            raise ValueError("GRAFANA_URL must not contain wildcards or whitespace")
         try:
-            parsed = urlsplit(candidate)
-            parsed_port = parsed.port
+            return normalize_grafana_url(value)
         except ValueError as exc:
-            raise ValueError("GRAFANA_URL is invalid") from exc
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("GRAFANA_URL must use http or https and include a host")
-        if parsed.username or parsed.password:
-            raise ValueError("GRAFANA_URL must not contain credentials")
-        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-        netloc = host if parsed_port is None else f"{host}:{parsed_port}"
-        return urlunsplit(
-            (
-                parsed.scheme.lower(),
-                netloc.lower(),
-                parsed.path,
-                parsed.query,
-                parsed.fragment,
+            raise ValueError(str(exc).replace("Grafana URL", "GRAFANA_URL")) from exc
+
+    @field_validator("checks_grafana_base_url", mode="before")
+    @classmethod
+    def validate_checks_grafana_url(cls, value: object) -> str | None:
+        try:
+            return normalize_grafana_url(value)
+        except ValueError:
+            # A navigation convenience must never prevent the hub from starting. The unsafe
+            # value itself is intentionally omitted from logs.
+            logger.warning(
+                "checks_grafana_url_disabled",
+                extra={"event": "checks_grafana_url_disabled", "reason": "invalid_url"},
             )
-        )
+            return None
 
     @field_validator("peer_urls", mode="before")
     @classmethod
@@ -387,6 +391,20 @@ class Settings(BaseSettings):
                 "SYNC_BACKOFF_MAX_SECONDS must be greater than or equal to "
                 "SYNC_BACKOFF_INITIAL_SECONDS"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_checks_grafana_transport(self) -> Settings:
+        if (
+            self.checks_grafana_base_url
+            and urlsplit(self.checks_grafana_base_url).scheme == "http"
+            and not self.allow_http_monitoring_urls
+        ):
+            logger.warning(
+                "checks_grafana_url_disabled",
+                extra={"event": "checks_grafana_url_disabled", "reason": "http_not_allowed"},
+            )
+            self.checks_grafana_base_url = None
         return self
 
     @field_validator("signing_key", "cluster_secret")

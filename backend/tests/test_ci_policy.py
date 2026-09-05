@@ -1081,24 +1081,32 @@ def test_ci_keeps_images_local_and_release_publishes_exact_pair() -> None:
     ci_source = (REPOSITORY / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "bundle-image" not in jobs
     assert "candidate" not in jobs
+    assert "api-image" not in jobs
+    assert "web-image" not in jobs
     assert "packages: write" not in ci_source
     assert "docker login" not in ci_source
     assert "docker push" not in ci_source
-    api = jobs["api-image"]
-    web = jobs["web-image"]
     integration = jobs["container-integration"]
-    api_run = _job_run(api)
-    web_run = _job_run(web)
     integration_run = _job_run(integration)
 
-    api_needs = api["needs"] if isinstance(api["needs"], list) else [api["needs"]]
-    assert "frontend" not in api_needs
-    assert "--file backend/Dockerfile" in api_run
-    assert "--tag alert-hub-api:ci" in api_run
-    assert "docker save alert-hub-api:ci" in api_run
-    assert "--file frontend/Dockerfile" in web_run
-    assert "--tag alert-hub-web:ci" in web_run
-    assert "docker save alert-hub-web:ci" in web_run
+    assert set(integration["needs"]) == {
+        "repository-quality",
+        "backend",
+        "frontend",
+        "security",
+        "operations",
+    }
+    assert len(re.findall(r"(?m)^docker build(?:x)?(?:\s|$)", integration_run)) == 2
+    assert "--file backend/Dockerfile" in integration_run
+    assert "--tag alert-hub-api:ci" in integration_run
+    assert "--file frontend/Dockerfile" in integration_run
+    assert "--tag alert-hub-web:ci" in integration_run
+    assert "docker save" not in integration_run
+    assert "docker load" not in integration_run
+    assert not any(
+        action.startswith(("actions/upload-artifact@", "actions/download-artifact@"))
+        for action in _job_actions(integration)
+    )
     assert "ci-image-matrix-smoke.sh" in integration_run
     assert "alert-hub-api:ci alert-hub-web:ci" in integration_run
     assert "ci-three-node-failure.sh alert-hub-api:ci" in integration_run
@@ -1159,13 +1167,11 @@ def test_ci_keeps_images_local_and_release_publishes_exact_pair() -> None:
     assert all(step["with"]["push-to-registry"] is False for step in attestation_steps)
 
 
-def test_ci_runs_for_main_and_release_tags() -> None:
+def test_ci_runs_for_main_while_release_owns_version_tags() -> None:
     source = (REPOSITORY / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert re.search(r"(?m)^  pull_request:\n    branches: \[main\]$", source)
-    assert re.search(
-        r'(?m)^  push:\n    branches: \[main\]\n    tags: \["v\*\.\*\.\*"\]$',
-        source,
-    )
+    assert re.search(r"(?m)^  push:\n    branches: \[main\]$", source)
+    assert "tags:" not in source
 
 
 def test_manual_release_reserves_tag_and_publishes_assets_idempotently() -> None:
@@ -1374,6 +1380,15 @@ def test_web_only_production_deploy_does_not_receive_crypto_secrets() -> None:
         "SESSION_SIGNING_KEY",
         "VAPID_PRIVATE_KEY",
     }
+    checks_settings = {
+        "CHECKS_CACHE_TTL_SECONDS",
+        "CHECKS_ENABLED",
+        "CHECKS_FUTURE_TOLERANCE_SECONDS",
+        "CHECKS_GRAFANA_BASE_URL",
+        "CHECKS_MAX_SERIES",
+        "CHECKS_MIN_FAILURE_SOURCES",
+        "CHECKS_STALE_AFTER_SECONDS",
+    }
 
     for job_name in ("deploy_ru", "deploy_nl", "deploy_de"):
         steps = deploy["jobs"][job_name]["steps"]
@@ -1390,6 +1405,9 @@ def test_web_only_production_deploy_does_not_receive_crypto_secrets() -> None:
         assert crypto_secrets.isdisjoint(web_step["env"])
         assert crypto_secrets <= api_step["env"].keys()
         assert crypto_secrets.isdisjoint(status_step.get("env", {}))
+        assert checks_settings.isdisjoint(web_step["env"])
+        assert checks_settings <= api_step["env"].keys()
+        assert checks_settings.isdisjoint(status_step.get("env", {}))
         assert "PEER_PUBLIC_URL" not in web_step["env"]
         assert "PEER_PUBLIC_URL" in api_step["env"]
         assert "PEER_ADDRESS" not in web_step_text
@@ -1397,6 +1415,10 @@ def test_web_only_production_deploy_does_not_receive_crypto_secrets() -> None:
         for secret in crypto_secrets:
             assert secret not in web_step_text
             assert secret in api_step_text
+        for setting in checks_settings:
+            assert web_step_text.count(setting) == 0
+            assert setting in api_step_text
+            assert api_step["env"][setting] == f"${{{{ vars.{setting} }}}}"
         assert "/usr/local/sbin/docker-deploy-node.sh" in str(web_step["run"])
         assert "/usr/local/sbin/docker-deploy-node.sh" in str(api_step["run"])
         assert "/usr/local/sbin/docker-status-node.sh" in str(status_step["run"])
@@ -1404,6 +1426,79 @@ def test_web_only_production_deploy_does_not_receive_crypto_secrets() -> None:
     rollback_text = str(_workflow("rollback.yml"))
     assert "PEER_ADDRESS" not in rollback_text
     assert "PEER_PUBLIC_URL" not in rollback_text
+    assert all(setting not in rollback_text for setting in checks_settings)
+
+
+def test_production_checks_settings_are_allowlisted_validated_and_snapshotted() -> None:
+    checker = _checker()
+    deploy = DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
+    runtime = _shell_function(deploy, "write_runtime_material")
+    provisioner = PROVISIONER_PATH.read_text(encoding="utf-8")
+    environment_example = (REPOSITORY / ".env.example").read_text(encoding="utf-8")
+    checks_defaults = {
+        "CHECKS_ENABLED": "false",
+        "CHECKS_STALE_AFTER_SECONDS": "180",
+        "CHECKS_MIN_FAILURE_SOURCES": "1",
+        "CHECKS_GRAFANA_BASE_URL": "",
+        "CHECKS_CACHE_TTL_SECONDS": "5",
+        "CHECKS_FUTURE_TOLERANCE_SECONDS": "30",
+        "CHECKS_MAX_SERIES": "5000",
+    }
+
+    assert checks_defaults.keys() <= checker.PRESERVABLE_ROOT_ENVIRONMENT
+    for setting, default in checks_defaults.items():
+        assert f"{setting}=${{{setting}:-{default}}}" in deploy
+        assert f'"{setting}=${{{setting}}}"' in runtime
+        assert f"{setting}={default}\n" in environment_example
+        assert setting in provisioner
+
+    assert 'validate_boolean "${CHECKS_ENABLED}"' in runtime
+    assert 'validate_bounded_integer "${CHECKS_STALE_AFTER_SECONDS}" 1 86400' in runtime
+    assert 'validate_bounded_integer "${CHECKS_MIN_FAILURE_SOURCES}" 1 1000' in runtime
+    assert 'validate_single_line "${CHECKS_GRAFANA_BASE_URL}"' in runtime
+    assert 'validate_bounded_decimal "${CHECKS_CACHE_TTL_SECONDS}" 0.1 5' in runtime
+    assert 'validate_bounded_decimal "${CHECKS_FUTURE_TOLERANCE_SECONDS}" 0 300' in runtime
+    assert 'validate_bounded_integer "${CHECKS_MAX_SERIES}" 1 100000' in runtime
+
+
+@pytest.mark.parametrize(
+    ("expression", "value", "accepted"),
+    [
+        ('validate_boolean "$1"', "true", True),
+        ('validate_boolean "$1"', "false", True),
+        ('validate_boolean "$1"', "1", False),
+        ('validate_boolean "$1"', "TRUE", False),
+        ('validate_bounded_integer "$1" 1 86400', "1", True),
+        ('validate_bounded_integer "$1" 1 86400', "86400", True),
+        ('validate_bounded_integer "$1" 1 86400', "0", False),
+        ('validate_bounded_integer "$1" 1 86400', "86401", False),
+        ('validate_bounded_integer "$1" 1 86400', "1.0", False),
+        ('validate_bounded_decimal "$1" 0.1 5', "0.1", True),
+        ('validate_bounded_decimal "$1" 0.1 5', "5.0", True),
+        ('validate_bounded_decimal "$1" 0.1 5', "0.09", False),
+        ('validate_bounded_decimal "$1" 0.1 5', "5.01", False),
+        ('validate_bounded_decimal "$1" 0 300', "0", True),
+        ('validate_bounded_decimal "$1" 0 300', "300", True),
+        ('validate_bounded_decimal "$1" 0 300', "-1", False),
+        ('validate_bounded_decimal "$1" 0 300', "NaN", False),
+    ],
+)
+def test_production_checks_setting_validators_fail_closed(
+    expression: str,
+    value: str,
+    accepted: bool,
+) -> None:
+    source = DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
+    definitions, marker, _entrypoint = source.partition("[[ ${EUID} -eq 0 ]]")
+    assert marker
+    result = subprocess.run(
+        ["bash", "-s", "--", value],
+        input=definitions + f"{expression}\n",
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert (result.returncode == 0) is accepted
 
 
 def test_production_network_topology_comes_from_root_owned_policy() -> None:
@@ -1963,6 +2058,10 @@ def test_controlled_three_node_peers_use_literal_private_addresses() -> None:
 
 def test_pr_codeql_is_a_read_only_failing_sarif_gate() -> None:
     workflow = _workflow("codeql.yml")
+    assert workflow["concurrency"] == {
+        "group": "codeql-${{ github.workflow }}-${{ github.ref }}",
+        "cancel-in-progress": True,
+    }
     for job_name in ("analyze-pr", "analyze-main"):
         job = workflow["jobs"][job_name]
         assert job["strategy"]["matrix"]["language"] == [

@@ -126,12 +126,14 @@ Compose, backup/restore, and static deployment/rollback policy checks. The full
 root-owned host rollback state machine remains a production-like installation drill.
 
 Pull requests and pushes to `main` run read-only GitHub-hosted checks and never
-publish or deploy. Semver-like `v*.*.*` tags also run the normal CI matrix
-without publishing images; the separate release workflow is the only workflow
-that pushes the two `vX.Y.Z` images. It publishes SBOMs, GitHub-hosted provenance
-attestations, and the compatible-pair manifest without adding synthetic
-`sha256-*` tags to GHCR. Production deploy and rollback are separate, manual,
-protected workflows.
+publish or deploy. After all source, dependency, and operations gates pass, one
+ephemeral job builds the API and web images separately and exercises their exact
+compatible pair without transferring image archives through Actions artifacts.
+Semver-like `v*.*.*` tags are owned by the separate release workflow, which is
+the only workflow that pushes the two `vX.Y.Z` images. It publishes SBOMs,
+GitHub-hosted provenance attestations, and the compatible-pair manifest without
+adding synthetic `sha256-*` tags to GHCR. Production deploy and rollback are
+separate, manual, protected workflows.
 
 ## Repository layout
 

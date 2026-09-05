@@ -5,23 +5,34 @@ import base64
 import json
 import math
 import socket
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
 import httpx
 
+from alert_hub.domain.monitoring import job_globs_to_re2
 from alert_hub.infrastructure.url_safety import Resolver, UnsafeURL, validate_monitoring_url
 from alert_hub.settings import Settings
 
-type FixedQueryName = Literal[
+type PublicQueryName = Literal[
     "connection_test",
     "reachability",
     "firing_alerts",
     "key_jobs_up",
     "alert_hub_health",
 ]
+type CheckQueryName = Literal[
+    "check_info",
+    "check_status",
+    "check_last_run",
+    "check_canary_success",
+    "check_duration",
+    "check_ttfb",
+    "check_egress_match",
+]
+type FixedQueryName = PublicQueryName | CheckQueryName
 
 FIXED_PROMQL: dict[FixedQueryName, str] = {
     "connection_test": "vector(1)",
@@ -29,7 +40,23 @@ FIXED_PROMQL: dict[FixedQueryName, str] = {
     "firing_alerts": 'ALERTS{alertstate="firing"}',
     "key_jobs_up": 'up{job=~"prometheus|alertmanager|blackbox.*"}',
     "alert_hub_health": 'up{job=~"alert[-_]?hub.*"}',
+    "check_info": "synthetic_check_info",
+    "check_status": "synthetic_check_status",
+    "check_last_run": "synthetic_check_last_run_timestamp_seconds",
+    "check_canary_success": "synthetic_check_canary_success",
+    "check_duration": "synthetic_check_duration_seconds",
+    "check_ttfb": "synthetic_check_ttfb_seconds",
+    "check_egress_match": "synthetic_check_egress_match",
 }
+
+
+def fixed_promql(query_name: FixedQueryName, job_globs: Sequence[str] | None = None) -> str:
+    if job_globs is None:
+        return FIXED_PROMQL[query_name]
+    if query_name not in {"key_jobs_up", "alert_hub_health"}:
+        raise ValueError(f"{query_name} does not accept job patterns")
+    regex = job_globs_to_re2(job_globs)
+    return f"up{{job=~{json.dumps(regex)}}}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,10 +81,19 @@ class PrometheusClient(Protocol):
         url: str,
         credentials: Mapping[str, Any],
         query_name: FixedQueryName,
+        *,
+        job_globs: Sequence[str] | None = None,
+        evaluated_at: datetime | None = None,
+        allow_non_finite_values: bool = False,
     ) -> list[VectorSample]: ...
 
 
-def parse_vector_response(payload: object, *, max_samples: int) -> list[VectorSample]:
+def parse_vector_response(
+    payload: object,
+    *,
+    max_samples: int,
+    allow_non_finite_values: bool = False,
+) -> list[VectorSample]:
     if not isinstance(payload, dict):
         raise PrometheusQueryError("invalid_response", "Prometheus response must be an object")
     if payload.get("status") != "success":
@@ -93,7 +129,9 @@ def parse_vector_response(payload: object, *, max_samples: int) -> list[VectorSa
             raise PrometheusQueryError(
                 "invalid_sample", f"Prometheus sample {index} has a non-numeric value"
             ) from exc
-        if not math.isfinite(timestamp) or not math.isfinite(sample_value):
+        if not math.isfinite(timestamp) or (
+            not allow_non_finite_values and not math.isfinite(sample_value)
+        ):
             raise PrometheusQueryError(
                 "invalid_sample", f"Prometheus sample {index} contains a non-finite value"
             )
@@ -103,7 +141,15 @@ def parse_vector_response(payload: object, *, max_samples: int) -> list[VectorSa
             raise PrometheusQueryError(
                 "invalid_sample", f"Prometheus sample {index} has an invalid timestamp"
             ) from exc
-        labels = {str(key): str(label) for key, label in metric.items()}
+        # Prometheus label names and values are strings. Do not turn malformed JSON values
+        # such as `null` into plausible public identifiers (for example, the string "None").
+        # Dropping the malformed pair lets the Checks allowlist reject a missing `check_id`
+        # without leaking or inventing data, while unknown well-formed labels remain harmless.
+        labels = {
+            key: label
+            for key, label in metric.items()
+            if isinstance(key, str) and isinstance(label, str)
+        }
         samples.append(VectorSample(labels=labels, value=sample_value, timestamp=occurred_at))
     return samples
 
@@ -162,6 +208,10 @@ class PrometheusHTTPClient:
         url: str,
         credentials: Mapping[str, Any],
         query_name: FixedQueryName,
+        *,
+        job_globs: Sequence[str] | None = None,
+        evaluated_at: datetime | None = None,
+        allow_non_finite_values: bool = False,
     ) -> list[VectorSample]:
         # Repeat DNS/address validation immediately before every request. Redirects are never
         # followed, which closes the common public-to-private redirect bypass.
@@ -175,9 +225,11 @@ class PrometheusHTTPClient:
         headers["Accept"] = "application/json"
         query_url = f"{normalized.rstrip('/')}/api/v1/query"
         params = {
-            "query": FIXED_PROMQL[query_name],
+            "query": fixed_promql(query_name, job_globs),
             "timeout": f"{self.settings.prometheus_query_timeout_seconds:g}s",
         }
+        if evaluated_at is not None:
+            params["time"] = evaluated_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
         try:
             async with (
                 httpx.AsyncClient(
@@ -226,6 +278,7 @@ class PrometheusHTTPClient:
         return parse_vector_response(
             payload,
             max_samples=self.settings.prometheus_max_samples,
+            allow_non_finite_values=allow_non_finite_values,
         )
 
 

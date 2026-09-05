@@ -107,3 +107,73 @@ def test_grafana_url_is_normalized_and_never_accepts_credentials() -> None:
         Settings(grafana_url="https://operator:secret@grafana.example/d/ops")
     with pytest.raises(ValueError, match="must use http or https"):
         Settings(grafana_url="javascript:alert(1)")
+
+
+def test_checks_settings_have_safe_bounded_defaults() -> None:
+    settings = Settings()
+
+    assert settings.checks_enabled is False
+    assert settings.checks_stale_after_seconds == 180
+    assert settings.checks_min_failure_sources == 1
+    assert settings.checks_cache_ttl_seconds == 5
+    assert settings.checks_future_tolerance_seconds == 30
+    assert settings.checks_max_series == 5_000
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("checks_stale_after_seconds", 0),
+        ("checks_stale_after_seconds", 86_401),
+        ("checks_min_failure_sources", 0),
+        ("checks_min_failure_sources", 1_001),
+        ("checks_cache_ttl_seconds", 0),
+        ("checks_cache_ttl_seconds", 5.01),
+        ("checks_future_tolerance_seconds", -1),
+        ("checks_future_tolerance_seconds", 301),
+        ("checks_max_series", 0),
+        ("checks_max_series", 100_001),
+    ],
+)
+def test_checks_settings_reject_values_outside_documented_bounds(
+    field: str,
+    value: int | float,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        Settings(**{field: value})
+
+
+def test_checks_grafana_url_fails_soft_without_logging_the_value(monkeypatch) -> None:
+    secret_url = "https://operator:do-not-log@grafana.example/d/checks"
+    log_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(
+        "alert_hub.settings.logger.warning",
+        lambda *args, **kwargs: log_calls.append((args, kwargs)),
+    )
+
+    settings = Settings(checks_grafana_base_url=secret_url)
+
+    assert settings.checks_grafana_base_url is None
+    assert log_calls
+    logged = repr(log_calls)
+    assert "checks_grafana_url_disabled" in logged
+    assert secret_url not in logged
+    assert "do-not-log" not in logged
+
+
+def test_checks_grafana_url_requires_explicit_http_and_preserves_admin_path() -> None:
+    https_settings = Settings(
+        checks_grafana_base_url="HTTPS://Grafana.Example:443/d/checks?orgId=1#panel"
+    )
+    rejected_http = Settings(checks_grafana_base_url="http://grafana.example/d/checks")
+    allowed_http = Settings(
+        checks_grafana_base_url="http://grafana.example/d/checks",
+        allow_http_monitoring_urls=True,
+    )
+
+    assert (
+        https_settings.checks_grafana_base_url
+        == "https://grafana.example:443/d/checks?orgId=1#panel"
+    )
+    assert rejected_http.checks_grafana_base_url is None
+    assert allowed_http.checks_grafana_base_url == "http://grafana.example/d/checks"

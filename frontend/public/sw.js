@@ -1,5 +1,5 @@
 /* Alert Hub application shell and notification worker. */
-const SHELL_CACHE = "alert-hub-v6-shell";
+const SHELL_CACHE = "alert-hub-v7-shell";
 // Keep the authenticated read-cache prefix stable so a service-worker upgrade
 // does not erase a verified session partition needed for a cold offline start.
 const DATA_CACHE = "alert-hub-v2-read-model";
@@ -12,7 +12,7 @@ const SHELL = [
 ];
 const MANIFEST_FETCH_TIMEOUT_MS = 750;
 const SPA_ROUTE =
-  /^\/(?:$|incidents(?:\/[^/]+)?|reachability|sources|channels|devices|cluster|audit|settings)\/?$/;
+  /^\/(?:$|incidents(?:\/[^/]+)?|checks(?:\/[^/]+)?|reachability|sources|channels|devices|cluster|audit|settings)\/?$/;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -41,6 +41,7 @@ self.addEventListener("activate", (event) => {
 function isReadableApi(url, request) {
   if (request.method !== "GET" || !url.pathname.startsWith("/api/v1/")) return false;
   return (
+    !/^\/api\/v1\/checks(?:\/|$)/.test(url.pathname) &&
     !url.pathname.includes("/auth/") &&
     !url.pathname.endsWith("/stream") &&
     url.pathname !== "/api/v1/push/vapid-public-key"
@@ -153,6 +154,10 @@ self.addEventListener("fetch", (event) => {
   const { request } = event;
   const url = new URL(request.url);
   if (request.method !== "GET" || url.origin !== self.location.origin) return;
+  if (/^\/api\/v1\/checks(?:\/|$)/.test(url.pathname)) {
+    event.respondWith(runtimeFileThrough(request));
+    return;
+  }
   if (isReadableApi(url, request)) {
     event.respondWith(readThrough(request));
     return;

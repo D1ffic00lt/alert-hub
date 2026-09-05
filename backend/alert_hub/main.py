@@ -18,9 +18,11 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from alert_hub import __version__
 from alert_hub.api import (
+    application_settings,
     audit,
     auth,
     channels,
+    checks,
     cluster,
     devices,
     health,
@@ -31,9 +33,12 @@ from alert_hub.api import (
     push,
     routes,
     sources,
+    statistics,
     stream,
 )
 from alert_hub.application.auth import add_audit, ensure_bootstrap_token
+from alert_hub.application.checks import ChecksSnapshotCache
+from alert_hub.application.statistics import StatisticsSnapshotCache
 from alert_hub.application.sync import register_local_node_event
 from alert_hub.infrastructure.db.session import (
     create_db_engine,
@@ -332,6 +337,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = session_factory
     app.state.envelope_cipher = build_envelope_cipher(runtime_settings)
     app.state.notification_providers = build_provider_registry(runtime_settings)
+    app.state.checks_snapshot_cache = ChecksSnapshotCache()
+    app.state.statistics_snapshot_cache = StatisticsSnapshotCache(ttl_seconds=30)
     app.state.rate_limiter = LocalRateLimiter(
         max_keys=runtime_settings.rate_limit_max_keys,
         cleanup_interval_seconds=runtime_settings.rate_limit_cleanup_interval_seconds,
@@ -478,6 +485,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     app.include_router(auth.router)
+    app.include_router(checks.router)
     app.include_router(incidents.router)
     app.include_router(sources.router)
     app.include_router(channels.router)
@@ -485,7 +493,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(push.router)
     app.include_router(devices.router)
     app.include_router(audit.router)
+    app.include_router(application_settings.router)
     app.include_router(metrics_api.router)
+    app.include_router(statistics.router)
     app.include_router(prometheus.router)
     app.include_router(stream.router)
     app.include_router(ingest.router)

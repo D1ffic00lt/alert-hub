@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func, or_, select
@@ -9,14 +10,58 @@ from sqlalchemy.orm import Session, selectinload
 from alert_hub.api.dependencies import current_user, get_db, get_settings
 from alert_hub.api.schemas import IncidentActionRequest, IncidentCommentRequest
 from alert_hub.application.auth import add_audit
+from alert_hub.application.checks import normalize_check_identifier
 from alert_hub.application.incidents import append_user_event
 from alert_hub.infrastructure.db.models import Incident, IncidentEvent, User
 from alert_hub.settings import Settings
 
 router = APIRouter(prefix="/api/v1/incidents", tags=["incidents"])
 
+_MAX_RELATED_CHECKS = 200
 
-def _incident_summary(incident: Incident) -> dict[str, Any]:
+
+def _related_checks(
+    incident: Incident,
+    *,
+    include_timeline: bool,
+) -> tuple[list[dict[str, str]], int]:
+    candidates: list[object] = [incident.labels_json.get("check_id")]
+    if include_timeline:
+        for event in incident.events:
+            labels = event.payload_json.get("labels")
+            if isinstance(labels, dict):
+                candidates.append(labels.get("check_id"))
+    check_ids: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        candidate = normalize_check_identifier(raw)
+        if candidate is None:
+            continue
+        if candidate not in seen:
+            seen.add(candidate)
+            check_ids.append(candidate)
+    total = len(check_ids)
+    return [
+        {
+            "check_id": check_id,
+            "href": f"/checks/{quote(check_id, safe='')}",
+        }
+        for check_id in check_ids[:_MAX_RELATED_CHECKS]
+    ], total
+
+
+def _incident_summary(
+    incident: Incident,
+    settings: Settings,
+    *,
+    include_timeline_checks: bool = False,
+) -> dict[str, Any]:
+    checks_enabled = settings.checks_enabled
+    related_checks, related_checks_total = (
+        _related_checks(incident, include_timeline=include_timeline_checks)
+        if checks_enabled
+        else ([], 0)
+    )
     return {
         "id": incident.id,
         "source_id": incident.source_id,
@@ -33,6 +78,10 @@ def _incident_summary(incident: Incident) -> dict[str, Any]:
         "resolved_at": incident.resolved_at,
         "acknowledged_at": incident.acknowledged_at,
         "acknowledged_by": incident.acknowledged_by,
+        "related_checks": related_checks,
+        "related_checks_total": related_checks_total,
+        "related_checks_truncated": related_checks_total > len(related_checks),
+        "checks_relation_state": "available" if checks_enabled else "disabled",
     }
 
 
@@ -71,6 +120,7 @@ def list_incidents(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
     user: User = Depends(current_user),
 ) -> dict[str, Any]:
     del user
@@ -96,7 +146,7 @@ def list_incidents(
         .limit(limit)
     ).all()
     return {
-        "items": [_incident_summary(incident) for incident in incidents],
+        "items": [_incident_summary(incident, settings) for incident in incidents],
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -107,19 +157,24 @@ def list_incidents(
 def incident_detail(
     incident_id: str,
     db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
     user: User = Depends(current_user),
 ) -> dict[str, Any]:
     del user
     incident = _incident_or_404(db, incident_id)
     return {
-        **_incident_summary(incident),
+        **_incident_summary(incident, settings, include_timeline_checks=True),
         "timeline": [_event_response(event) for event in incident.events],
     }
 
 
-def _action_response(incident: Incident, event: IncidentEvent | None) -> dict[str, Any]:
+def _action_response(
+    incident: Incident,
+    event: IncidentEvent | None,
+    settings: Settings,
+) -> dict[str, Any]:
     return {
-        "incident": _incident_summary(incident),
+        "incident": _incident_summary(incident, settings),
         "event": _event_response(event) if event else None,
     }
 
@@ -156,7 +211,7 @@ def acknowledge_incident(
             request_id=getattr(request.state, "request_id", None),
         )
         db.commit()
-    return _action_response(incident, event)
+    return _action_response(incident, event, settings)
 
 
 @router.post("/{incident_id}/resolve")
@@ -189,7 +244,7 @@ def resolve_incident(
             request_id=getattr(request.state, "request_id", None),
         )
         db.commit()
-    return _action_response(incident, event)
+    return _action_response(incident, event, settings)
 
 
 @router.post("/{incident_id}/silence")
@@ -224,7 +279,7 @@ def silence_incident(
             request_id=getattr(request.state, "request_id", None),
         )
         db.commit()
-    return _action_response(incident, event)
+    return _action_response(incident, event, settings)
 
 
 @router.post("/{incident_id}/comments", status_code=201)

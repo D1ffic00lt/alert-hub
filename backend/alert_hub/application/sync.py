@@ -23,8 +23,10 @@ from alert_hub.application.incidents import (
 )
 from alert_hub.application.notifications import apply_delivery_receipt, enqueue_notification_event
 from alert_hub.domain.events import as_utc
+from alert_hub.domain.monitoring import normalize_grafana_url, normalize_job_globs
 from alert_hub.infrastructure.db.base import utc_now
 from alert_hub.infrastructure.db.models import (
+    ApplicationSetting,
     AuditLog,
     ClusterEvent,
     HeartbeatState,
@@ -559,6 +561,41 @@ def _project_prometheus_datasource(db: Session, entity_id: str) -> None:
     datasource.updated_at = updated_at or event.occurred_at
 
 
+def _project_application_setting(db: Session, entity_id: str) -> None:
+    event = _latest_entity_event(db, "application_setting", entity_id)
+    if event is None or event.operation == "tombstone":
+        return
+    payload = event.payload_json
+    try:
+        grafana_url = normalize_grafana_url(payload.get("grafana_url"), https_only=True)
+        key_job_globs = normalize_job_globs(
+            payload.get("key_job_globs"), field_name="key_job_globs"
+        )
+        alert_hub_job_globs = normalize_job_globs(
+            payload.get("alert_hub_job_globs"), field_name="alert_hub_job_globs"
+        )
+    except ValueError:
+        return
+    created_at = _payload_datetime(payload, "created_at", default=event.occurred_at)
+    updated_at = _payload_datetime(payload, "updated_at", default=event.occurred_at)
+    stored = db.get(ApplicationSetting, entity_id)
+    if stored is None:
+        stored = ApplicationSetting(
+            id=entity_id,
+            grafana_url=grafana_url,
+            key_job_globs=key_job_globs,
+            alert_hub_job_globs=alert_hub_job_globs,
+            created_at=created_at or event.occurred_at,
+            updated_at=updated_at or event.occurred_at,
+        )
+        db.add(stored)
+        return
+    stored.grafana_url = grafana_url
+    stored.key_job_globs = key_job_globs
+    stored.alert_hub_job_globs = alert_hub_job_globs
+    stored.updated_at = updated_at or event.occurred_at
+
+
 def _push_events_for_user(db: Session, user_id: str) -> list[ClusterEvent]:
     return [
         event
@@ -898,6 +935,8 @@ def _project_event(db: Session, event: ClusterEvent, settings: Settings) -> None
         _project_notification_route(db, event.entity_id)
     elif event.entity_type == "prometheus_datasource":
         _project_prometheus_datasource(db, event.entity_id)
+    elif event.entity_type == "application_setting":
+        _project_application_setting(db, event.entity_id)
     elif event.entity_type == "push_subscription":
         _project_push_subscription(db, event.entity_id)
     elif event.entity_type == "delivery_receipt":
@@ -950,6 +989,7 @@ def apply_cluster_events(
         "notification_channel": 3,
         "notification_route": 3,
         "prometheus_datasource": 3,
+        "application_setting": 3,
         "push_subscription": 4,
         "incident": 5,
         "heartbeat_observation": 6,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -117,12 +119,23 @@ async def query_datasource_targets(
     targets: list[DatasourceQueryTarget],
     client: PrometheusClient,
     query_name: FixedQueryName,
+    *,
+    job_globs: Sequence[str] | None = None,
+    evaluated_at: datetime | None = None,
+    allow_non_finite_values: bool = False,
 ) -> tuple[list[DatasourceQueryResult], list[DatasourceQueryFailure]]:
     async def query_one(
         target: DatasourceQueryTarget,
     ) -> DatasourceQueryResult | DatasourceQueryFailure:
         try:
-            samples = await client.query(target.url, target.credentials, query_name)
+            samples = await client.query(
+                target.url,
+                target.credentials,
+                query_name,
+                job_globs=job_globs,
+                evaluated_at=evaluated_at,
+                allow_non_finite_values=allow_non_finite_values,
+            )
         except PrometheusQueryError as exc:
             return DatasourceQueryFailure(
                 target.datasource_id,

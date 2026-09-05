@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,7 @@ from sqlalchemy import select
 
 from alert_hub.application.sync import IncomingClusterEvent, apply_cluster_events
 from alert_hub.infrastructure.db.models import (
+    ApplicationSetting,
     AuditLog,
     ClusterEvent,
     PrometheusDatasource,
@@ -22,6 +24,7 @@ from alert_hub.infrastructure.prometheus import (
     PrometheusHTTPClient,
     PrometheusQueryError,
     basic_authorization_value,
+    fixed_promql,
     parse_vector_response,
 )
 from alert_hub.infrastructure.url_safety import UnsafeURL, validate_monitoring_url
@@ -62,6 +65,21 @@ def test_vector_parser_preserves_labels_and_rejects_invalid_values() -> None:
         parse_vector_response(invalid, max_samples=10)
     with pytest.raises(PrometheusQueryError, match="sample limit"):
         parse_vector_response(payload, max_samples=0)
+
+    malformed_labels = {
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [
+                {
+                    "metric": {"check_id": None, "valid": "kept", 7: "invalid-key"},
+                    "value": [1_788_256_800, "1"],
+                }
+            ],
+        },
+    }
+    parsed = parse_vector_response(malformed_labels, max_samples=10)
+    assert parsed[0].labels == {"valid": "kept"}
 
 
 def test_monitoring_url_requires_explicit_http_private_opt_in() -> None:
@@ -128,6 +146,45 @@ def test_send_time_dns_revalidation_blocks_rebinding_and_redirects(settings: Set
     with pytest.raises(PrometheusQueryError) as redirected:
         asyncio.run(redirect_client.query("https://1.1.1.1", {"auth_type": "none"}, "reachability"))
     assert redirected.value.code == "redirect_rejected"
+
+
+def test_checks_query_uses_explicit_evaluation_time_and_preserves_non_finite_values(
+    settings: Settings,
+) -> None:
+    evaluated_at = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
+    seen: list[tuple[str, str]] = []
+
+    def prometheus(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.params["query"], request.url.params["time"]))
+        return httpx.Response(
+            200,
+            request=request,
+            json=_vector(({"check_id": "public-api"}, float("nan"), 1_788_256_800)),
+        )
+
+    client = PrometheusHTTPClient(settings, transport=httpx.MockTransport(prometheus))
+    samples = asyncio.run(
+        client.query(
+            "https://1.1.1.1",
+            {"auth_type": "none"},
+            "check_status",
+            evaluated_at=evaluated_at,
+            allow_non_finite_values=True,
+        )
+    )
+
+    assert seen == [(FIXED_PROMQL["check_status"], "2026-09-05T12:00:00Z")]
+    assert len(samples) == 1
+    assert math.isnan(samples[0].value)
+    with pytest.raises(PrometheusQueryError, match="non-finite"):
+        asyncio.run(
+            client.query(
+                "https://1.1.1.1",
+                {"auth_type": "none"},
+                "check_status",
+                evaluated_at=evaluated_at,
+            )
+        )
 
 
 def test_datasource_crud_encrypts_redacts_auth_and_tests_connection(
@@ -253,6 +310,189 @@ def test_datasource_crud_encrypts_redacts_auth_and_tests_connection(
         assert latest is not None and latest.operation == "tombstone"
 
 
+def test_application_monitoring_settings_drive_safe_server_owned_job_queries(
+    client: TestClient,
+    auth: dict[str, str],
+    app,
+) -> None:
+    seen_queries: list[str] = []
+
+    def prometheus(request: httpx.Request) -> httpx.Response:
+        seen_queries.append(request.url.params["query"])
+        return httpx.Response(
+            200,
+            request=request,
+            json=_vector(({"job": "vless_blackbox_ru", "instance": "ru-1"}, 1, 300)),
+        )
+
+    app.state.prometheus_http_transport = httpx.MockTransport(prometheus)
+    created = client.post(
+        "/api/v1/prometheus-datasources",
+        headers=auth,
+        json={"name": "Regional Prometheus", "url": "https://1.1.1.1:9090"},
+    )
+    assert created.status_code == 201, created.text
+
+    defaults = client.get("/api/v1/application-settings", headers=auth)
+    assert defaults.status_code == 200
+    assert defaults.json() == {
+        "grafana_url": None,
+        "key_job_globs": ["prometheus", "alertmanager", "blackbox*"],
+        "alert_hub_job_globs": ["alert-hub*", "alert_hub*", "alerthub*"],
+    }
+
+    updated = client.patch(
+        "/api/v1/application-settings",
+        headers=auth,
+        json={
+            "grafana_url": "HTTPS://Grafana.Example:443/d/operations?orgId=1",
+            "key_job_globs": ["vless_blackbox_*", "vps_nodes", "vless_blackbox_*"],
+            "alert_hub_job_globs": ["alert-hub-api-*"],
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json() == {
+        "grafana_url": "https://grafana.example:443/d/operations?orgId=1",
+        "key_job_globs": ["vless_blackbox_*", "vps_nodes"],
+        "alert_hub_job_globs": ["alert-hub-api-*"],
+    }
+    assert (
+        client.patch(
+            "/api/v1/application-settings",
+            headers=auth,
+            json={"key_job_globs": ['vps_nodes"} or vector(1)']},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.patch(
+            "/api/v1/application-settings",
+            headers=auth,
+            json={"grafana_url": "http://grafana.example"},
+        ).status_code
+        == 422
+    )
+
+    key_jobs = client.get("/api/v1/metrics/queries/key_jobs_up", headers=auth)
+    alert_hub = client.get("/api/v1/metrics/queries/alert_hub_health", headers=auth)
+    assert key_jobs.status_code == 200
+    assert alert_hub.status_code == 200
+    assert fixed_promql("key_jobs_up", ["vless_blackbox_*", "vps_nodes"]) in seen_queries
+    assert fixed_promql("alert_hub_health", ["alert-hub-api-*"]) in seen_queries
+    summary = client.get("/api/v1/metrics/summary", headers=auth).json()
+    assert summary["grafana_url"] == "https://grafana.example:443/d/operations?orgId=1"
+    assert summary["key_job_globs"] == ["vless_blackbox_*", "vps_nodes"]
+
+    with app.state.session_factory() as db:
+        stored = db.get(ApplicationSetting, "monitoring")
+        assert stored is not None
+        assert stored.alert_hub_job_globs == ["alert-hub-api-*"]
+        event = db.scalars(
+            select(ClusterEvent).where(
+                ClusterEvent.entity_type == "application_setting",
+                ClusterEvent.entity_id == "monitoring",
+            )
+        ).one()
+        assert event.payload_json["grafana_url"] == summary["grafana_url"]
+        audit = db.scalars(
+            select(AuditLog).where(AuditLog.action == "application_settings_updated")
+        ).one()
+        assert audit.details_json["fields"] == [
+            "alert_hub_job_globs",
+            "grafana_url",
+            "key_job_globs",
+        ]
+
+
+def test_application_monitoring_settings_replicate_idempotently(tmp_path: Path) -> None:
+    shared = {
+        "environment": "test",
+        "auto_create_schema": True,
+        "signing_key": "shared-settings-signing-key",
+        "cluster_secret": "shared-settings-cluster-key",
+        "cookie_secure": False,
+        "heartbeat_scan_seconds": 0,
+    }
+    settings_a = Settings(
+        **shared,
+        node_id="settings-a",
+        database_url=f"sqlite:///{tmp_path / 'settings-a.db'}",
+        bootstrap_token="bootstrap-a",
+    )
+    settings_b = Settings(
+        **shared,
+        node_id="settings-b",
+        database_url=f"sqlite:///{tmp_path / 'settings-b.db'}",
+        bootstrap_token="bootstrap-b",
+    )
+    app_a = create_app(settings_a)
+    app_b = create_app(settings_b)
+    with TestClient(app_a) as client_a, TestClient(app_b):
+        bootstrap = client_a.post(
+            "/api/v1/auth/bootstrap",
+            json={
+                "bootstrap_token": "bootstrap-a",
+                "username": "admin",
+                "password": "a-strong-test-password",
+            },
+        )
+        auth = {"Authorization": f"Bearer {bootstrap.json()['access_token']}"}
+        response = client_a.patch(
+            "/api/v1/application-settings",
+            headers=auth,
+            json={
+                "grafana_url": "https://grafana.example/d/ops",
+                "key_job_globs": ["vless_blackbox_*"],
+                "alert_hub_job_globs": ["alert-hub-*"],
+            },
+        )
+        assert response.status_code == 200, response.text
+        with app_a.state.session_factory() as db:
+            event = db.scalars(
+                select(ClusterEvent).where(ClusterEvent.entity_type == "application_setting")
+            ).one()
+            incoming = IncomingClusterEvent(
+                event_id=event.event_id,
+                origin_node_id=event.origin_node_id,
+                origin_seq=event.origin_seq,
+                entity_type=event.entity_type,
+                entity_id=event.entity_id,
+                operation=event.operation,
+                occurred_at=event.occurred_at,
+                payload=event.payload_json,
+            )
+        with app_b.state.session_factory.begin() as db:
+            result = apply_cluster_events(db, [incoming, incoming], settings_b)
+            assert result.applied == 1
+            assert result.duplicates == 1
+        with app_b.state.session_factory() as db:
+            replicated = db.get(ApplicationSetting, "monitoring")
+            assert replicated is not None
+            assert replicated.grafana_url == "https://grafana.example/d/ops"
+            assert replicated.key_job_globs == ["vless_blackbox_*"]
+
+        stale = IncomingClusterEvent(
+            event_id="00000000-0000-0000-0000-000000009998",
+            origin_node_id="stale-settings-node",
+            origin_seq=1,
+            entity_type="application_setting",
+            entity_id="monitoring",
+            operation="upsert",
+            occurred_at=incoming.occurred_at - timedelta(seconds=1),
+            payload={
+                **incoming.payload,
+                "grafana_url": "https://stale.example",
+                "updated_at": (incoming.occurred_at - timedelta(seconds=1)).isoformat(),
+            },
+        )
+        with app_b.state.session_factory.begin() as db:
+            assert apply_cluster_events(db, [stale], settings_b).applied == 1
+        with app_b.state.session_factory() as db:
+            replicated = db.get(ApplicationSetting, "monitoring")
+            assert replicated is not None
+            assert replicated.grafana_url == "https://grafana.example/d/ops"
+
+
 def test_reachability_merges_actual_labels_and_reports_partial_failures(
     client: TestClient,
     auth: dict[str, str],
@@ -329,6 +569,7 @@ def test_reachability_merges_actual_labels_and_reports_partial_failures(
     assert alerts.json()["samples"][0]["metric"]["alertname"] == "DatabaseDown"
     assert FIXED_PROMQL["firing_alerts"] in query_values
     assert client.get("/api/v1/metrics/queries/arbitrary", headers=auth).status_code == 422
+    assert client.get("/api/v1/metrics/queries/check_status", headers=auth).status_code == 422
 
 
 def test_reachability_default_mode_uses_only_canonical_labels(

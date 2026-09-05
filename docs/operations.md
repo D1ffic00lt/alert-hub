@@ -30,10 +30,11 @@ from the third consecutive failure, and unknown before an attempt has produced e
 is the worker's current cursor evidence, not an estimate from the durable `last_seen_at` field. The
 UI refreshes this runtime view every 30 seconds even while its cluster-event stream is connected.
 
-Set the optional `GRAFANA_URL` to the installation's HTTPS dashboard when the UI should offer a
-detailed-view link. The validated URL is returned only in the authenticated metrics summary. It is
-navigation metadata, not a Grafana credential or a way to submit PromQL; Prometheus remains the
-time-series source of truth.
+Administrators set the optional Grafana HTTPS dashboard link and the bounded `job` glob lists under
+**Settings → Grafana and job selection**. The values are audited and replicated as append-only
+cluster configuration. `GRAFANA_URL` remains the initial fallback until a cluster setting is saved.
+The link is navigation metadata, not a Grafana credential or a way to submit PromQL; Prometheus
+remains the time-series source of truth.
 
 Alert on at least:
 
@@ -42,8 +43,211 @@ Alert on at least:
 - SQLite errors or disk exhaustion;
 - outbox growth and delivery failure ratio;
 - sync lag, peer availability, and `alert_hub_clock_skew_suspected` when a peer event timestamp differs from local time beyond `CLOCK_SKEW_THRESHOLD_SECONDS`;
+- repeated Checks `unavailable`/`checks_limit_exceeded` responses and unexpected growth in
+  `unknown` or stale results when Checks is enabled;
 - backup age/checksum/restore-test failure;
 - release digest/config checksum drift across nodes.
+
+## Checks
+
+Checks is an optional, read-only view of results produced by operator-managed external executors.
+Alert Hub neither ships nor runs a prober, owns schedules or subscriptions, stores executor
+credentials, nor performs network checks itself. Prometheus remains the operational source of
+truth; check samples, run history, status snapshots, and the in-memory registry are never written
+to SQLite.
+
+Set `CHECKS_ENABLED=true` on an API node only after at least one enabled Alert Hub Prometheus
+datasource can read the contract below. Every `/api/v1/checks*` operation still authenticates the
+caller when the feature is disabled. Disabled requests return `200`, `enabled: false`,
+`data_state: disabled`, and no check data; they do not query Prometheus. A successful refresh with
+no contract series returns `200`, `data_state: empty`, an empty list, and a zero summary. This is a
+normal state and does not affect Dashboard, alerts, incidents, readiness, or notification work.
+
+The authenticated operations are:
+
+- `GET /api/v1/checks` for the filtered, paginated list;
+- `GET /api/v1/checks/summary` for the same filtered population without pagination;
+- `GET /api/v1/checks/{check_id}` for normalized per-source/scenario/variant results, optional
+  canaries/assertions, alert links, and an optional safe Grafana link.
+
+Response metadata separates acquisition state (`ready`, `empty`, `stale`, `unavailable`, or
+`disabled`) from each Check's `up`, `degraded`, `down`, `stale`, or `unknown` status. Ready snapshots
+include a server-generated `snapshot_id`, fetch/evaluation time, cache expiry, and bounded warning
+codes. A detail request returns `404` only when a reliable current inventory proves the Check is
+absent.
+
+### Metric contract and executor connection
+
+The two required gauges describe the same latest completed run:
+
+| Metric                                         | Meaning                                                                            |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `synthetic_check_status`                       | `1` for success or `0` for failure of the latest completed run                     |
+| `synthetic_check_last_run_timestamp_seconds`   | Unix timestamp at which that same run completed                                    |
+| `synthetic_check_info`                         | Optional expected-inventory/metadata series; publish value `1`                     |
+| `synthetic_check_duration_seconds`             | Optional non-negative total run duration                                           |
+| `synthetic_check_ttfb_seconds`                 | Optional non-negative time to first byte when meaningful                           |
+| `synthetic_check_canary_success{canary="..."}` | Optional named nested result, `0` or `1`                                           |
+| `synthetic_check_egress_match`                 | Optional assertion result, exposed as assertion key `egress_match` without IP data |
+
+`check_id` is the only required label. It must be a stable public identifier, unique across the
+enabled datasources visible to the user. The allowlisted optional labels are `check_name`, `group`,
+`source`, `target`, `scenario`, and `variant`; `canary` is additionally read only on the canary
+metric. Do not put hostnames, URLs, IP addresses, protocol UUIDs, account names, tokens,
+credentials, subscription data, or other secrets into any of them. Unknown and service labels
+such as `job` and `instance` are not returned to the client.
+
+This is a complete minimal example. Its fixed timestamp is illustrative documentation data, not a
+fallback or live fixture:
+
+```prometheus
+# TYPE synthetic_check_status gauge
+synthetic_check_status{check_id="checkout-flow"} 1
+# TYPE synthetic_check_last_run_timestamp_seconds gauge
+synthetic_check_last_run_timestamp_seconds{check_id="checkout-flow"} 1788609600
+```
+
+A multi-source executor can publish richer results through the same contract:
+
+```prometheus
+# TYPE synthetic_check_info gauge
+synthetic_check_info{check_id="checkout-flow",check_name="Checkout flow",group="customer-paths",source="edge-a",target="Primary storefront",scenario="purchase",variant="standard"} 1
+synthetic_check_info{check_id="checkout-flow",check_name="Checkout flow",group="customer-paths",source="edge-b",target="Primary storefront",scenario="purchase",variant="standard"} 1
+# TYPE synthetic_check_status gauge
+synthetic_check_status{check_id="checkout-flow",source="edge-a",scenario="purchase",variant="standard"} 1
+synthetic_check_status{check_id="checkout-flow",source="edge-b",scenario="purchase",variant="standard"} 0
+# TYPE synthetic_check_last_run_timestamp_seconds gauge
+synthetic_check_last_run_timestamp_seconds{check_id="checkout-flow",source="edge-a",scenario="purchase",variant="standard"} 1788609600
+synthetic_check_last_run_timestamp_seconds{check_id="checkout-flow",source="edge-b",scenario="purchase",variant="standard"} 1788609598
+# TYPE synthetic_check_duration_seconds gauge
+synthetic_check_duration_seconds{check_id="checkout-flow",source="edge-a",scenario="purchase",variant="standard"} 0.42
+# TYPE synthetic_check_canary_success gauge
+synthetic_check_canary_success{check_id="checkout-flow",source="edge-a",scenario="purchase",variant="standard",canary="receipt"} 1
+# TYPE synthetic_check_egress_match gauge
+synthetic_check_egress_match{check_id="checkout-flow",source="edge-a",scenario="purchase",variant="standard"} 1
+```
+
+Expose these metrics to the existing Prometheus scrape topology, then confirm an enabled Alert Hub
+datasource can query them through its configured network and credentials. If an executor emits
+different names, normalize them with executor-side output or reviewed Prometheus recording rules;
+do not add browser PromQL or a vendor-specific Alert Hub adapter. Update every optional series for
+a result consistently with the required status and completion-timestamp gauges for that run. The
+main status remains authoritative: Alert Hub does not infer that a canary or assertion failure must
+fail the Check.
+
+`source` is the executor-declared logical observation point, not proof of physical independence.
+Give genuinely independent points different stable values, and give replicas of one logical point
+the same value. When omitted, Alert Hub treats the result as one private default source; it never
+substitutes `instance`, `job`, a scrape address, or a random ID. Scenario, variant, and canary are
+also optional and never create extra failure-quorum votes.
+
+Publish `synthetic_check_info` for every expected `(check_id, source, scenario, variant)`, including
+before its first run. Without `info`, Alert Hub can discover only tuples present in the required
+metrics. A source that has never emitted, or a Check whose series vanished before the process saw
+it, is unknowable. Previously observed tuples remain visible only for the life of the bounded
+in-memory registry; after restart they cannot be reconstructed. Prometheus retention and `info`,
+not the Alert Hub database, provide durable inventory.
+
+Executors that publish `info` may coexist with status-only executors. A valid `info` family removes
+an absent cached tuple only when that tuple was itself previously declared by `info`; the presence
+of an unrelated `info` series never erases a remembered status-only source. The public identifier
+`summary` is reserved by the API route and is rejected like internal sentinels, IP/UUID-bearing
+identifiers, and obvious credential markers.
+
+### Freshness, quorum, and aggregation
+
+One result is keyed by `(check_id, source, scenario, variant)`. Exactly matching duplicates are
+coalesced. Conflicting main values for one key make that result `unknown`; conflicting optional
+values remove only that optional field. Conflicting names fall back to `check_id`, conflicting
+optional metadata becomes `null`, and a diagnostic code records the reason. Malformed identifiers,
+non-`0`/`1` status values, NaN/infinite values, negative durations, missing timestamps, and
+timestamps more than `CHECKS_FUTURE_TOLERANCE_SECONDS` ahead are not allowed to confirm success or
+failure.
+
+Age comes from `synthetic_check_last_run_timestamp_seconds`, never scrape or HTTP time. A result is
+fresh through the exact `CHECKS_STALE_AFTER_SECONDS` boundary; it becomes stale only when its age is
+greater. For each scenario/variant, apply these rules in order:
+
+1. at least one fresh success and one fresh failure is `degraded`;
+2. no fresh success and failures from at least `CHECKS_MIN_FAILURE_SOURCES` distinct logical
+   sources is `down`;
+3. a non-empty set in which every known result is fresh, valid, and successful is `up`;
+4. a non-empty set in which every known result has an expired valid timestamp is `stale`;
+5. every other case is `unknown`, including a single failure below the configured quorum.
+
+The whole Check is `down` if any scenario/variant part is down, otherwise `degraded` if any part is
+degraded, `up` only when every part is up, `stale` only when every part is stale, and `unknown`
+otherwise. An empty set is never up. `sources_total` counts distinct known logical sources;
+`sources_up` counts sources whose every known result is fresh and successful. List latency is the
+maximum available duration among fresh successful results, not an average. `last_checked_at`,
+`oldest_checked_at`, `stale_results`, and `data_incomplete` make age and partial evidence explicit.
+
+List filters (`status`, `group`, `source`, `target`, `scenario`, and bounded `search`) are combined
+with AND. A source filter selects complete Checks but never recomputes their status from a subset.
+Summary applies the same filters and counts Checks, not samples; its five status counts sum to
+`total`. Results use stable ordering with `check_id` as the final key. The default list page is 50
+Checks and the maximum is 200.
+
+An active alert relates to a Check only by exact `check_id` inside the same authorization scope.
+This relationship does not change the Check status or create an incident. If alert lookup fails,
+`active_alerts` is `null`, not zero; an unavailable Prometheus refresh cannot turn into a false
+detail `404`.
+
+### Cache, errors, and limits
+
+All seven fixed metric queries across all enabled datasources use one evaluation time and one
+coalesced process-local refresh. The default cache TTL is five seconds and cannot be configured
+above five seconds. Measurement age is recalculated on every response, including cache hits. A
+refresh never combines required status from one snapshot with a timestamp from another.
+
+During a refresh, an expired prior snapshot may be exposed only as `data_state: stale`; its original
+values belong in explicitly marked last-known data, not the current summary. If either required
+query fails, current statuses become `unknown`, `data_state` becomes `unavailable`, and the API
+returns `503` even when a previously successful cache exists. When no reliable inventory remains,
+summary is `null`, not a zero summary. Failure of an optional query produces a bounded warning and
+removes that capability without invalidating the required results. Client responses contain safe
+codes such as `prometheus_unavailable` or `checks_limit_exceeded`, never upstream bodies, URLs, or
+raw error text.
+
+| Limit                                           | Default / bound                                                     |
+| ----------------------------------------------- | ------------------------------------------------------------------- |
+| Checks samples across all 7 queries/datasources | 5,000 total (`CHECKS_MAX_SERIES`, allowed range 1–100,000)          |
+| Samples in one Prometheus vector response       | 10,000 (`PROMETHEUS_MAX_SAMPLES`)                                   |
+| One Prometheus HTTP response                    | 2 MiB (`PROMETHEUS_MAX_RESPONSE_BYTES`)                             |
+| Prometheus query timeout                        | 8 seconds (`PROMETHEUS_QUERY_TIMEOUT_SECONDS`)                      |
+| Checks cache TTL                                | 5 seconds (`CHECKS_CACHE_TTL_SECONDS`, allowed range 0.1–5)         |
+| Future timestamp tolerance                      | 30 seconds (`CHECKS_FUTURE_TOLERANCE_SECONDS`, allowed range 0–300) |
+| List page                                       | 50 by default, 200 maximum                                          |
+| Results within one Check                        | 1,000 maximum; excess fails the refresh                             |
+| Canary entries within one result                | 100 maximum; excess fails the refresh                               |
+| Encoded Checks API response                     | 2 MiB maximum; excess returns `checks_limit_exceeded`               |
+| Related alerts/incidents or reverse Check links | 200 items per detail response; totals and truncation are explicit   |
+
+`CHECKS_MAX_SERIES` also bounds the retained in-memory registry. Exceeding the Checks total or an
+upstream sample/body, per-Check nesting, or final API body limit returns
+`checks_limit_exceeded`; Alert Hub does not truncate and compute a deceptively healthy summary.
+Keep Prometheus cardinality below both the per-response and combined limits, and alert on repeated
+unavailable/limit responses.
+
+The production settings are:
+
+```dotenv
+CHECKS_ENABLED=false
+CHECKS_STALE_AFTER_SECONDS=180
+CHECKS_MIN_FAILURE_SOURCES=1
+CHECKS_GRAFANA_BASE_URL=
+CHECKS_CACHE_TTL_SECONDS=5
+CHECKS_FUTURE_TOLERANCE_SECONDS=30
+CHECKS_MAX_SERIES=5000
+```
+
+`CHECKS_STALE_AFTER_SECONDS` accepts 1–86,400 seconds and
+`CHECKS_MIN_FAILURE_SOURCES` accepts 1–1,000. `CHECKS_GRAFANA_BASE_URL` is an optional
+administrator-defined absolute HTTP(S) dashboard URL without userinfo. HTTPS is the default;
+internal HTTP works only with the separately reviewed `ALLOW_HTTP_MONITORING_URLS=true` setting.
+Invalid or disallowed values disable only the link and produce a safe diagnostic. The backend
+constructs the deep link with an encoded `var-check_id`; labels and browser parameters cannot
+change its scheme, authority, or path. No Grafana setting is required for Checks to work.
 
 ## Peer HTTPS boundary
 
