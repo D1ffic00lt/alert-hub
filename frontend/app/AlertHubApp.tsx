@@ -3202,7 +3202,7 @@ function Brand() {
       </span>
       <span>
         <b>{appName}</b>
-        <small>{tr("центр мониторинга", "monitoring center")}</small>
+        <small>{tr("Центр мониторинга", "Monitoring center")}</small>
       </span>
     </div>
   );
@@ -3904,7 +3904,7 @@ export function AlertHubApp({ appName = "Alert Hub" }: { appName?: string }) {
   }, [themePreference]);
   useEffect(() => {
     document.documentElement.lang = language;
-    const pageTitle = `${appName} — ${language === "ru" ? "центр мониторинга" : "monitoring center"}`;
+    const pageTitle = `${appName} — ${language === "ru" ? "Центр мониторинга" : "Monitoring center"}`;
     document.title = pageTitle;
     document
       .querySelectorAll<HTMLMetaElement>('meta[property="og:title"], meta[name="twitter:title"]')
