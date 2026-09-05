@@ -4402,7 +4402,6 @@ function OverviewPage({
         }
         actions={
           <>
-            <LanguageSwitch className="overview-language-switch" />
             <button className="button button--quiet" onClick={onNotifications} disabled={readOnly}>
               <Icon symbol="◉" />
               {tr("Включить оповещения", "Enable alerts")}

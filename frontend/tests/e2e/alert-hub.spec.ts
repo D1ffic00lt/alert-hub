@@ -1343,6 +1343,7 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole("button", { name: /Открыть демо/ }).click();
   await expect(page.getByRole("main")).toBeVisible();
+  await expect(page.locator(".overview-page .language-switch")).toHaveCount(0);
   await expect(page.getByRole("status").getByText("демо-режим", { exact: true })).toBeVisible();
   await expect(page.locator("html")).not.toHaveClass(/auth-open/);
   await expect(page.getByLabel("Grafana не настроена")).toBeVisible();

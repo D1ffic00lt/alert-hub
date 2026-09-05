@@ -6477,11 +6477,6 @@ body,
   align-self: center;
 }
 
-.page-heading__actions > .overview-language-switch {
-  width: auto;
-  justify-self: start;
-}
-
 @media (max-width: 720px) {
   .channel-health-banner {
     display: grid;
