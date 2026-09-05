@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -117,12 +118,19 @@ async def query_datasource_targets(
     targets: list[DatasourceQueryTarget],
     client: PrometheusClient,
     query_name: FixedQueryName,
+    *,
+    job_globs: Sequence[str] | None = None,
 ) -> tuple[list[DatasourceQueryResult], list[DatasourceQueryFailure]]:
     async def query_one(
         target: DatasourceQueryTarget,
     ) -> DatasourceQueryResult | DatasourceQueryFailure:
         try:
-            samples = await client.query(target.url, target.credentials, query_name)
+            samples = await client.query(
+                target.url,
+                target.credentials,
+                query_name,
+                job_globs=job_globs,
+            )
         except PrometheusQueryError as exc:
             return DatasourceQueryFailure(
                 target.datasource_id,

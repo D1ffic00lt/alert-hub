@@ -4,9 +4,10 @@
 
 Alert Hub runs beside existing monitoring rather than replacing it. Alertmanager and other sources
 send webhooks; Prometheus remains the time-series authority; Grafana remains the detailed
-visualization surface. An optional validated `GRAFANA_URL` supplies an authenticated UI link but no
-credential or query surface. Each Alert Hub node owns a local SQLite database and is intended to
-remain useful when peers are unreachable.
+visualization surface. A replicated, validated Grafana URL supplies an authenticated UI link but no
+credential or query surface. Administrators can select bounded `job` globs for named `up` queries;
+the server constructs PromQL and never accepts browser-authored PromQL. Each Alert Hub node owns a
+local SQLite database and is intended to remain useful when peers are unreachable.
 
 ```mermaid
 flowchart LR

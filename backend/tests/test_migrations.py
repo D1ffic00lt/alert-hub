@@ -24,6 +24,7 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
     tables = set(inspect(engine).get_table_names())
     assert tables == {
         "alembic_version",
+        "application_settings",
         "audit_log",
         "cluster_events",
         "deliveries",
@@ -65,6 +66,12 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
         column["name"]: column for column in inspect(engine).get_columns("prometheus_datasources")
     }
     assert prometheus_columns["reachability_label_mode"]["nullable"] is False
+    application_settings_columns = {
+        column["name"]: column for column in inspect(engine).get_columns("application_settings")
+    }
+    assert application_settings_columns["grafana_url"]["nullable"] is True
+    assert application_settings_columns["key_job_globs"]["nullable"] is False
+    assert application_settings_columns["alert_hub_job_globs"]["nullable"] is False
 
     command.downgrade(config, "0001_initial")
     downgraded_columns = {

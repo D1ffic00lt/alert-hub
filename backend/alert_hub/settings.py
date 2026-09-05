@@ -12,6 +12,7 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from alert_hub.domain.monitoring import normalize_grafana_url
 from alert_hub.infrastructure.request_security import parse_cidr_setting
 
 
@@ -334,31 +335,10 @@ class Settings(BaseSettings):
     @field_validator("grafana_url")
     @classmethod
     def validate_grafana_url(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        candidate = value.strip()
-        if "*" in candidate or any(character.isspace() for character in candidate):
-            raise ValueError("GRAFANA_URL must not contain wildcards or whitespace")
         try:
-            parsed = urlsplit(candidate)
-            parsed_port = parsed.port
+            return normalize_grafana_url(value)
         except ValueError as exc:
-            raise ValueError("GRAFANA_URL is invalid") from exc
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("GRAFANA_URL must use http or https and include a host")
-        if parsed.username or parsed.password:
-            raise ValueError("GRAFANA_URL must not contain credentials")
-        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-        netloc = host if parsed_port is None else f"{host}:{parsed_port}"
-        return urlunsplit(
-            (
-                parsed.scheme.lower(),
-                netloc.lower(),
-                parsed.path,
-                parsed.query,
-                parsed.fragment,
-            )
-        )
+            raise ValueError(str(exc).replace("Grafana URL", "GRAFANA_URL")) from exc
 
     @field_validator("peer_urls", mode="before")
     @classmethod

@@ -135,6 +135,11 @@ Login, bootstrap, ingest, and internal peer traffic use bounded fixed-window lim
 
 Production startup fails closed unless cookies are secure; `PUBLIC_API_URL` is an exact non-loopback HTTPS origin included in the exact non-loopback HTTPS `TRUSTED_ORIGINS`; signing, active cluster, and any previous cluster secrets are pairwise distinct, non-default, and high entropy; a master encryption key file is configured; a cookie domain is syntactically safe and contains every trusted origin host; peer/origin URLs are valid; an optional `GRAFANA_URL` uses HTTPS without embedded credentials; and sync has a non-empty peer CIDR policy. Local HTTP health checks behind the proxy remain possible because these checks validate declared public trust configuration rather than weakening runtime cookie/origin policy.
 
+Authenticated administrators may replace the runtime Grafana fallback with a replicated cluster
+link. This path also requires HTTPS without embedded credentials. Configurable Prometheus job
+selection accepts bounded glob values only; the backend escapes them into its named `up` queries,
+so the browser cannot submit arbitrary PromQL or turn Alert Hub into a query proxy.
+
 ## Deployment trust
 
 Protect `.github/workflows`, `.github/deploy`, `deploy/scripts`, both component Dockerfiles,

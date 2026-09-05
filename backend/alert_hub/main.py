@@ -18,6 +18,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from alert_hub import __version__
 from alert_hub.api import (
+    application_settings,
     audit,
     auth,
     channels,
@@ -485,6 +486,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(push.router)
     app.include_router(devices.router)
     app.include_router(audit.router)
+    app.include_router(application_settings.router)
     app.include_router(metrics_api.router)
     app.include_router(prometheus.router)
     app.include_router(stream.router)

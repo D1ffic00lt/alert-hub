@@ -26,6 +26,7 @@ async function fulfill(route: Route, body: unknown, status = 200) {
 }
 
 type MockState = {
+  applicationSettingsRequest?: Record<string, unknown> | null;
   auditPageGate?: Promise<void> | null;
   auditPageStarted?: (() => void) | null;
   auditItems?: unknown[];
@@ -219,6 +220,11 @@ async function installApi(page: Page, state: MockState) {
       });
       return;
     }
+    if (method === "PATCH" && path === "/application-settings") {
+      state.applicationSettingsRequest = request.postDataJSON() as Record<string, unknown>;
+      await fulfill(route, state.applicationSettingsRequest);
+      return;
+    }
 
     if (state.authoritativeUnauthorized && method === "GET") {
       await fulfill(route, { detail: "session revoked" }, 401);
@@ -365,6 +371,7 @@ async function installApi(page: Page, state: MockState) {
       return;
     }
     if (method === "GET" && path === "/metrics/summary") {
+      const monitoring = state.applicationSettingsRequest ?? {};
       await fulfill(route, {
         open: 0,
         acknowledged: 0,
@@ -374,7 +381,15 @@ async function installApi(page: Page, state: MockState) {
         delivery_rate: null,
         outbox_pending: 0,
         channels_enabled: 0,
-        grafana_url: "https://grafana.example.test/d/alert-hub",
+        grafana_url: Object.prototype.hasOwnProperty.call(monitoring, "grafana_url")
+          ? monitoring.grafana_url
+          : "https://grafana.example.test/d/alert-hub",
+        key_job_globs: monitoring.key_job_globs ?? ["prometheus", "alertmanager", "blackbox*"],
+        alert_hub_job_globs: monitoring.alert_hub_job_globs ?? [
+          "alert-hub*",
+          "alert_hub*",
+          "alerthub*",
+        ],
       });
       return;
     }
@@ -800,9 +815,7 @@ test("bootstrap, deep-link navigation, live source creation, failover trust, and
     page.getByRole("heading", { name: "Доступность по регионам" }).first(),
   ).toBeVisible();
   await expect(page.getByRole("heading", { name: "Активные тревоги" })).toBeVisible();
-  await expect(
-    page.getByRole("heading", { name: "Prometheus / Alertmanager / Blackbox" }),
-  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Выбранные ключевые job" })).toBeVisible();
   await expect(
     page.getByRole("heading", { name: "Синхронизация и состояние Alert Hub" }),
   ).toBeVisible();
@@ -887,6 +900,40 @@ test("creates a Prometheus datasource with explicit server reachability labels",
       reachability_label_mode: "canonical",
     });
   await expect(labelModeSelect).toHaveValue("canonical");
+});
+
+test("updates the Grafana link and safe job patterns from settings", async ({ page }) => {
+  const state: MockState = {
+    applicationSettingsRequest: null,
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+
+  await page.getByRole("button", { name: "Настройки", exact: true }).click();
+  await page.getByLabel("Ссылка на Grafana").fill("https://grafana.example.test/d/new-operations");
+  await page.getByLabel("Ключевые сервисы · job").fill("vless_blackbox_*, vps_nodes");
+  await page.getByLabel("Сервисы Alert Hub · job").fill("alert-hub-api-*");
+  await page.getByRole("button", { name: "Сохранить мониторинг" }).click();
+
+  await expect(page.getByRole("status")).toContainText("Настройки мониторинга сохранены");
+  expect(state.applicationSettingsRequest).toEqual({
+    grafana_url: "https://grafana.example.test/d/new-operations",
+    key_job_globs: ["vless_blackbox_*", "vps_nodes"],
+    alert_hub_job_globs: ["alert-hub-api-*"],
+  });
+  await page.getByRole("button", { name: "Обзор", exact: true }).click();
+  await expect(page.getByRole("link", { name: "Открыть Grafana" })).toHaveAttribute(
+    "href",
+    "https://grafana.example.test/d/new-operations",
+  );
 });
 
 test("logout waits for an in-flight refresh and rejects its stale token", async ({ page }) => {

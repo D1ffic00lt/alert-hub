@@ -277,6 +277,17 @@ class PrometheusDatasource(Base):
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
 
 
+class ApplicationSetting(Base):
+    __tablename__ = "application_settings"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    grafana_url: Mapped[str | None] = mapped_column(String(2048))
+    key_job_globs: Mapped[list[str]] = mapped_column(JSON)
+    alert_hub_job_globs: Mapped[list[str]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
+
+
 class HeartbeatState(Base):
     __tablename__ = "heartbeat_state"
 
