@@ -24,7 +24,7 @@ function setMeta(selector: string, value: string) {
 
 const appName = getAppName();
 applyThemePreference(readThemePreference());
-const pageTitle = `${appName} — ${document.documentElement.lang === "ru" ? "центр мониторинга" : "monitoring center"}`;
+const pageTitle = `${appName} — ${document.documentElement.lang === "ru" ? "Центр мониторинга" : "Monitoring center"}`;
 document.title = pageTitle;
 setMeta('meta[name="application-name"]', appName);
 setMeta('meta[name="apple-mobile-web-app-title"]', appName);

@@ -7,8 +7,8 @@ describe("static SPA security contract", () => {
     expect(html).toContain('<html lang="en">');
     expect(html).toContain('<meta name="theme-color" content="#0A0A0B" />');
     expect(html).toContain('<meta name="color-scheme" content="light dark" />');
-    expect(html).toContain("<title>Alert Hub — monitoring center</title>");
-    expect(html).toContain('<meta property="og:title" content="Alert Hub — monitoring center" />');
+    expect(html).toContain("<title>Alert Hub — Monitoring center</title>");
+    expect(html).toContain('<meta property="og:title" content="Alert Hub — Monitoring center" />');
   });
 
   it("loads runtime configuration and application code only from external scripts", () => {

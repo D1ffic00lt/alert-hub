@@ -753,7 +753,7 @@ test("bootstrap, deep-link navigation, live source creation, failover trust, and
     ],
     theme_color: "#0A0A0B",
   });
-  await expect(page).toHaveTitle("E2E Operations — центр мониторинга");
+  await expect(page).toHaveTitle("E2E Operations — Центр мониторинга");
   await expect(page.getByRole("heading", { name: "Запуск кластера" })).toBeVisible();
   await page.getByLabel("Токен первичной настройки").fill("one-time-bootstrap-token");
   await page.getByLabel("Имя пользователя").fill("admin");
@@ -1335,6 +1335,7 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
     rootLocked: true,
   });
   await expect(page.locator(".auth-screen .language-switch")).toBeVisible();
+  await expect(page.locator(".auth-story > .brand small")).toHaveText("Центр мониторинга");
   await expect(page.getByRole("button", { name: "RU", exact: true })).toHaveAttribute(
     "aria-pressed",
     "true",
@@ -1343,6 +1344,7 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole("button", { name: /Открыть демо/ }).click();
   await expect(page.getByRole("main")).toBeVisible();
+  await expect(page.locator(".overview-page .language-switch")).toHaveCount(0);
   await expect(page.getByRole("status").getByText("демо-режим", { exact: true })).toBeVisible();
   await expect(page.locator("html")).not.toHaveClass(/auth-open/);
   await expect(page.getByLabel("Grafana не настроена")).toBeVisible();
@@ -1447,6 +1449,8 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
   await page.getByRole("button", { name: "Настройки", exact: true }).click();
   await page.getByRole("button", { name: "EN", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
+  await expect(page.locator(".sidebar .brand small")).toHaveText("Monitoring center");
+  await expect(page).toHaveTitle("E2E Operations — Monitoring center");
   await expect(page.getByRole("button", { name: "EN", exact: true })).toHaveAttribute(
     "aria-pressed",
     "true",
