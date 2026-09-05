@@ -22,6 +22,39 @@ flowchart LR
     API -. "bounded provider delivery" .-> PUSH["Web Push / Telegram / SMTP / webhook"]
 ```
 
+Checks uses that existing Prometheus boundary as a read-only, optional read model. Alert Hub does
+not schedule or execute checks, manage an executor, ingest check results over HTTP, or introduce a
+prober service. The module issues only fixed server-owned instant-vector queries for the
+`synthetic_check_*` metric contract. Prometheus metric names and labels stop at the dedicated
+acquisition/normalization boundary; the domain layer receives protocol-neutral Check, Source,
+Target, Scenario, Variant, Canary, and Assertion values, and the API returns an explicit allowlist
+of normalized fields.
+
+```mermaid
+flowchart LR
+    EXEC["Operator-managed check executor"] -->|"exports synthetic_check_*"| PROM["Existing Prometheus"]
+    PROM -->|"fixed queries at one evaluation time"| NORM["Acquisition and normalization"]
+    NORM -->|"normalized result keys"| AGG["Checks domain aggregation"]
+    AGG -->|"authenticated envelopes"| CHECKAPI["/api/v1/checks*"]
+    CHECKAPI --> CHECKUI["Dashboard, list, and detail views"]
+    AGG -. "never persisted" .-> CACHE["Bounded in-memory snapshot"]
+```
+
+A result key is `(check_id, source, scenario, variant)`; absent optional dimensions use private,
+stable sentinels that are not presented as invented user data. `synthetic_check_info` supplies the
+expected inventory when available. Without it, only series currently visible in the required
+status/timestamp metrics can establish inventory, and process restart loses any cache-only memory
+of disappeared series. Samples, run history, current status, and snapshots are never copied into
+SQLite. Existing alert and incident history remains durable: a Check may read active relationships
+by exact safe `check_id`, but a failed Check does not create an incident and alert state does not
+override Check aggregation.
+
+Every node evaluates its own configured Prometheus view and owns its own short-lived cache. Checks
+failure or disablement cannot affect local ingest, incident actions, notification work, peer sync,
+or readiness. A failed required Prometheus refresh becomes `data_state: unavailable`; a previous
+success is never silently served as current. Optional metric failures remove only the associated
+duration, TTFB, canary, or assertion capability and add a warning.
+
 Only operator-managed reverse proxies terminate public HTTPS. Production host
 proxies target fixed web/API addresses on the managed edge bridge; a
 containerized Caddy uses service DNS on that bridge. Loopback publishes are
@@ -71,6 +104,12 @@ The backend follows four simple dependency layers:
 2. `application` orchestrates auth, intake, incident actions, and projections.
 3. `domain` owns normalized event and adapter contracts without FastAPI or SQLAlchemy imports.
 4. `infrastructure` owns SQLAlchemy, SQLite, source adapters, peer transport, and channel providers.
+
+Checks follows the same dependency direction: fixed PromQL and bounded Prometheus transport stay
+in `infrastructure`; `application` orchestrates acquisition, allowlisted metric-label
+normalization, caching, and alert association; freshness, source quorum, and scenario/variant
+aggregation stay in `domain`; and `api` owns authentication, filters, pagination, serialization,
+and safe error status mapping.
 
 Interfaces are used at external boundaries, not created for every trivial operation. Display
 name is runtime configuration (`APP_NAME`); protocol fields, table names, and package namespace

@@ -327,6 +327,23 @@ validate_single_line() {
   [[ $1 != *$'\n'* && $1 != *$'\r'* ]]
 }
 
+validate_boolean() {
+  [[ $1 == true || $1 == false ]]
+}
+
+validate_bounded_integer() {
+  local value=$1 minimum=$2 maximum=$3
+  [[ ${value} =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  ((10#${value} >= minimum && 10#${value} <= maximum))
+}
+
+validate_bounded_decimal() {
+  local value=$1 minimum=$2 maximum=$3
+  [[ ${value} =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] || return 1
+  LC_ALL=C awk -v value="${value}" -v minimum="${minimum}" -v maximum="${maximum}" \
+    'BEGIN { exit !(value >= minimum && value <= maximum) }'
+}
+
 validate_config_checksum() {
   [[ $1 =~ ^[0-9a-f]{64}$ ]]
 }
@@ -718,6 +735,21 @@ write_runtime_material() {
   validate_single_line "${VAPID_PUBLIC_KEY:-}" || die "VAPID_PUBLIC_KEY must be a single line"
   validate_single_line "${APP_NAME}" || die "APP_NAME must be a single line"
   [[ -n ${APP_NAME} && ${#APP_NAME} -le 80 ]] || die "APP_NAME must contain 1 to 80 characters"
+  validate_boolean "${CHECKS_ENABLED}" || die "CHECKS_ENABLED must be true or false"
+  validate_bounded_integer "${CHECKS_STALE_AFTER_SECONDS}" 1 86400 ||
+    die "CHECKS_STALE_AFTER_SECONDS must be an integer from 1 through 86400"
+  validate_bounded_integer "${CHECKS_MIN_FAILURE_SOURCES}" 1 1000 ||
+    die "CHECKS_MIN_FAILURE_SOURCES must be an integer from 1 through 1000"
+  validate_single_line "${CHECKS_GRAFANA_BASE_URL}" ||
+    die "CHECKS_GRAFANA_BASE_URL must be a single line"
+  ((${#CHECKS_GRAFANA_BASE_URL} <= 2048)) ||
+    die "CHECKS_GRAFANA_BASE_URL must not exceed 2048 characters"
+  validate_bounded_decimal "${CHECKS_CACHE_TTL_SECONDS}" 0.1 5 ||
+    die "CHECKS_CACHE_TTL_SECONDS must be from 0.1 through 5"
+  validate_bounded_decimal "${CHECKS_FUTURE_TOLERANCE_SECONDS}" 0 300 ||
+    die "CHECKS_FUTURE_TOLERANCE_SECONDS must be from 0 through 300"
+  validate_bounded_integer "${CHECKS_MAX_SERIES}" 1 100000 ||
+    die "CHECKS_MAX_SERIES must be an integer from 1 through 100000"
   : "${PEER_PUBLIC_URL:?PEER_PUBLIC_URL is required for API deployment}"
   validate_https_origin "${PEER_PUBLIC_URL}" ||
     die "PEER_PUBLIC_URL must be an exact HTTPS origin with a DNS host and no path"
@@ -751,6 +783,13 @@ write_runtime_material() {
     'VAPID_PRIVATE_KEY_FILE=/run/secrets/vapid-private-key.pem' \
     "VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY:-}" \
     "VAPID_SUBJECT=mailto:ops@${PUBLIC_DOMAIN}" \
+    "CHECKS_ENABLED=${CHECKS_ENABLED}" \
+    "CHECKS_STALE_AFTER_SECONDS=${CHECKS_STALE_AFTER_SECONDS}" \
+    "CHECKS_MIN_FAILURE_SOURCES=${CHECKS_MIN_FAILURE_SOURCES}" \
+    "CHECKS_GRAFANA_BASE_URL=${CHECKS_GRAFANA_BASE_URL}" \
+    "CHECKS_CACHE_TTL_SECONDS=${CHECKS_CACHE_TTL_SECONDS}" \
+    "CHECKS_FUTURE_TOLERANCE_SECONDS=${CHECKS_FUTURE_TOLERANCE_SECONDS}" \
+    "CHECKS_MAX_SERIES=${CHECKS_MAX_SERIES}" \
     'UI_ENABLED=false' >"${temporary}"
   chown root:root "${temporary}"
   chmod 0600 "${temporary}"
@@ -1327,6 +1366,13 @@ readonly POLICY_GITHUB_REPOSITORY POLICY_NODE_NAME HOST_PORT API_HOST_PORT EDGE_
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 COMPONENT=${ALERT_HUB_COMPONENT:?ALERT_HUB_COMPONENT is required}
 APP_NAME=${APP_NAME:-Alert Hub}
+CHECKS_ENABLED=${CHECKS_ENABLED:-false}
+CHECKS_STALE_AFTER_SECONDS=${CHECKS_STALE_AFTER_SECONDS:-180}
+CHECKS_MIN_FAILURE_SOURCES=${CHECKS_MIN_FAILURE_SOURCES:-1}
+CHECKS_GRAFANA_BASE_URL=${CHECKS_GRAFANA_BASE_URL:-}
+CHECKS_CACHE_TTL_SECONDS=${CHECKS_CACHE_TTL_SECONDS:-5}
+CHECKS_FUTURE_TOLERANCE_SECONDS=${CHECKS_FUTURE_TOLERANCE_SECONDS:-30}
+CHECKS_MAX_SERIES=${CHECKS_MAX_SERIES:-5000}
 validate_component "${COMPONENT}" || die "ALERT_HUB_COMPONENT must be api, web, or all"
 [[ ${GITHUB_REPOSITORY} == "${POLICY_GITHUB_REPOSITORY}" ]] || die "workflow repository does not match the root-owned deployment policy"
 [[ ${NODE_NAME} == "${POLICY_NODE_NAME}" ]] || die "workflow node does not match the root-owned deployment policy"

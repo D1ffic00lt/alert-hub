@@ -12,6 +12,13 @@ import {
 } from "react";
 import { useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
 
+import { CheckDetailPage, ChecksPage, ChecksWidget } from "./checks/ChecksViews";
+import {
+  type ChecksOverviewState,
+  type ChecksRequestResult,
+  type ChecksRuntimeMode,
+  useChecksOverview,
+} from "./checks/hooks";
 import { mergeIncidentSummariesWithHistory } from "./incidents";
 import {
   applicationServerKeyMatches,
@@ -116,6 +123,8 @@ type Incident = {
   labels: Record<string, string>;
   annotations: Record<string, string>;
   events: IncidentEvent[];
+  checkIds?: string[];
+  checksRelationState?: "available" | "disabled" | "unavailable";
 };
 
 type ClusterNode = {
@@ -1026,6 +1035,14 @@ const NAV_ITEMS = [
     icon: "reachability",
   },
   {
+    id: "checks",
+    get label() {
+      return "Checks";
+    },
+    path: "/checks",
+    icon: "checks",
+  },
+  {
     id: "sources",
     get label() {
       return tr("Источники", "Sources");
@@ -1075,7 +1092,7 @@ const NAV_ITEMS = [
   },
 ] as const;
 
-type RouteId = (typeof NAV_ITEMS)[number]["id"] | "incident";
+type RouteId = (typeof NAV_ITEMS)[number]["id"] | "incident" | "check";
 
 function titleCase(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
@@ -1374,6 +1391,20 @@ function listFrom(payload: unknown, key: string): unknown[] {
 function normalizeIncident(item: unknown, index: number): Incident {
   const row = asRecord(item);
   const rawEvents = listFrom(row.events ?? row.timeline, "events");
+  const rawChecksRelationState = String(row.checks_relation_state ?? "");
+  const checksRelationState = ["available", "disabled", "unavailable"].includes(
+    rawChecksRelationState,
+  )
+    ? (rawChecksRelationState as Incident["checksRelationState"])
+    : undefined;
+  const linkedCheckIds =
+    checksRelationState === "available"
+      ? listFrom(row.related_checks, "checks").flatMap((value) => {
+          if (typeof value === "string") return value.trim() ? [value.trim()] : [];
+          const checkId = String(asRecord(value).check_id ?? asRecord(value).id ?? "").trim();
+          return checkId ? [checkId] : [];
+        })
+      : [];
   return {
     id: String(row.id ?? `incident-${index}`),
     title: String(row.title ?? row.name ?? tr("Инцидент без названия", "Untitled incident")),
@@ -1402,6 +1433,8 @@ function normalizeIncident(item: unknown, index: number): Incident {
     ),
     labels: asStringRecord(row.labels_json ?? row.labels),
     annotations: asStringRecord(row.annotations_json ?? row.annotations),
+    checkIds: [...new Set(linkedCheckIds)],
+    checksRelationState,
     events: rawEvents.map((event, eventIndex) => {
       const entry = asRecord(event);
       const eventPayload = asRecord(entry.payload);
@@ -2108,6 +2141,12 @@ async function getJson(path: string, signal?: AbortSignal) {
     payload: (await response.json()) as unknown,
     cached: response.headers.get("X-Alert-Hub-Cache") === "hit",
   };
+}
+
+async function getChecksJson(path: string, signal: AbortSignal): Promise<ChecksRequestResult> {
+  const response = await apiFetch(path, { cache: "no-store", signal });
+  const payload = (await response.json().catch(() => ({}))) as unknown;
+  return { status: response.status, payload };
 }
 
 type AuthState =
@@ -2970,9 +3009,22 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
   };
 }
 
-function getRoute(pathname: string): { id: RouteId; incidentId?: string } {
+function safeRouteParameter(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function getRoute(pathname: string): { id: RouteId; incidentId?: string; checkId?: string } {
   const parts = pathname.split("/").filter(Boolean);
-  if (parts[0] === "incidents" && parts[1]) return { id: "incident", incidentId: parts[1] };
+  if (parts[0] === "incidents" && parts[1]) {
+    return { id: "incident", incidentId: safeRouteParameter(parts[1]) };
+  }
+  if (parts[0] === "checks" && parts[1]) {
+    return { id: "check", checkId: safeRouteParameter(parts[1]) };
+  }
   const item = NAV_ITEMS.find((entry) => entry.path === `/${parts[0] ?? ""}`);
   return { id: item?.id ?? "overview" };
 }
@@ -3012,6 +3064,13 @@ function iconArtwork(name: string): ReactNode | null {
       );
     case "reachability":
       return <path d="M3 12h3l2.2-5 3.4 10 2.6-7 1.8 2h5" />;
+    case "checks":
+      return (
+        <>
+          <rect x="4" y="3" width="16" height="18" rx="2" />
+          <path d="m8 9 2 2 4-4M8 16h8" />
+        </>
+      );
     case "sources":
       return (
         <>
@@ -3548,6 +3607,7 @@ function Sidebar({
   incidents,
   nodes,
   operator,
+  checksVisible,
 }: {
   route: RouteId;
   navigate: (path: string) => void;
@@ -3556,6 +3616,7 @@ function Sidebar({
   incidents: Incident[];
   nodes: ClusterNode[];
   operator: string;
+  checksVisible: boolean;
 }) {
   const activeIncidents = incidents.filter((item) => item.status !== "resolved").length;
   const healthyNodes = nodes.filter((item) => item.health === "healthy").length;
@@ -3581,22 +3642,28 @@ function Sidebar({
       </div>
       <nav className="sidebar__nav" aria-label={tr("Основная навигация", "Primary navigation")}>
         <span className="sidebar__section-label">{tr("Мониторинг", "Operations")}</span>
-        {NAV_ITEMS.slice(0, 5).map((item) => (
-          <button
-            key={item.id}
-            className={
-              route === item.id || (route === "incident" && item.id === "incidents") ? "active" : ""
-            }
-            onClick={() => navigate(item.path)}
-            title={collapsed ? item.label : undefined}
-          >
-            <Icon symbol={item.icon} />
-            <span>{item.label}</span>
-            {item.id === "incidents" && <em>{activeIncidents}</em>}
-          </button>
-        ))}
+        {NAV_ITEMS.slice(0, 6)
+          .filter((item) => item.id !== "checks" || checksVisible)
+          .map((item) => (
+            <button
+              key={item.id}
+              className={
+                route === item.id ||
+                (route === "incident" && item.id === "incidents") ||
+                (route === "check" && item.id === "checks")
+                  ? "active"
+                  : ""
+              }
+              onClick={() => navigate(item.path)}
+              title={collapsed ? item.label : undefined}
+            >
+              <Icon symbol={item.icon} />
+              <span>{item.label}</span>
+              {item.id === "incidents" && <em>{activeIncidents}</em>}
+            </button>
+          ))}
         <span className="sidebar__section-label">{tr("Управление", "Manage")}</span>
-        {NAV_ITEMS.slice(5).map((item) => (
+        {NAV_ITEMS.slice(6).map((item) => (
           <button
             key={item.id}
             className={route === item.id ? "active" : ""}
@@ -3651,19 +3718,27 @@ function MobileNav({
   route,
   navigate,
   onMore,
+  checksVisible,
 }: {
   route: RouteId;
   navigate: (path: string) => void;
   onMore: () => void;
+  checksVisible: boolean;
 }) {
-  const items = [NAV_ITEMS[0], NAV_ITEMS[1], NAV_ITEMS[2], NAV_ITEMS[6]];
+  const items = checksVisible
+    ? [NAV_ITEMS[0], NAV_ITEMS[1], NAV_ITEMS[2], NAV_ITEMS[3]]
+    : [NAV_ITEMS[0], NAV_ITEMS[1], NAV_ITEMS[2], NAV_ITEMS[7]];
   return (
     <nav className="mobile-nav" aria-label={tr("Мобильная навигация", "Mobile navigation")}>
       {items.map((item) => (
         <button
           key={item.id}
           className={
-            route === item.id || (route === "incident" && item.id === "incidents") ? "active" : ""
+            route === item.id ||
+            (route === "incident" && item.id === "incidents") ||
+            (route === "check" && item.id === "checks")
+              ? "active"
+              : ""
           }
           onClick={() => navigate(item.path)}
         >
@@ -3684,11 +3759,13 @@ function MobileDrawer({
   route,
   navigate,
   onClose,
+  checksVisible,
 }: {
   open: boolean;
   route: RouteId;
   navigate: (path: string) => void;
   onClose: () => void;
+  checksVisible: boolean;
 }) {
   if (!open) return null;
   return (
@@ -3709,11 +3786,13 @@ function MobileDrawer({
           </button>
         </div>
         <nav>
-          {NAV_ITEMS.map((item) => (
+          {NAV_ITEMS.filter((item) => item.id !== "checks" || checksVisible).map((item) => (
             <button
               key={item.id}
               className={
-                route === item.id || (route === "incident" && item.id === "incidents")
+                route === item.id ||
+                (route === "incident" && item.id === "incidents") ||
+                (route === "check" && item.id === "checks")
                   ? "active"
                   : ""
               }
@@ -3969,6 +4048,13 @@ function AlertHubRuntime() {
     auth.state.status === "demo",
     language,
   );
+  const checksRuntimeMode: ChecksRuntimeMode =
+    auth.state.status === "authenticated"
+      ? "active"
+      : auth.state.status === "offline"
+        ? "unavailable"
+        : "disabled";
+  const [checksOverview, refreshChecks] = useChecksOverview(getChecksJson, checksRuntimeMode);
   const { route, navigate } = useRoute();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenu, setMobileMenu] = useState(false);
@@ -3977,8 +4063,10 @@ function AlertHubRuntime() {
   const [logoutBusy, setLogoutBusy] = useState(false);
   const readOnly = auth.state.status === "demo" || auth.state.status === "offline";
   const effectiveOnline = auth.state.status === "offline" ? false : online;
+  const checksVisible = checksOverview.enabled !== false;
   const refreshAll = async () => {
     if (auth.state.status === "offline") await auth.recover();
+    refreshChecks();
     await refresh();
   };
   const openNotifications = () => {
@@ -4041,6 +4129,26 @@ function AlertHubRuntime() {
             navigate={navigate}
             setData={setData}
             readOnly={readOnly}
+            checksVisible={checksVisible}
+          />
+        );
+      case "checks":
+        return (
+          <ChecksPage
+            request={getChecksJson}
+            runtimeMode={checksRuntimeMode}
+            language={language}
+            navigate={navigate}
+          />
+        );
+      case "check":
+        return (
+          <CheckDetailPage
+            checkId={route.checkId ?? ""}
+            request={getChecksJson}
+            runtimeMode={checksRuntimeMode}
+            language={language}
+            navigate={navigate}
           />
         );
       case "reachability":
@@ -4120,6 +4228,8 @@ function AlertHubRuntime() {
         return (
           <OverviewPage
             data={data}
+            checks={checksOverview}
+            refreshChecks={refreshChecks}
             readOnly={readOnly}
             navigate={navigate}
             onNotifications={openNotifications}
@@ -4147,6 +4257,7 @@ function AlertHubRuntime() {
               ? tr("офлайн · только чтение", "offline · read-only")
               : tr("демо-режим", "demo-preview")
         }
+        checksVisible={checksVisible}
       />
       <div className="app-frame">
         <AppHeader
@@ -4171,12 +4282,18 @@ function AlertHubRuntime() {
           {view}
         </main>
       </div>
-      <MobileNav route={route.id} navigate={navigate} onMore={() => setMobileMenu(true)} />
+      <MobileNav
+        route={route.id}
+        navigate={navigate}
+        onMore={() => setMobileMenu(true)}
+        checksVisible={checksVisible}
+      />
       <MobileDrawer
         open={mobileMenu}
         route={route.id}
         navigate={navigate}
         onClose={() => setMobileMenu(false)}
+        checksVisible={checksVisible}
       />
       {sourceWizard && (
         <SourceWizard
@@ -4396,11 +4513,15 @@ function PrometheusEvidenceGrid({ data }: { data: HubData }) {
 
 function OverviewPage({
   data,
+  checks,
+  refreshChecks,
   readOnly,
   navigate,
   onNotifications,
 }: {
   data: HubData;
+  checks: ChecksOverviewState;
+  refreshChecks: () => void;
   readOnly: boolean;
   navigate: (path: string) => void;
   onNotifications: () => void;
@@ -4537,6 +4658,13 @@ function OverviewPage({
       </div>
 
       <PrometheusEvidenceGrid data={data} />
+
+      <ChecksWidget
+        state={checks}
+        language={currentUiLanguage()}
+        navigate={navigate}
+        onRetry={refreshChecks}
+      />
 
       <div className="overview-grid">
         <Panel
@@ -4918,12 +5046,14 @@ function IncidentDetailPage({
   navigate,
   setData,
   readOnly,
+  checksVisible,
 }: {
   incidentId: string;
   incidents: Incident[];
   navigate: (path: string) => void;
   setData: React.Dispatch<React.SetStateAction<HubData>>;
   readOnly: boolean;
+  checksVisible: boolean;
 }) {
   const incident = incidents.find((item) => item.id === incidentId);
   const [busy, setBusy] = useState<string | null>(null);
@@ -5098,6 +5228,27 @@ function IncidentDetailPage({
           <Icon symbol="!" /> {actionError}
         </div>
       )}
+      {checksVisible &&
+        incident.checksRelationState === "available" &&
+        Boolean(incident.checkIds?.length) && (
+          <nav
+            className="incident-check-links"
+            aria-label={tr("Связанные Checks", "Related Checks")}
+          >
+            <span>
+              <Icon symbol="checks" /> {tr("Связанные Checks", "Related Checks")}
+            </span>
+            {incident.checkIds?.map((checkId) => (
+              <button
+                key={checkId}
+                className="button button--quiet button--small"
+                onClick={() => navigate(`/checks/${encodeURIComponent(checkId)}`)}
+              >
+                <code>{checkId}</code> <span aria-hidden="true">→</span>
+              </button>
+            ))}
+          </nav>
+        )}
       <div className="incident-detail-grid">
         <Panel
           className="timeline-panel"

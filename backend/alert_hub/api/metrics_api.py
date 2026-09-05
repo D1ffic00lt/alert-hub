@@ -25,7 +25,7 @@ from alert_hub.infrastructure.db.models import (
     User,
 )
 from alert_hub.infrastructure.encryption import EnvelopeCipher
-from alert_hub.infrastructure.prometheus import FixedQueryName, PrometheusClient
+from alert_hub.infrastructure.prometheus import PrometheusClient, PublicQueryName
 from alert_hub.settings import Settings
 
 router = APIRouter(prefix="/api/v1/metrics", tags=["metrics-summary"])
@@ -216,7 +216,7 @@ def _failure_response(failure: DatasourceQueryFailure) -> dict[str, str]:
 
 @router.get("/queries/{query_name}")
 async def metrics_named_query(
-    query_name: FixedQueryName,
+    query_name: PublicQueryName,
     request: Request,
     db: Session = Depends(get_db),
     prometheus: PrometheusClient = Depends(get_prometheus_client),
