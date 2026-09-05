@@ -59,21 +59,134 @@ _OPTIONAL_WARNING_CODES: dict[CheckQueryName, str] = {
     "check_egress_match": "check_assertions_unavailable",
 }
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:\-]{0,127}")
-_SENSITIVE_DISPLAY = re.compile(
-    r"(?i)(?:[a-z][a-z0-9+.-]*://|bearer\s+\S|"
-    r"(?:token|password|secret|api[_-]?key)\s*[:=])"
-)
 _RESERVED_IDENTIFIER_PREFIX = "__alert_hub_"
 _RESERVED_IDENTIFIERS = frozenset({"summary"})
 _UUID_CANDIDATE = re.compile(
     r"(?i)(?<![A-Za-z0-9])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12}(?![A-Za-z0-9])"
 )
-_IPV4_CANDIDATE = re.compile(r"(?<![A-Za-z0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![A-Za-z0-9])")
-_IPV6_CANDIDATE = re.compile(
-    r"(?i)\[[0-9a-f:.%]+\](?::[0-9]{1,5})?|"
-    r"(?<![A-Za-z0-9])[0-9a-f:]*:[0-9a-f:]*:[0-9a-f:]+(?![A-Za-z0-9])"
+_DISPLAY_LENGTH_LIMIT = 255
+_ASCII_DIGITS = frozenset("0123456789")
+_IPV6_RUN_CHARACTERS = frozenset("0123456789abcdefABCDEF:")
+_SENSITIVE_ASSIGNMENT_NAMES = ("token", "password", "secret", "apikey", "api_key", "api-key")
+_IGNORE_CASE_TRANSLATION = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZİıſK",
+    "abcdefghijklmnopqrstuvwxyziisk",
 )
+
+
+def _contains_sensitive_display(value: str) -> bool:
+    """Detect credential-shaped display text with bounded linear scans."""
+
+    folded = value.translate(_IGNORE_CASE_TRANSLATION)
+    if "://" in folded:
+        return True
+
+    marker_at = folded.find("bearer")
+    while marker_at >= 0:
+        cursor = marker_at + len("bearer")
+        if cursor < len(value) and value[cursor].isspace():
+            while cursor < len(value) and value[cursor].isspace():
+                cursor += 1
+            if cursor < len(value):
+                return True
+        marker_at = folded.find("bearer", marker_at + 1)
+
+    for name in _SENSITIVE_ASSIGNMENT_NAMES:
+        marker_at = folded.find(name)
+        while marker_at >= 0:
+            cursor = marker_at + len(name)
+            while cursor < len(value) and value[cursor].isspace():
+                cursor += 1
+            if cursor < len(value) and value[cursor] in {":", "="}:
+                return True
+            marker_at = folded.find(name, marker_at + 1)
+    return False
+
+
+def _is_ascii_alphanumeric(character: str) -> bool:
+    return character.isascii() and character.isalnum()
+
+
+def _contains_ipv4_address(value: str) -> bool:
+    for start, character in enumerate(value):
+        if character not in _ASCII_DIGITS:
+            continue
+        if start > 0 and _is_ascii_alphanumeric(value[start - 1]):
+            continue
+
+        cursor = start
+        octets: list[str] = []
+        for octet_index in range(4):
+            octet_start = cursor
+            while cursor < len(value) and value[cursor] in _ASCII_DIGITS:
+                cursor += 1
+            octet = value[octet_start:cursor]
+            if not 1 <= len(octet) <= 3:
+                break
+            octets.append(octet)
+            if octet_index < 3:
+                if cursor >= len(value) or value[cursor] != ".":
+                    break
+                cursor += 1
+        if len(octets) != 4:
+            continue
+        if cursor < len(value) and _is_ascii_alphanumeric(value[cursor]):
+            continue
+        try:
+            ipaddress.IPv4Address(".".join(octets))
+        except ipaddress.AddressValueError:
+            continue
+        return True
+    return False
+
+
+def _contains_ipv6_address(value: str) -> bool:
+    for bracket_start, character in enumerate(value):
+        if character != "[":
+            continue
+        bracket_end = value.find("]", bracket_start + 1)
+        if bracket_end < 0:
+            continue
+        candidate = value[bracket_start + 1 : bracket_end].split("%", 1)[0]
+        try:
+            ipaddress.IPv6Address(candidate)
+        except ipaddress.AddressValueError:
+            continue
+        return True
+
+    cursor = 0
+    while cursor < len(value):
+        if value[cursor] not in _IPV6_RUN_CHARACTERS:
+            cursor += 1
+            continue
+        run_start = cursor
+        while cursor < len(value) and value[cursor] in _IPV6_RUN_CHARACTERS:
+            cursor += 1
+        run_end = cursor
+        if cursor < len(value) and _is_ascii_alphanumeric(value[cursor]):
+            continue
+
+        for candidate_start in range(run_start, run_end):
+            if candidate_start > 0 and _is_ascii_alphanumeric(value[candidate_start - 1]):
+                continue
+            candidate = value[candidate_start:run_end]
+            if candidate.count(":") < 2:
+                break
+            try:
+                ipaddress.IPv6Address(candidate)
+            except ipaddress.AddressValueError:
+                pass
+            else:
+                return True
+            # This is the first maximal candidate the former regex would consume;
+            # do not reinterpret one of its internal fields as a separate address.
+            break
+    return False
+
+
+def _contains_ip_address(value: str) -> bool:
+    return _contains_ipv4_address(value) or _contains_ipv6_address(value)
 
 
 class ChecksDataError(RuntimeError):
@@ -173,24 +286,12 @@ def normalize_check_identifier(
 def _safe_display(value: object, *, max_length: int) -> str | None:
     if not isinstance(value, str):
         return None
+    if max_length < 1 or len(value) > min(max_length, _DISPLAY_LENGTH_LIMIT):
+        return None
     if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
         return None
     candidate = " ".join(value.strip().split())
-    if not candidate or len(candidate) > max_length or _SENSITIVE_DISPLAY.search(candidate):
-        return None
-    address_candidates = [
-        candidate,
-        *(_IPV4_CANDIDATE.findall(candidate)),
-        *(_IPV6_CANDIDATE.findall(candidate)),
-    ]
-    for address_candidate in address_candidates:
-        if address_candidate.startswith("[") and "]" in address_candidate:
-            address_candidate = address_candidate[1 : address_candidate.index("]")]
-        address_candidate = address_candidate.split("%", 1)[0]
-        try:
-            ipaddress.ip_address(address_candidate.strip("[]"))
-        except ValueError:
-            continue
+    if not candidate or _contains_sensitive_display(candidate) or _contains_ip_address(candidate):
         return None
     return candidate
 
