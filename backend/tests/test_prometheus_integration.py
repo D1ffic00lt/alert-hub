@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -64,6 +65,21 @@ def test_vector_parser_preserves_labels_and_rejects_invalid_values() -> None:
         parse_vector_response(invalid, max_samples=10)
     with pytest.raises(PrometheusQueryError, match="sample limit"):
         parse_vector_response(payload, max_samples=0)
+
+    malformed_labels = {
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [
+                {
+                    "metric": {"check_id": None, "valid": "kept", 7: "invalid-key"},
+                    "value": [1_788_256_800, "1"],
+                }
+            ],
+        },
+    }
+    parsed = parse_vector_response(malformed_labels, max_samples=10)
+    assert parsed[0].labels == {"valid": "kept"}
 
 
 def test_monitoring_url_requires_explicit_http_private_opt_in() -> None:
@@ -130,6 +146,45 @@ def test_send_time_dns_revalidation_blocks_rebinding_and_redirects(settings: Set
     with pytest.raises(PrometheusQueryError) as redirected:
         asyncio.run(redirect_client.query("https://1.1.1.1", {"auth_type": "none"}, "reachability"))
     assert redirected.value.code == "redirect_rejected"
+
+
+def test_checks_query_uses_explicit_evaluation_time_and_preserves_non_finite_values(
+    settings: Settings,
+) -> None:
+    evaluated_at = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
+    seen: list[tuple[str, str]] = []
+
+    def prometheus(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.params["query"], request.url.params["time"]))
+        return httpx.Response(
+            200,
+            request=request,
+            json=_vector(({"check_id": "public-api"}, float("nan"), 1_788_256_800)),
+        )
+
+    client = PrometheusHTTPClient(settings, transport=httpx.MockTransport(prometheus))
+    samples = asyncio.run(
+        client.query(
+            "https://1.1.1.1",
+            {"auth_type": "none"},
+            "check_status",
+            evaluated_at=evaluated_at,
+            allow_non_finite_values=True,
+        )
+    )
+
+    assert seen == [(FIXED_PROMQL["check_status"], "2026-09-05T12:00:00Z")]
+    assert len(samples) == 1
+    assert math.isnan(samples[0].value)
+    with pytest.raises(PrometheusQueryError, match="non-finite"):
+        asyncio.run(
+            client.query(
+                "https://1.1.1.1",
+                {"auth_type": "none"},
+                "check_status",
+                evaluated_at=evaluated_at,
+            )
+        )
 
 
 def test_datasource_crud_encrypts_redacts_auth_and_tests_connection(
@@ -514,6 +569,7 @@ def test_reachability_merges_actual_labels_and_reports_partial_failures(
     assert alerts.json()["samples"][0]["metric"]["alertname"] == "DatabaseDown"
     assert FIXED_PROMQL["firing_alerts"] in query_values
     assert client.get("/api/v1/metrics/queries/arbitrary", headers=auth).status_code == 422
+    assert client.get("/api/v1/metrics/queries/check_status", headers=auth).status_code == 422
 
 
 def test_reachability_default_mode_uses_only_canonical_labels(

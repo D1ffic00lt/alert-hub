@@ -127,7 +127,7 @@ function createHarness() {
         status: controls.apiStatus,
       });
     }
-    if (["/incidents", "/settings"].includes(pathname)) {
+    if (["/incidents", "/settings", "/checks", "/checks/public-api"].includes(pathname)) {
       if (controls.navigationResponse === "text") {
         return responseWithUrl(
           "not an SPA document",
@@ -235,7 +235,7 @@ async function dispatchWaitable(
 describe("service worker fetch boundaries", () => {
   it("does not intercept backend or unknown navigations as SPA shell requests", async () => {
     const { caches, listeners } = createHarness();
-    const shell = await caches.open("alert-hub-v6-shell");
+    const shell = await caches.open("alert-hub-v7-shell");
     await shell.put("/", new Response("known-good-shell"));
 
     const metricsResponse = await dispatchFetch(
@@ -255,9 +255,32 @@ describe("service worker fetch boundaries", () => {
     expect(vapidResponse).toBeUndefined();
   });
 
+  it("keeps every Checks API response network-only and never revives a cached success", async () => {
+    const { caches, controls, listeners, networkCalls } = createHarness();
+    const apiRequest = request("/api/v1/checks/public-api");
+    apiRequest.headers.set("Authorization", "Bearer current-session");
+    apiRequest.headers.set("X-Alert-Hub-Cache-Partition", "session_partition_123");
+    const readCache = await caches.open("alert-hub-v2-read-model-session_partition_123");
+    await readCache.put(
+      apiRequest,
+      new Response('{"check":{"check_id":"public-api","status":"up"}}', {
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    controls.apiStatus = 503;
+    const unavailable = await dispatchFetch(listeners.fetch, apiRequest);
+    expect((await unavailable)?.status).toBe(503);
+    expect((await unavailable)?.headers.get("X-Alert-Hub-Cache")).toBeNull();
+    expect(networkCalls.at(-1)).toMatchObject({ cache: "no-store" });
+
+    controls.networkOffline = true;
+    await expect(dispatchFetch(listeners.fetch, apiRequest)).rejects.toThrow("offline");
+  });
+
   it("keeps runtime config network-only while manifest branding has an offline fallback", async () => {
     const { caches, controls, listeners, networkCalls } = createHarness();
-    const shell = await caches.open("alert-hub-v6-shell");
+    const shell = await caches.open("alert-hub-v7-shell");
     await shell.put("/runtime-config.js", new Response("stale-runtime-config"));
 
     const runtime = await dispatchFetch(
@@ -279,7 +302,7 @@ describe("service worker fetch boundaries", () => {
 
   it("only replaces the offline shell with same-origin HTML from an SPA route", async () => {
     const { caches, controls, listeners } = createHarness();
-    const shell = await caches.open("alert-hub-v6-shell");
+    const shell = await caches.open("alert-hub-v7-shell");
     const response = await dispatchFetch(
       listeners.fetch,
       request("/incidents", "navigate", "document"),
@@ -356,7 +379,7 @@ describe("service worker push contract", () => {
       openedWindows,
     } = createHarness();
     controls.manifestOffline = true;
-    const shell = await caches.open("alert-hub-v6-shell");
+    const shell = await caches.open("alert-hub-v7-shell");
     await shell.put(
       "/manifest.webmanifest",
       new Response('{"name":"Cached Operations"}', {
@@ -447,7 +470,7 @@ describe("service worker cache lifecycle", () => {
         ],
       },
     });
-    const shell = await caches.open("alert-hub-v6-shell");
+    const shell = await caches.open("alert-hub-v7-shell");
     expect(await shell.match(`${origin}/assets/index-safe.js`)).toBeDefined();
     expect(await shell.match(`${origin}/runtime-config.js`)).toBeUndefined();
     expect(await shell.match("https://evil.invalid/assets/index.js")).toBeUndefined();

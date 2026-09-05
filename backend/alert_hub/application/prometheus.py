@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -120,6 +121,8 @@ async def query_datasource_targets(
     query_name: FixedQueryName,
     *,
     job_globs: Sequence[str] | None = None,
+    evaluated_at: datetime | None = None,
+    allow_non_finite_values: bool = False,
 ) -> tuple[list[DatasourceQueryResult], list[DatasourceQueryFailure]]:
     async def query_one(
         target: DatasourceQueryTarget,
@@ -130,6 +133,8 @@ async def query_datasource_targets(
                 target.credentials,
                 query_name,
                 job_globs=job_globs,
+                evaluated_at=evaluated_at,
+                allow_non_finite_values=allow_non_finite_values,
             )
         except PrometheusQueryError as exc:
             return DatasourceQueryFailure(
