@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from alert_hub.api.dependencies import current_user, get_db, get_settings
 from alert_hub.api.prometheus import get_prometheus_client
+from alert_hub.application.monitoring_settings import monitoring_settings_snapshot
 from alert_hub.application.prometheus import (
     DatasourceQueryFailure,
     prepare_enabled_datasources,
@@ -37,6 +38,7 @@ def metrics_summary(
     user: User = Depends(current_user),
 ) -> dict[str, Any]:
     del user
+    monitoring = monitoring_settings_snapshot(db, settings)
     since = utc_now() - timedelta(hours=24)
     open_count = int(
         db.scalar(select(func.count(Incident.id)).where(Incident.status == "open")) or 0
@@ -77,7 +79,9 @@ def metrics_summary(
         "delivery_success_rate": delivery_rate,
         "deliveries_24h": delivery_total,
         "delivery_success_24h": delivery_success,
-        "grafana_url": settings.grafana_url,
+        "grafana_url": monitoring.grafana_url,
+        "key_job_globs": monitoring.key_job_globs,
+        "alert_hub_job_globs": monitoring.alert_hub_job_globs,
         "channels_enabled": int(
             db.scalar(
                 select(func.count(NotificationChannel.id)).where(
@@ -216,13 +220,25 @@ async def metrics_named_query(
     request: Request,
     db: Session = Depends(get_db),
     prometheus: PrometheusClient = Depends(get_prometheus_client),
+    settings: Settings = Depends(get_settings),
     user: User = Depends(current_user),
 ) -> dict[str, Any]:
     del user
     cipher: EnvelopeCipher | None = request.app.state.envelope_cipher
     targets, failures, datasource_count = prepare_enabled_datasources(db, cipher)
+    monitoring = monitoring_settings_snapshot(db, settings)
     db.close()
-    results, transport_failures = await query_datasource_targets(targets, prometheus, query_name)
+    job_globs = None
+    if query_name == "key_jobs_up":
+        job_globs = monitoring.key_job_globs
+    elif query_name == "alert_hub_health":
+        job_globs = monitoring.alert_hub_job_globs
+    results, transport_failures = await query_datasource_targets(
+        targets,
+        prometheus,
+        query_name,
+        job_globs=job_globs,
+    )
     failures.extend(transport_failures)
     samples = [
         {

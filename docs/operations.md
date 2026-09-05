@@ -30,10 +30,11 @@ from the third consecutive failure, and unknown before an attempt has produced e
 is the worker's current cursor evidence, not an estimate from the durable `last_seen_at` field. The
 UI refreshes this runtime view every 30 seconds even while its cluster-event stream is connected.
 
-Set the optional `GRAFANA_URL` to the installation's HTTPS dashboard when the UI should offer a
-detailed-view link. The validated URL is returned only in the authenticated metrics summary. It is
-navigation metadata, not a Grafana credential or a way to submit PromQL; Prometheus remains the
-time-series source of truth.
+Administrators set the optional Grafana HTTPS dashboard link and the bounded `job` glob lists under
+**Settings → Grafana and job selection**. The values are audited and replicated as append-only
+cluster configuration. `GRAFANA_URL` remains the initial fallback until a cluster setting is saved.
+The link is navigation metadata, not a Grafana credential or a way to submit PromQL; Prometheus
+remains the time-series source of truth.
 
 Alert on at least:
 

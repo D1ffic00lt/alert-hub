@@ -3807,6 +3807,17 @@ textarea:focus-visible {
   color: var(--muted);
   font-size: 8px;
 }
+.monitoring-settings-form .settings-field--wide {
+  grid-column: 1 / -1;
+}
+.monitoring-settings-form label small {
+  color: var(--muted-2);
+  font-size: 7px;
+  line-height: 1.45;
+}
+.settings-message {
+  margin: 0 18px 16px;
+}
 .settings-actions {
   display: flex;
   align-items: center;

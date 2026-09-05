@@ -5,13 +5,14 @@ import base64
 import json
 import math
 import socket
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
 import httpx
 
+from alert_hub.domain.monitoring import job_globs_to_re2
 from alert_hub.infrastructure.url_safety import Resolver, UnsafeURL, validate_monitoring_url
 from alert_hub.settings import Settings
 
@@ -30,6 +31,15 @@ FIXED_PROMQL: dict[FixedQueryName, str] = {
     "key_jobs_up": 'up{job=~"prometheus|alertmanager|blackbox.*"}',
     "alert_hub_health": 'up{job=~"alert[-_]?hub.*"}',
 }
+
+
+def fixed_promql(query_name: FixedQueryName, job_globs: Sequence[str] | None = None) -> str:
+    if job_globs is None:
+        return FIXED_PROMQL[query_name]
+    if query_name not in {"key_jobs_up", "alert_hub_health"}:
+        raise ValueError(f"{query_name} does not accept job patterns")
+    regex = job_globs_to_re2(job_globs)
+    return f"up{{job=~{json.dumps(regex)}}}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +64,8 @@ class PrometheusClient(Protocol):
         url: str,
         credentials: Mapping[str, Any],
         query_name: FixedQueryName,
+        *,
+        job_globs: Sequence[str] | None = None,
     ) -> list[VectorSample]: ...
 
 
@@ -162,6 +174,8 @@ class PrometheusHTTPClient:
         url: str,
         credentials: Mapping[str, Any],
         query_name: FixedQueryName,
+        *,
+        job_globs: Sequence[str] | None = None,
     ) -> list[VectorSample]:
         # Repeat DNS/address validation immediately before every request. Redirects are never
         # followed, which closes the common public-to-private redirect bypass.
@@ -175,7 +189,7 @@ class PrometheusHTTPClient:
         headers["Accept"] = "application/json"
         query_url = f"{normalized.rstrip('/')}/api/v1/query"
         params = {
-            "query": FIXED_PROMQL[query_name],
+            "query": fixed_promql(query_name, job_globs),
             "timeout": f"{self.settings.prometheus_query_timeout_seconds:g}s",
         }
         try:

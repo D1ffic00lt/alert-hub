@@ -3,8 +3,9 @@
 Sources are configured through the authenticated UI/API and receive a random bearer token exactly once. Alert Hub stores only a keyed hash. Losing the token requires rotation; it cannot be read back from SQLite.
 
 The repository implements Alertmanager, normalized generic JSON, and heartbeat intake, plus
-backend-owned fixed Prometheus datasource queries for regional reachability. Grafana-specific
-payload adapters and arbitrary browser-authored PromQL are not implemented. Source adapters never
+backend-owned named Prometheus datasource queries for regional reachability. Administrators may
+select validated `job` globs for the two `up` summaries, but Grafana-specific payload adapters and
+arbitrary browser-authored PromQL are not implemented. Source adapters never
 execute source-provided code or interpolation expressions. SMTP notification templates are a
 separate allowlisted-placeholder feature described in [operations](operations.md#smtp-notification-templates).
 
@@ -23,7 +24,8 @@ public ingress, sender CIDR, or external system. Complete setup with one real re
 sender. Rotating a source token invalidates the previous token immediately.
 
 Prometheus is not an event source in this menu. Add it under **Regional reachability → Add
-datasource**; Alert Hub runs only its fixed backend-owned queries. Grafana webhook payloads are not
+datasource**; Alert Hub runs only its named backend-owned queries. Set the Grafana link and the
+allowed `job` globs under **Settings → Grafana and job selection**. Grafana webhook payloads are not
 accepted directly.
 
 ## Common rules
@@ -182,7 +184,7 @@ datasources through `/api/v1/prometheus-datasources`. Credentials support `none`
 modes and are stored only as AES-GCM envelopes. Responses expose the auth mode and configured field
 names, never credential values.
 
-The backend exposes only named fixed queries and never accepts browser-authored PromQL:
+The backend exposes only named queries and never accepts browser-authored PromQL. Defaults are:
 
 ```promql
 probe_success
@@ -191,9 +193,16 @@ up{job=~"prometheus|alertmanager|blackbox.*"}
 up{job=~"alert[-_]?hub.*"}
 ```
 
+An administrator can replace the two default `job` selectors with comma-separated glob patterns
+such as `vless_blackbox_*` or `alert-hub-api-*`. Patterns accept only bounded job-label characters
+and `*`; the backend escapes them and constructs the `up{job=~...}` selector. The browser cannot
+provide metric names, operators, functions, or other PromQL syntax.
+
 `GET /api/v1/metrics/reachability` merges the latest `probe_success` samples using the label pair selected on each datasource. The default `canonical` mode reads `source_region` and `target_name`. An explicit `server` mode reads `source_server` and `target_server` for existing installations that retain geographic `source_region` grouping for Grafana. Modes never fall back into one another, so adding the compatibility option cannot silently change an existing datasource's matrix identity. It returns `partial` with per-datasource errors when some Prometheus instances fail. `GET /api/v1/metrics/queries/{query_name}` exposes the other fixed vectors, and `POST /api/v1/prometheus-datasources/{id}/test` uses a fixed `vector(1)` probe.
 
-Set optional `GRAFANA_URL` to an HTTPS dashboard when operators should get a detailed-view link.
+Set the optional Grafana HTTPS dashboard link under **Settings** when operators should get a
+detailed-view link. `GRAFANA_URL` remains an initial fallback for installations that configure it
+before a cluster setting has been saved.
 The backend validates it, rejects embedded credentials, and returns it in the authenticated
 `GET /api/v1/metrics/summary` response. Alert Hub does not proxy Grafana or turn that link into an
 arbitrary-query surface.

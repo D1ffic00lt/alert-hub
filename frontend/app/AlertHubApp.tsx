@@ -273,7 +273,12 @@ type HubSummary = {
   outboxPending: number | null;
   channelsEnabled: number | null;
   grafanaUrl: string | null;
+  keyJobGlobs: string[];
+  alertHubJobGlobs: string[];
 };
+
+const DEFAULT_KEY_JOB_GLOBS = ["prometheus", "alertmanager", "blackbox*"];
+const DEFAULT_ALERT_HUB_JOB_GLOBS = ["alert-hub*", "alert_hub*", "alerthub*"];
 
 type HubData = {
   incidents: Incident[];
@@ -326,6 +331,8 @@ const EMPTY_DATA: HubData = {
     outboxPending: null,
     channelsEnabled: null,
     grafanaUrl: null,
+    keyJobGlobs: DEFAULT_KEY_JOB_GLOBS,
+    alertHubJobGlobs: DEFAULT_ALERT_HUB_JOB_GLOBS,
   },
 };
 
@@ -987,6 +994,8 @@ function createDemoData(): HubData {
       outboxPending: 1,
       channelsEnabled: 3,
       grafanaUrl: null,
+      keyJobGlobs: DEFAULT_KEY_JOB_GLOBS,
+      alertHubJobGlobs: DEFAULT_ALERT_HUB_JOB_GLOBS,
     },
   };
 }
@@ -2544,6 +2553,14 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
               outboxPending: asFiniteNumber(row.outbox_pending),
               channelsEnabled: asFiniteNumber(row.channels_enabled),
               grafanaUrl: normalizeGrafanaUrl(row.grafana_url),
+              keyJobGlobs:
+                asStringList(row.key_job_globs).length > 0
+                  ? asStringList(row.key_job_globs)
+                  : next.summary.keyJobGlobs,
+              alertHubJobGlobs:
+                asStringList(row.alert_hub_job_globs).length > 0
+                  ? asStringList(row.alert_hub_job_globs)
+                  : next.summary.alertHubJobGlobs,
             };
           } else {
             next.summary = {
@@ -2558,6 +2575,8 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
               outboxPending: next.summary.outboxPending,
               channelsEnabled: next.summary.channelsEnabled,
               grafanaUrl: next.summary.grafanaUrl,
+              keyJobGlobs: next.summary.keyJobGlobs,
+              alertHubJobGlobs: next.summary.alertHubJobGlobs,
             };
           }
           verifiedData.current = next;
@@ -4088,7 +4107,15 @@ function AlertHubRuntime() {
           />
         );
       case "settings":
-        return <SettingsPage nodes={data.nodes} readOnly={readOnly} />;
+        return (
+          <SettingsPage
+            nodes={data.nodes}
+            summary={data.summary}
+            readOnly={readOnly}
+            setData={setData}
+            onRefresh={() => refresh(true)}
+          />
+        );
       default:
         return (
           <OverviewPage
@@ -4263,8 +4290,14 @@ function MetricEvidenceValue({
   return (
     <>
       <strong>
-        {kind === "alerts" ? active : `${active}/${result.samples.length}`}
-        <span>{kind === "alerts" ? tr(" активн.", " firing") : tr(" доступно", " up")}</span>
+        {kind === "alerts"
+          ? active
+          : result.samples.length
+            ? `${active}/${result.samples.length}`
+            : tr("Нет целей", "No targets")}
+        {kind === "alerts" || result.samples.length ? (
+          <span>{kind === "alerts" ? tr(" активн.", " firing") : tr(" доступно", " up")}</span>
+        ) : null}
       </strong>
       <small>
         {kind === "alerts"
@@ -4335,7 +4368,7 @@ function PrometheusEvidenceGrid({ data }: { data: HubData }) {
         </Panel>
         <Panel
           eyebrow={tr("up · ключевые сервисы", "up · key jobs")}
-          title="Prometheus / Alertmanager / Blackbox"
+          title={tr("Выбранные ключевые job", "Selected key jobs")}
         >
           <div className="metric-evidence-value">
             <MetricEvidenceValue result={data.fixedMetrics.keyJobsUp} kind="jobs" />
@@ -7296,7 +7329,32 @@ function Toggle({
   );
 }
 
-function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boolean }) {
+const JOB_GLOB_PATTERN = /^[A-Za-z0-9_.:/\-*]{1,128}$/;
+
+function parseJobGlobs(value: string) {
+  return [
+    ...new Set(
+      value
+        .split(/[\n,]+/)
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function SettingsPage({
+  nodes,
+  summary,
+  readOnly,
+  setData,
+  onRefresh,
+}: {
+  nodes: ClusterNode[];
+  summary: HubSummary;
+  readOnly: boolean;
+  setData: React.Dispatch<React.SetStateAction<HubData>>;
+  onRefresh: () => Promise<void>;
+}) {
   const appName = useContext(AppNameContext);
   const {
     preference: themePreference,
@@ -7309,6 +7367,16 @@ function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boo
       : localStorage.getItem("alert-hub-auto-failover") !== "false",
   );
   const [cacheMessage, setCacheMessage] = useState<string | null>(null);
+  const [monitoringDraft, setMonitoringDraft] = useState<{
+    grafanaUrl: string;
+    keyJobGlobs: string;
+    alertHubJobGlobs: string;
+  } | null>(null);
+  const [monitoringBusy, setMonitoringBusy] = useState(false);
+  const [monitoringMessage, setMonitoringMessage] = useState<{
+    tone: "success" | "warning";
+    text: string;
+  } | null>(null);
   const [endpoints, setEndpoints] = useState<string[]>(() => {
     if (typeof window === "undefined") return [];
     try {
@@ -7328,6 +7396,98 @@ function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boo
     ),
   ];
   const enabledEndpoints = endpoints.filter((item) => availableEndpoints.includes(item));
+  const grafanaUrl = monitoringDraft?.grafanaUrl ?? summary.grafanaUrl ?? "";
+  const keyJobGlobs = monitoringDraft?.keyJobGlobs ?? summary.keyJobGlobs.join(", ");
+  const alertHubJobGlobs = monitoringDraft?.alertHubJobGlobs ?? summary.alertHubJobGlobs.join(", ");
+  const monitoringDirty = monitoringDraft !== null;
+
+  const saveMonitoringSettings = async () => {
+    const normalizedGrafana = grafanaUrl.trim();
+    const normalizedKeyJobs = parseJobGlobs(keyJobGlobs);
+    const normalizedAlertHubJobs = parseJobGlobs(alertHubJobGlobs);
+    if (normalizedGrafana) {
+      try {
+        const parsed = new URL(normalizedGrafana);
+        if (parsed.protocol !== "https:" || parsed.username || parsed.password) throw new Error();
+      } catch {
+        setMonitoringMessage({
+          tone: "warning",
+          text: tr(
+            "Укажите HTTPS-адрес Grafana без логина и пароля в URL.",
+            "Enter a Grafana HTTPS URL without embedded credentials.",
+          ),
+        });
+        return;
+      }
+    }
+    const invalidJob = [...normalizedKeyJobs, ...normalizedAlertHubJobs].find(
+      (item) => !JOB_GLOB_PATTERN.test(item),
+    );
+    if (
+      !normalizedKeyJobs.length ||
+      !normalizedAlertHubJobs.length ||
+      normalizedKeyJobs.length > 32 ||
+      normalizedAlertHubJobs.length > 32 ||
+      invalidJob
+    ) {
+      setMonitoringMessage({
+        tone: "warning",
+        text: tr(
+          "Добавьте хотя бы один допустимый шаблон job в каждую группу.",
+          "Add at least one valid job pattern to each group.",
+        ),
+      });
+      return;
+    }
+    setMonitoringBusy(true);
+    setMonitoringMessage(null);
+    try {
+      const body = asRecord(
+        await mutationJson("/application-settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            grafana_url: normalizedGrafana || null,
+            key_job_globs: normalizedKeyJobs,
+            alert_hub_job_globs: normalizedAlertHubJobs,
+          }),
+        }),
+      );
+      const nextGrafanaUrl = normalizeGrafanaUrl(body.grafana_url);
+      const nextKeyJobs = asStringList(body.key_job_globs);
+      const nextAlertHubJobs = asStringList(body.alert_hub_job_globs);
+      setData((current) => ({
+        ...current,
+        summary: {
+          ...current.summary,
+          grafanaUrl: nextGrafanaUrl,
+          keyJobGlobs: nextKeyJobs,
+          alertHubJobGlobs: nextAlertHubJobs,
+        },
+      }));
+      setMonitoringDraft(null);
+      setMonitoringMessage({
+        tone: "success",
+        text: tr(
+          "Настройки мониторинга сохранены и будут реплицированы между узлами.",
+          "Monitoring settings were saved and will replicate across nodes.",
+        ),
+      });
+      void onRefresh().catch(() => undefined);
+    } catch (reason) {
+      setMonitoringMessage({
+        tone: "warning",
+        text:
+          reason instanceof Error
+            ? reason.message
+            : tr(
+                "Не удалось сохранить настройки мониторинга.",
+                "Unable to save monitoring settings.",
+              ),
+      });
+    } finally {
+      setMonitoringBusy(false);
+    }
+  };
   const toggleEndpoint = (item: string) => {
     const enabled = enabledEndpoints.includes(item);
     const next = enabled
@@ -7502,6 +7662,112 @@ function SettingsPage({ nodes, readOnly }: { nodes: ClusterNode[]; readOnly: boo
                 )}
               </span>
             </div>
+          </Panel>
+          <Panel
+            eyebrow={tr("Интеграции мониторинга", "Monitoring integrations")}
+            title={tr("Grafana и выбор job", "Grafana and job selection")}
+          >
+            <p className="settings-intro">
+              {tr(
+                "Alert Hub строит безопасные серверные запросы только по указанным шаблонам метки job. Произвольный PromQL из браузера не принимается.",
+                "Alert Hub builds safe server-side queries only from these job label patterns. Browser-authored PromQL is not accepted.",
+              )}
+            </p>
+            <div className="form-grid monitoring-settings-form">
+              <label className="settings-field--wide">
+                <span>{tr("Ссылка на Grafana", "Grafana URL")}</span>
+                <input
+                  type="url"
+                  inputMode="url"
+                  value={grafanaUrl}
+                  placeholder="https://grafana.example.com/d/operations"
+                  disabled={readOnly || monitoringBusy}
+                  onChange={(event) => {
+                    setMonitoringDraft({
+                      grafanaUrl: event.target.value,
+                      keyJobGlobs,
+                      alertHubJobGlobs,
+                    });
+                    setMonitoringMessage(null);
+                  }}
+                />
+                <small>
+                  {tr(
+                    "Необязательно. Используется кнопкой «Открыть Grafana»; учётные данные не сохраняются.",
+                    "Optional. Used by the Open Grafana button; credentials are not stored.",
+                  )}
+                </small>
+              </label>
+              <label>
+                <span>{tr("Ключевые сервисы · job", "Key services · job")}</span>
+                <input
+                  value={keyJobGlobs}
+                  disabled={readOnly || monitoringBusy}
+                  onChange={(event) => {
+                    setMonitoringDraft({
+                      grafanaUrl,
+                      keyJobGlobs: event.target.value,
+                      alertHubJobGlobs,
+                    });
+                    setMonitoringMessage(null);
+                  }}
+                />
+                <small>
+                  {tr(
+                    "Через запятую, например: prometheus, alertmanager, vless_blackbox_*",
+                    "Comma-separated, for example: prometheus, alertmanager, vless_blackbox_*",
+                  )}
+                </small>
+              </label>
+              <label>
+                <span>{tr("Сервисы Alert Hub · job", "Alert Hub services · job")}</span>
+                <input
+                  value={alertHubJobGlobs}
+                  disabled={readOnly || monitoringBusy}
+                  onChange={(event) => {
+                    setMonitoringDraft({
+                      grafanaUrl,
+                      keyJobGlobs,
+                      alertHubJobGlobs: event.target.value,
+                    });
+                    setMonitoringMessage(null);
+                  }}
+                />
+                <small>
+                  {tr(
+                    "Через запятую, например: alert-hub-*",
+                    "Comma-separated, for example: alert-hub-*",
+                  )}
+                </small>
+              </label>
+            </div>
+            <div className="settings-actions">
+              <span>
+                <Icon symbol="i" />
+                {tr(
+                  "Разрешены буквы, цифры, . _ : / - и символ * как подстановка.",
+                  "Letters, digits, . _ : / - and * as a wildcard are allowed.",
+                )}
+              </span>
+              <button
+                className="button button--primary"
+                disabled={readOnly || monitoringBusy || !monitoringDirty}
+                onClick={() => void saveMonitoringSettings()}
+              >
+                {monitoringBusy
+                  ? tr("Сохраняем…", "Saving…")
+                  : tr("Сохранить мониторинг", "Save monitoring")}
+              </button>
+            </div>
+            {monitoringMessage && (
+              <div
+                className={`permission-message permission-message--${monitoringMessage.tone} settings-message`}
+                role={monitoringMessage.tone === "warning" ? "alert" : "status"}
+              >
+                <Icon symbol={monitoringMessage.tone === "success" ? "✓" : "!"} />
+                {monitoringMessage.text}
+              </div>
+            )}
           </Panel>
           <Panel
             className="danger-panel"
