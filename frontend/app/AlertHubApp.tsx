@@ -1,4 +1,4 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   createContext,
   FormEvent,
@@ -28,6 +28,12 @@ import {
   decodeApplicationServerKey,
   withPushTimeout,
 } from "./push";
+import { StatisticsOverview } from "./statistics/StatisticsOverview";
+import {
+  DEMO_STATISTICS_SNAPSHOT,
+  normalizeStatisticsSnapshot,
+  type StatisticsSnapshot,
+} from "./statistics/model";
 import {
   applyThemePreference,
   readThemePreference,
@@ -2143,6 +2149,47 @@ async function getJson(path: string, signal?: AbortSignal) {
   };
 }
 
+function useOverviewStatistics(demo: boolean): {
+  loading: boolean;
+  snapshot: StatisticsSnapshot | null;
+} {
+  const query = useQuery({
+    queryKey: ["overview-statistics", memorySessionId ?? "unpartitioned", "7d"],
+    queryFn: async ({ signal }) => {
+      const controller = new AbortController();
+      const forwardAbort = () => controller.abort(signal.reason);
+      if (signal.aborted) forwardAbort();
+      else signal.addEventListener("abort", forwardAbort, { once: true });
+      const timer = window.setTimeout(() => controller.abort(), 6_500);
+      try {
+        const response = await getJson("/metrics/statistics?window=7d", controller.signal);
+        const snapshot = normalizeStatisticsSnapshot(response.payload);
+        if (!snapshot) {
+          throw new Error(
+            tr(
+              "API вернул некорректный снимок статистики.",
+              "The API returned an invalid statistics snapshot.",
+            ),
+          );
+        }
+        return snapshot;
+      } finally {
+        window.clearTimeout(timer);
+        signal.removeEventListener("abort", forwardAbort);
+      }
+    },
+    enabled: !demo,
+    networkMode: "always",
+    refetchInterval: demo ? false : 5 * 60_000,
+    staleTime: 60_000,
+  });
+  if (demo) return { loading: false, snapshot: DEMO_STATISTICS_SNAPSHOT };
+  return {
+    loading: query.isPending && !query.data,
+    snapshot: query.data ?? null,
+  };
+}
+
 async function getChecksJson(path: string, signal: AbortSignal): Promise<ChecksRequestResult> {
   const response = await apiFetch(path, { cache: "no-store", signal });
   const payload = (await response.json().catch(() => ({}))) as unknown;
@@ -4067,7 +4114,10 @@ function AlertHubRuntime() {
   const refreshAll = async () => {
     if (auth.state.status === "offline") await auth.recover();
     refreshChecks();
-    await refresh();
+    await Promise.all([
+      refresh(),
+      queryClient.invalidateQueries({ queryKey: ["overview-statistics"] }),
+    ]);
   };
   const openNotifications = () => {
     if (!readOnly) setNotificationModal(true);
@@ -4511,6 +4561,19 @@ function PrometheusEvidenceGrid({ data }: { data: HubData }) {
   );
 }
 
+function OverviewStatisticsBlock({ grafanaUrl }: { grafanaUrl: string | null }) {
+  const { language } = useContext(LanguageContext);
+  const statistics = useOverviewStatistics(demoModeActive);
+  return (
+    <StatisticsOverview
+      snapshot={statistics.snapshot}
+      loading={statistics.loading}
+      language={language}
+      grafanaUrl={grafanaUrl}
+    />
+  );
+}
+
 function OverviewPage({
   data,
   checks,
@@ -4656,6 +4719,8 @@ function OverviewPage({
           }
         />
       </div>
+
+      <OverviewStatisticsBlock grafanaUrl={data.summary.grafanaUrl} />
 
       <PrometheusEvidenceGrid data={data} />
 

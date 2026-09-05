@@ -27,6 +27,7 @@
     "/api/v1/devices/{device_id}/sessions": ["delete"],
     "/api/v1/metrics/reachability": ["get"],
     "/api/v1/metrics/queries/{query_name}": ["get"],
+    "/api/v1/metrics/statistics": ["get"],
     "/api/v1/metrics/summary": ["get"],
     "/api/v1/prometheus-datasources": ["get", "post"],
     "/api/v1/prometheus-datasources/{datasource_id}": ["patch", "delete"],

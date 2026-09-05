@@ -86,6 +86,7 @@ class Incident(Base):
     __table_args__ = (
         UniqueConstraint("source_id", "fingerprint", name="uq_incidents_source_fingerprint"),
         Index("ix_incidents_status_last_event", "status", "last_event_at"),
+        Index("ix_incidents_status_severity", "status", "severity"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -118,7 +119,18 @@ class IncidentEvent(Base):
     __table_args__ = (
         UniqueConstraint("origin_node_id", "origin_seq", name="uq_incident_events_origin_seq"),
         UniqueConstraint("event_key", name="uq_incident_events_event_key"),
-        Index("ix_incident_events_incident_time", "incident_id", "occurred_at"),
+        Index(
+            "ix_incident_events_incident_time_key",
+            "incident_id",
+            "occurred_at",
+            "event_key",
+        ),
+        Index(
+            "ix_incident_events_type_time_incident",
+            "event_type",
+            "occurred_at",
+            "incident_id",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -233,6 +245,12 @@ class ClusterEvent(Base):
     __table_args__ = (
         UniqueConstraint("origin_node_id", "origin_seq", name="uq_cluster_events_origin_seq"),
         Index("ix_cluster_events_origin_cursor", "origin_node_id", "origin_seq"),
+        Index(
+            "ix_cluster_events_type_operation_time",
+            "entity_type",
+            "operation",
+            "occurred_at",
+        ),
     )
 
     event_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)

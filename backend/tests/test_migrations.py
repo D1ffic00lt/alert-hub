@@ -72,12 +72,53 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
     assert application_settings_columns["grafana_url"]["nullable"] is True
     assert application_settings_columns["key_job_globs"]["nullable"] is False
     assert application_settings_columns["alert_hub_job_globs"]["nullable"] is False
+    incident_indexes = {index["name"]: index for index in inspect(engine).get_indexes("incidents")}
+    assert incident_indexes["ix_incidents_status_severity"]["column_names"] == [
+        "status",
+        "severity",
+    ]
+    incident_event_indexes = {
+        index["name"]: index for index in inspect(engine).get_indexes("incident_events")
+    }
+    assert incident_event_indexes["ix_incident_events_incident_time_key"]["column_names"] == [
+        "incident_id",
+        "occurred_at",
+        "event_key",
+    ]
+    assert "ix_incident_events_incident_time" not in incident_event_indexes
+    assert incident_event_indexes["ix_incident_events_type_time_incident"]["column_names"] == [
+        "event_type",
+        "occurred_at",
+        "incident_id",
+    ]
+    cluster_event_indexes = {
+        index["name"]: index for index in inspect(engine).get_indexes("cluster_events")
+    }
+    assert cluster_event_indexes["ix_cluster_events_type_operation_time"]["column_names"] == [
+        "entity_type",
+        "operation",
+        "occurred_at",
+    ]
 
     command.downgrade(config, "0001_initial")
     downgraded_columns = {
         column["name"] for column in inspect(engine).get_columns("push_subscriptions")
     }
     assert "session_id" not in downgraded_columns
+    downgraded_incident_indexes = {
+        index["name"] for index in inspect(engine).get_indexes("incident_events")
+    }
+    downgraded_projection_indexes = {
+        index["name"] for index in inspect(engine).get_indexes("incidents")
+    }
+    downgraded_cluster_indexes = {
+        index["name"] for index in inspect(engine).get_indexes("cluster_events")
+    }
+    assert "ix_incident_events_type_time_incident" not in downgraded_incident_indexes
+    assert "ix_incident_events_incident_time_key" not in downgraded_incident_indexes
+    assert "ix_incident_events_incident_time" in downgraded_incident_indexes
+    assert "ix_incidents_status_severity" not in downgraded_projection_indexes
+    assert "ix_cluster_events_type_operation_time" not in downgraded_cluster_indexes
     command.upgrade(config, "head")
 
     command.downgrade(config, "base")

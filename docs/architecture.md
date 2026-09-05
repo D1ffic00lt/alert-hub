@@ -8,6 +8,10 @@ visualization surface. A replicated, validated Grafana URL supplies an authentic
 credential or query surface. Administrators can select bounded `job` globs for named `up` queries;
 the server constructs PromQL and never accepts browser-authored PromQL. Each Alert Hub node owns a
 local SQLite database and is intended to remain useful when peers are unreachable.
+The overview can aggregate bounded `24h`, `7d`, or `30d` incident and delivery history from that
+node-local replicated append-only event history, with current-active counters from the incident
+projection. This remains an eventually consistent operational summary; Prometheus and Grafana
+continue to own detailed infrastructure time-series.
 
 ```mermaid
 flowchart LR
@@ -118,7 +122,7 @@ branding, Web Push/Telegram headings, and SMTP subjects/sender display names.
 
 ## Event and consistency model
 
-The target cluster has no write quorum. Every node assigns an immutable `(origin_node_id, origin_seq)` to append-only cluster events. Peers exchange vector cursors and apply events idempotently. Incident history is never overwritten; current state is a deterministic projection, with `event_id` as the final tie-breaker.
+The target cluster has no write quorum. Every node assigns an immutable `(origin_node_id, origin_seq)` to append-only cluster events. Peers exchange vector cursors and apply events idempotently. Incident history is never overwritten; current state is a deterministic projection, with `event_id` as the final tie-breaker. The statistics read model orders lifecycle history by `(occurred_at, event_key)` so its summaries remain stable across replicas.
 
 The priority is:
 

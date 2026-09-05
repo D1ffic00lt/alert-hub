@@ -208,9 +208,32 @@ The backend validates it, rejects embedded credentials, and returns it in the au
 `GET /api/v1/metrics/summary` response. Alert Hub does not proxy Grafana or turn that link into an
 arbitrary-query surface.
 
+`GET /api/v1/metrics/statistics` supplies the overview's bounded operational-history block. The
+server accepts only the fixed windows `24h`, `7d`, and `30d`; it builds incident cohorts from the
+append-only `IncidentEvent` lifecycle and delivery-attempt outcomes from original replicated
+`ClusterEvent` receipt history. Historical counts and durations come from those append-only events.
+Current active counters use the mutable incident projection; missing event metadata falls back to
+the current incident, while source and channel display fields use current configuration. The
+response includes fixed buckets, current incident totals, response/resolution durations, severity
+and source counts, and per-channel delivery outcomes. Source and channel rankings are limited to the
+five most active entries. It is an eventually consistent view of the node's replicated Alert Hub
+history, not a cluster quorum read. During a partition, another node can temporarily show a
+different newest bucket without preventing local reads or actions.
+Composite temporal indexes restrict both history scans to the selected window, and rows are consumed
+in bounded batches. A request fails with `503` rather than returning partial statistics when a
+window contains more than 100,000 lifecycle events, 20,000 incidents with lifecycle activity, or
+100,000 delivery receipts; select a shorter window or reduce event volume before retrying. Each
+application process keeps completed snapshots fresh for 30 seconds and may serve one for at most 60
+seconds while another request refreshes it or a refresh fails. Refresh followers never wait for an
+in-progress refresh. Worker processes refresh independently, so this does not introduce a shared
+coordinator.
+
 HTTPS and public addresses are required by default. Set `ALLOW_HTTP_MONITORING_URLS=true` and `ALLOW_PRIVATE_MONITORING_URLS=true` only for an intentional private HTTP monitoring network. Requests use finite connect/read/write/pool and query timeouts, reject redirects, cap response bytes/samples, ignore proxy environment variables, and repeat DNS/address validation immediately before sending. Keep an egress firewall allowlist because application checks cannot eliminate every DNS race.
 
-Alert Hub does not copy complete time-series into SQLite. Automated coverage uses mocked Prometheus responses; configure and test the actual regional topology separately.
+Alert Hub does not copy complete Prometheus time-series into SQLite. The statistics block aggregates
+Alert Hub's own append-only incident and delivery history; detailed infrastructure series remain in
+Prometheus and Grafana. Automated coverage uses mocked Prometheus responses; configure and test the
+actual regional topology separately.
 
 Join the application to an existing monitoring Docker network only with the optional Compose overlay, or use an explicitly allowed private URL. Never recreate the monitoring stack and never make Prometheus public to simplify integration.
 
@@ -219,9 +242,9 @@ Join the application to an existing monitoring Docker network only with the opti
 Checks is not another webhook source and does not appear in the Sources wizard. An external,
 operator-managed executor publishes the fixed `synthetic_check_*` gauges to Prometheus; Alert Hub
 queries all enabled Prometheus datasources at one evaluation time and normalizes their results.
-There is no scheduler, executor configuration, credential store, subscription importer, or prober
-inside Alert Hub. Removing every Checks metric, leaving the feature disabled, or omitting Grafana
-must not affect event intake or incident handling.
+There is no Checks-specific scheduler, executor configuration, executor credential store,
+subscription importer, or prober inside Alert Hub. Removing every Checks metric, leaving the feature
+disabled, or omitting Grafana must not affect event intake or incident handling.
 
 For a minimal result, publish exactly one stable public identifier on both required metrics:
 
