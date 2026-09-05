@@ -3,11 +3,12 @@
 Sources are configured through the authenticated UI/API and receive a random bearer token exactly once. Alert Hub stores only a keyed hash. Losing the token requires rotation; it cannot be read back from SQLite.
 
 The repository implements Alertmanager, normalized generic JSON, and heartbeat intake, plus
-backend-owned named Prometheus datasource queries for regional reachability. Administrators may
-select validated `job` globs for the two `up` summaries, but Grafana-specific payload adapters and
-arbitrary browser-authored PromQL are not implemented. Source adapters never
-execute source-provided code or interpolation expressions. SMTP notification templates are a
-separate allowlisted-placeholder feature described in [operations](operations.md#smtp-notification-templates).
+backend-owned named Prometheus datasource queries for regional reachability and the optional Checks
+read model. Administrators may select validated `job` globs for the two `up` summaries, but
+Grafana-specific payload adapters and arbitrary browser-authored PromQL are not implemented. Source
+adapters never execute source-provided code or interpolation expressions. SMTP notification
+templates are a separate allowlisted-placeholder feature described in
+[operations](operations.md#smtp-notification-templates).
 
 ## UI quick start
 
@@ -210,19 +211,21 @@ arbitrary-query surface.
 `GET /api/v1/metrics/statistics` supplies the overview's bounded operational-history block. The
 server accepts only the fixed windows `24h`, `7d`, and `30d`; it builds incident cohorts from the
 append-only `IncidentEvent` lifecycle and delivery-attempt outcomes from original replicated
-`ClusterEvent` receipt history. Only current active counters use the mutable incident projection.
-The response includes fixed buckets, current incident totals, response/resolution durations,
-severity and source counts, and per-channel delivery outcomes. Source and channel rankings are
-limited to the five most active entries. It is an eventually consistent view of the node's
-replicated Alert Hub history, not a cluster quorum read. During a partition, another node can
-temporarily show a different newest bucket without preventing local reads or actions.
+`ClusterEvent` receipt history. Historical counts and durations come from those append-only events.
+Current active counters use the mutable incident projection; missing event metadata falls back to
+the current incident, while source and channel display fields use current configuration. The
+response includes fixed buckets, current incident totals, response/resolution durations, severity
+and source counts, and per-channel delivery outcomes. Source and channel rankings are limited to the
+five most active entries. It is an eventually consistent view of the node's replicated Alert Hub
+history, not a cluster quorum read. During a partition, another node can temporarily show a
+different newest bucket without preventing local reads or actions.
 Composite temporal indexes restrict both history scans to the selected window, and rows are consumed
 in bounded batches. A request fails with `503` rather than returning partial statistics when a
 window contains more than 100,000 lifecycle events, 20,000 incidents with lifecycle activity, or
 100,000 delivery receipts; select a shorter window or reduce event volume before retrying. Each
 application process keeps completed snapshots fresh for 30 seconds and may serve one for at most 60
-seconds while another request refreshes it or a refresh fails. Refresh followers never wait on an
-in-process lock. Worker processes refresh independently, so this does not introduce a shared
+seconds while another request refreshes it or a refresh fails. Refresh followers never wait for an
+in-progress refresh. Worker processes refresh independently, so this does not introduce a shared
 coordinator.
 
 HTTPS and public addresses are required by default. Set `ALLOW_HTTP_MONITORING_URLS=true` and `ALLOW_PRIVATE_MONITORING_URLS=true` only for an intentional private HTTP monitoring network. Requests use finite connect/read/write/pool and query timeouts, reject redirects, cap response bytes/samples, ignore proxy environment variables, and repeat DNS/address validation immediately before sending. Keep an egress firewall allowlist because application checks cannot eliminate every DNS race.
@@ -233,6 +236,52 @@ Prometheus and Grafana. Automated coverage uses mocked Prometheus responses; con
 actual regional topology separately.
 
 Join the application to an existing monitoring Docker network only with the optional Compose overlay, or use an explicitly allowed private URL. Never recreate the monitoring stack and never make Prometheus public to simplify integration.
+
+## Checks metric integration
+
+Checks is not another webhook source and does not appear in the Sources wizard. An external,
+operator-managed executor publishes the fixed `synthetic_check_*` gauges to Prometheus; Alert Hub
+queries all enabled Prometheus datasources at one evaluation time and normalizes their results.
+There is no Checks-specific scheduler, executor configuration, executor credential store,
+subscription importer, or prober inside Alert Hub. Removing every Checks metric, leaving the feature
+disabled, or omitting Grafana must not affect event intake or incident handling.
+
+For a minimal result, publish exactly one stable public identifier on both required metrics:
+
+```prometheus
+synthetic_check_status{check_id="billing-smoke"} 1
+synthetic_check_last_run_timestamp_seconds{check_id="billing-smoke"} 1788609600
+```
+
+For independent observations, add stable logical `source` values to the same Check rather than
+encoding scrape endpoints or infrastructure addresses:
+
+```prometheus
+synthetic_check_info{check_id="billing-smoke",check_name="Billing smoke",group="customer-paths",source="edge-a",target="Primary billing",scenario="invoice",variant="standard"} 1
+synthetic_check_info{check_id="billing-smoke",check_name="Billing smoke",group="customer-paths",source="edge-b",target="Primary billing",scenario="invoice",variant="standard"} 1
+synthetic_check_status{check_id="billing-smoke",source="edge-a",scenario="invoice",variant="standard"} 1
+synthetic_check_status{check_id="billing-smoke",source="edge-b",scenario="invoice",variant="standard"} 0
+synthetic_check_last_run_timestamp_seconds{check_id="billing-smoke",source="edge-a",scenario="invoice",variant="standard"} 1788609600
+synthetic_check_last_run_timestamp_seconds{check_id="billing-smoke",source="edge-b",scenario="invoice",variant="standard"} 1788609598
+```
+
+The names in these examples are safe aliases and the timestamps are fixed documentation values;
+they are never injected as authenticated UI fallback data. Do not publish real URLs, IP addresses,
+tenant/account names, tokens, credentials, protocol identifiers, or subscription data in any Check
+label. Replicas of one executor location use the same logical `source`; missing `source` means one
+default source and is never inferred from `instance` or `job`. Keep `check_id` unique across all
+enabled datasources. Publish `synthetic_check_info` for expected tuples so a never-run or vanished
+result remains observable; without it, restart loses inventory that no longer exists in Prometheus.
+
+When the executor uses other metric names, translate them before Alert Hub with reviewed recording
+rules or executor configuration. Alert Hub does not accept a metric name or PromQL from the browser.
+See [Checks operations](operations.md#checks) for the complete metric contract, aggregation order,
+cache/error behavior, settings, and cardinality limits.
+
+To relate an existing alert or incident, add the same safe `check_id` label to the alerting rule.
+Alert Hub links only an exact match inside the caller's existing authorization scope. A Check status
+does not create an incident, an alert without `check_id` is unchanged, and an active incident does
+not force a recovered Check to remain down.
 
 ## Adding a future adapter
 

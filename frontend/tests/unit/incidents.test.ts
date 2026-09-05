@@ -26,4 +26,55 @@ describe("incident snapshot merging", () => {
 
     expect(merged[0]?.events).toBe(incomingHistory);
   });
+
+  it("preserves detail-only related Checks when list polling returns a shorter summary", () => {
+    const history = [{ id: "event-1", type: "firing" }];
+    const [merged] = mergeIncidentSummariesWithHistory(
+      [
+        {
+          id: "incident-1",
+          events: [],
+          checkIds: ["label-check"],
+          checksRelationState: "available",
+        },
+      ],
+      [
+        {
+          id: "incident-1",
+          events: history,
+          checkIds: ["label-check", "timeline-check"],
+          checksRelationState: "available",
+        },
+      ],
+    );
+
+    expect(merged).toMatchObject({
+      events: history,
+      checkIds: ["label-check", "timeline-check"],
+      checksRelationState: "available",
+    });
+  });
+
+  it("does not retain related Checks when the incoming state disables relationships", () => {
+    const [merged] = mergeIncidentSummariesWithHistory(
+      [
+        {
+          id: "incident-1",
+          events: [],
+          checkIds: [],
+          checksRelationState: "disabled",
+        },
+      ],
+      [
+        {
+          id: "incident-1",
+          events: [],
+          checkIds: ["previous-check"],
+          checksRelationState: "available",
+        },
+      ],
+    );
+
+    expect(merged).toMatchObject({ checkIds: [], checksRelationState: "disabled" });
+  });
 });
