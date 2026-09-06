@@ -2624,8 +2624,8 @@ test("configures per-node API-down alerts and enables every selected node", asyn
   await page.locator(".sidebar__nav").getByRole("button", { name: "Кластер" }).click();
 
   await expect(page.getByRole("heading", { name: "Алерты о падении API" })).toBeVisible();
-  await expect(page.getByText("0/3 узлов под защитой")).toBeVisible();
   const alertPanel = page.locator(".cluster-api-alerts");
+  await expect(alertPanel.locator(".cluster-api-alerts__count")).toContainText("Включено: 0/3");
   const [panelHeaderBox, panelBodyBox, introBox, actionsBox] = await Promise.all([
     alertPanel.locator(".panel__header").boundingBox(),
     alertPanel.locator(".cluster-api-alerts__body").boundingBox(),
@@ -2640,35 +2640,44 @@ test("configures per-node API-down alerts and enables every selected node", asyn
   expect(actionsBox!.y).toBeGreaterThanOrEqual(introBox!.y + introBox!.height - 1);
 
   const deSwitch = page.getByRole("switch", { name: "Алерт о падении API для DE" });
-  await expect(deSwitch.locator(".toggle__state")).toHaveText("ВЫКЛ");
+  const deControl = deSwitch.locator("xpath=..");
+  await expect(deControl).toContainText("выключен");
   const offSwitchColor = await deSwitch.evaluate(
     (element) => window.getComputedStyle(element).backgroundColor,
   );
+  const offThumbTransform = await deSwitch
+    .locator(".toggle__thumb")
+    .evaluate((element) => window.getComputedStyle(element).transform);
   const switchBox = await deSwitch.boundingBox();
-  expect(switchBox?.width).toBeGreaterThanOrEqual(68);
+  expect(switchBox?.width).toBeGreaterThanOrEqual(44);
   await page.getByRole("button", { name: "Выбрать все" }).click();
   await expect(page.getByText("Выбрано: 3")).toBeVisible();
   await page.getByRole("button", { name: "Включить выбранным" }).click();
 
-  await expect(page.getByText("3/3 узлов под защитой")).toBeVisible();
+  await expect(alertPanel.locator(".cluster-api-alerts__count")).toContainText("Включено: 3/3");
   await expect(page.getByRole("switch")).toHaveCount(3);
   for (const control of await page.getByRole("switch").all()) {
     await expect(control).toHaveAttribute("aria-checked", "true");
-    await expect(control.locator(".toggle__state")).toHaveText("ВКЛ");
   }
+  await expect(deControl).toContainText("включён");
+  await expect(deSwitch).toHaveCSS("background-color", "rgb(34, 197, 94)");
   const onSwitchColor = await deSwitch.evaluate(
     (element) => window.getComputedStyle(element).backgroundColor,
   );
+  const onThumbTransform = await deSwitch
+    .locator(".toggle__thumb")
+    .evaluate((element) => window.getComputedStyle(element).transform);
   expect(onSwitchColor).not.toBe(offSwitchColor);
+  expect(onThumbTransform).not.toBe(offThumbTransform);
   expect(state.clusterApiAlertRequests?.[0]).toEqual({
     node_ids: ["ru", "nl", "de"],
     enabled: true,
   });
 
   await deSwitch.click();
-  await expect(page.getByText("2/3 узлов под защитой")).toBeVisible();
+  await expect(alertPanel.locator(".cluster-api-alerts__count")).toContainText("Включено: 2/3");
   await expect(deSwitch).toHaveAttribute("aria-checked", "false");
-  await expect(deSwitch.locator(".toggle__state")).toHaveText("ВЫКЛ");
+  await expect(deControl).toContainText("выключен");
   expect(state.clusterApiAlertRequests?.[1]).toEqual({ node_ids: ["de"], enabled: false });
 
   await page.setViewportSize({ width: 390, height: 844 });
@@ -2685,6 +2694,38 @@ test("configures per-node API-down alerts and enables every selected node", asyn
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
     true,
   );
+
+  for (const visualCase of [
+    { theme: "dark", width: 1440, height: 900 },
+    { theme: "light", width: 1440, height: 900 },
+    { theme: "dark", width: 820, height: 1000 },
+    { theme: "light", width: 820, height: 1000 },
+    { theme: "dark", width: 390, height: 844 },
+    { theme: "light", width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize({ width: visualCase.width, height: visualCase.height });
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.theme = theme;
+    }, visualCase.theme);
+    const layout = await alertPanel.evaluate((panel) => {
+      const bounds = panel.getBoundingClientRect();
+      const intro = panel.querySelector<HTMLElement>(".cluster-api-alerts__intro > p");
+      const header = panel.querySelector<HTMLElement>(".panel__header");
+      return {
+        headerBackgroundImage: header ? window.getComputedStyle(header).backgroundImage : "",
+        introFontSize: intro ? Number.parseFloat(window.getComputedStyle(intro).fontSize) : 0,
+        noHorizontalOverflow: document.documentElement.scrollWidth <= window.innerWidth,
+        panelLeft: bounds.left,
+        panelRight: bounds.right,
+        viewportWidth: window.innerWidth,
+      };
+    });
+    expect(layout.noHorizontalOverflow).toBe(true);
+    expect(layout.panelLeft).toBeGreaterThanOrEqual(0);
+    expect(layout.panelRight).toBeLessThanOrEqual(layout.viewportWidth + 1);
+    expect(layout.headerBackgroundImage).toBe("none");
+    expect(layout.introFontSize).toBeGreaterThanOrEqual(14);
+  }
 });
 
 test("rebases pure audit prepends and safely resets for an interior insertion", async ({
@@ -2932,7 +2973,7 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
   });
   expect(authVisuals).toMatchObject({
     signInTabBackground: "rgb(35, 35, 39)",
-    submitBackground: "rgb(45, 212, 191)",
+    submitBackground: "rgb(228, 228, 231)",
   });
   expect(authVisuals.nodeTopOffset).toBeLessThan(1);
   expect(authVisuals.brandLanguageTopOffset).toBeLessThan(1);
