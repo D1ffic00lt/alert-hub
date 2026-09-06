@@ -188,34 +188,53 @@ fi
 compose stop alert-hub
 api_down=false
 for _attempt in $(seq 1 20); do
-  root_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  root_status=$(curl --silent --dump-header "${smoke_root}/api-down.headers" \
+    --output "${smoke_root}/api-down.html" --write-out '%{http_code}' \
     --max-time 3 "${base_url}/" || true)
   ready_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
     --max-time 3 "${base_url}/health/ready" || true)
-  if [[ ${root_status} == 503 && ${ready_status} != 200 ]]; then
+  if [[ ${root_status} == 503 && ${ready_status} != 200 ]] &&
+    grep -F '503 Service Temporarily Unavailable' \
+      "${smoke_root}/api-down.headers" >/dev/null &&
+    grep -Fi 'Content-Type: text/html' \
+      "${smoke_root}/api-down.headers" >/dev/null &&
+    grep -F 'data-service-unavailable' \
+      "${smoke_root}/api-down.html" >/dev/null &&
+    grep -F 'API offline · HTTP 503' \
+      "${smoke_root}/api-down.html" >/dev/null; then
     api_down=true
     break
   fi
   sleep 1
 done
 [[ ${api_down} == true ]] || {
-  printf 'Web continued serving a ready UI after API stopped\n' >&2
+  printf 'Web did not serve the expected 503 outage page after API stopped\n' >&2
   exit 1
 }
 [[ $(docker container inspect "${web_container}" --format '{{.State.Running}}') == true ]]
-curl --silent --show-error --max-time 3 --dump-header "${smoke_root}/api-down.headers" \
-  --output "${smoke_root}/api-down.html" "${base_url}/" || true
-grep -F '503 Service Temporarily Unavailable' "${smoke_root}/api-down.headers" >/dev/null
-grep -Fi 'Content-Type: text/html' "${smoke_root}/api-down.headers" >/dev/null
-grep -F 'data-service-unavailable' "${smoke_root}/api-down.html" >/dev/null
-grep -F 'API offline · HTTP 503' "${smoke_root}/api-down.html" >/dev/null
 
 # API clients retain the small JSON fallback and never receive an HTML shell.
-curl --silent --show-error --max-time 3 --dump-header "${smoke_root}/api-down-api.headers" \
-  --output "${smoke_root}/api-down-api.json" "${base_url}/api/v1/incidents" || true
-grep -F '503 Service Temporarily Unavailable' "${smoke_root}/api-down-api.headers" >/dev/null
-grep -Fi 'Content-Type: application/json' "${smoke_root}/api-down-api.headers" >/dev/null
-grep -F '"detail":"API unavailable"' "${smoke_root}/api-down-api.json" >/dev/null
+api_fallback=false
+for _attempt in $(seq 1 20); do
+  api_status=$(curl --silent --dump-header "${smoke_root}/api-down-api.headers" \
+    --output "${smoke_root}/api-down-api.json" --write-out '%{http_code}' \
+    --max-time 3 "${base_url}/api/v1/incidents" || true)
+  if [[ ${api_status} == 503 ]] &&
+    grep -F '503 Service Temporarily Unavailable' \
+      "${smoke_root}/api-down-api.headers" >/dev/null &&
+    grep -Fi 'Content-Type: application/json' \
+      "${smoke_root}/api-down-api.headers" >/dev/null &&
+    grep -F '"detail":"API unavailable"' \
+      "${smoke_root}/api-down-api.json" >/dev/null; then
+    api_fallback=true
+    break
+  fi
+  sleep 1
+done
+[[ ${api_fallback} == true ]] || {
+  printf 'Web did not serve the expected JSON 503 fallback after API stopped\n' >&2
+  exit 1
+}
 
 compose start alert-hub
 recovered=false
