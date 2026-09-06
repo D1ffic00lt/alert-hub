@@ -8247,22 +8247,25 @@ function ClusterPage({
         eyebrow={tr("Контроль доступности", "Availability monitoring")}
         title={tr("Алерты о падении API", "API-down alerts")}
         action={
-          <span
-            className={`cluster-api-alerts__count ${nodes.length > 0 && enabledApiAlerts === nodes.length ? "cluster-api-alerts__count--complete" : ""}`}
-          >
-            <span aria-hidden="true" />
+          <span className="cluster-api-alerts__count">
+            <StatusDot
+              health={
+                nodes.length > 0 && enabledApiAlerts === nodes.length
+                  ? "healthy"
+                  : enabledApiAlerts > 0
+                    ? "degraded"
+                    : "unknown"
+              }
+            />
+            {tr("Включено", "Enabled")}:{" "}
             <b>
               {enabledApiAlerts}/{nodes.length}
-            </b>{" "}
-            {tr("узлов под защитой", "nodes protected")}
+            </b>
           </span>
         }
       >
         <div className="cluster-api-alerts__body">
           <div className="cluster-api-alerts__intro">
-            <span className="cluster-api-alerts__icon">
-              <Icon symbol="bell" />
-            </span>
             <p>
               {tr(
                 "После трёх подряд ошибок живой peer создаст critical-инцидент и отправит его по обычным маршрутам уведомлений. Для мониторинга нужен хотя бы один другой настроенный узел.",
@@ -8306,7 +8309,7 @@ function ClusterPage({
                   : tr("Включить выбранным", "Enable selected")}
               </button>
               <button
-                className="button button--quiet button--small button--deactivate"
+                className="button button--quiet button--small"
                 type="button"
                 disabled={readOnly || alertBusy || !selectedNodes.length}
                 onClick={() =>
@@ -8750,12 +8753,7 @@ function Toggle({
       onClick={() => onChange(!checked)}
       disabled={disabled}
     >
-      <span className="toggle__state" aria-hidden="true">
-        {checked ? tr("ВКЛ", "ON") : tr("ВЫКЛ", "OFF")}
-      </span>
-      <span className="toggle__thumb" aria-hidden="true">
-        {checked ? "✓" : "–"}
-      </span>
+      <span className="toggle__thumb" aria-hidden="true" />
     </button>
   );
 }
