@@ -2624,28 +2624,67 @@ test("configures per-node API-down alerts and enables every selected node", asyn
   await page.locator(".sidebar__nav").getByRole("button", { name: "Кластер" }).click();
 
   await expect(page.getByRole("heading", { name: "Алерты о падении API" })).toBeVisible();
-  await expect(page.getByText("Включено: 0/3")).toBeVisible();
+  await expect(page.getByText("0/3 узлов под защитой")).toBeVisible();
+  const alertPanel = page.locator(".cluster-api-alerts");
+  const [panelHeaderBox, panelBodyBox, introBox, actionsBox] = await Promise.all([
+    alertPanel.locator(".panel__header").boundingBox(),
+    alertPanel.locator(".cluster-api-alerts__body").boundingBox(),
+    alertPanel.locator(".cluster-api-alerts__intro").boundingBox(),
+    alertPanel.locator(".cluster-api-alerts__actions").boundingBox(),
+  ]);
+  expect(panelHeaderBox).not.toBeNull();
+  expect(panelBodyBox).not.toBeNull();
+  expect(introBox).not.toBeNull();
+  expect(actionsBox).not.toBeNull();
+  expect(panelBodyBox!.y).toBeGreaterThanOrEqual(panelHeaderBox!.y + panelHeaderBox!.height - 1);
+  expect(actionsBox!.y).toBeGreaterThanOrEqual(introBox!.y + introBox!.height - 1);
+
+  const deSwitch = page.getByRole("switch", { name: "Алерт о падении API для DE" });
+  await expect(deSwitch.locator(".toggle__state")).toHaveText("ВЫКЛ");
+  const offSwitchColor = await deSwitch.evaluate(
+    (element) => window.getComputedStyle(element).backgroundColor,
+  );
+  const switchBox = await deSwitch.boundingBox();
+  expect(switchBox?.width).toBeGreaterThanOrEqual(68);
   await page.getByRole("button", { name: "Выбрать все" }).click();
   await expect(page.getByText("Выбрано: 3")).toBeVisible();
   await page.getByRole("button", { name: "Включить выбранным" }).click();
 
-  await expect(page.getByText("Включено: 3/3")).toBeVisible();
+  await expect(page.getByText("3/3 узлов под защитой")).toBeVisible();
   await expect(page.getByRole("switch")).toHaveCount(3);
   for (const control of await page.getByRole("switch").all()) {
     await expect(control).toHaveAttribute("aria-checked", "true");
+    await expect(control.locator(".toggle__state")).toHaveText("ВКЛ");
   }
+  const onSwitchColor = await deSwitch.evaluate(
+    (element) => window.getComputedStyle(element).backgroundColor,
+  );
+  expect(onSwitchColor).not.toBe(offSwitchColor);
   expect(state.clusterApiAlertRequests?.[0]).toEqual({
     node_ids: ["ru", "nl", "de"],
     enabled: true,
   });
 
-  await page.getByRole("switch", { name: "Алерт о падении API для DE" }).click();
-  await expect(page.getByText("Включено: 2/3")).toBeVisible();
-  await expect(page.getByRole("switch", { name: "Алерт о падении API для DE" })).toHaveAttribute(
-    "aria-checked",
-    "false",
-  );
+  await deSwitch.click();
+  await expect(page.getByText("2/3 узлов под защитой")).toBeVisible();
+  await expect(deSwitch).toHaveAttribute("aria-checked", "false");
+  await expect(deSwitch.locator(".toggle__state")).toHaveText("ВЫКЛ");
   expect(state.clusterApiAlertRequests?.[1]).toEqual({ node_ids: ["de"], enabled: false });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(alertPanel).toBeVisible();
+  const [mobileIntroBox, mobileActionsBox] = await Promise.all([
+    alertPanel.locator(".cluster-api-alerts__intro").boundingBox(),
+    alertPanel.locator(".cluster-api-alerts__actions").boundingBox(),
+  ]);
+  expect(mobileIntroBox).not.toBeNull();
+  expect(mobileActionsBox).not.toBeNull();
+  expect(mobileActionsBox!.y).toBeGreaterThanOrEqual(
+    mobileIntroBox!.y + mobileIntroBox!.height - 1,
+  );
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
 });
 
 test("rebases pure audit prepends and safely resets for an interior insertion", async ({
@@ -2893,7 +2932,7 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
   });
   expect(authVisuals).toMatchObject({
     signInTabBackground: "rgb(35, 35, 39)",
-    submitBackground: "rgb(228, 228, 231)",
+    submitBackground: "rgb(45, 212, 191)",
   });
   expect(authVisuals.nodeTopOffset).toBeLessThan(1);
   expect(authVisuals.brandLanguageTopOffset).toBeLessThan(1);
