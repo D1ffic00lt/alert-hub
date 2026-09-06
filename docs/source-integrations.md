@@ -204,7 +204,8 @@ provide metric names, operators, functions, or other PromQL syntax.
 Set the optional Grafana HTTPS dashboard link under **Settings** when operators should get a
 detailed-view link. `GRAFANA_URL` remains an initial fallback for installations that configure it
 before a cluster setting has been saved.
-The backend validates it, rejects embedded credentials, and returns it in the authenticated
+The backend requires a concrete `/d/<uid>[/slug]` or `d-solo` view for new values, rejects embedded
+credentials, and returns it in the authenticated
 `GET /api/v1/metrics/summary` response. Alert Hub does not proxy Grafana or turn that link into an
 arbitrary-query surface.
 
@@ -268,10 +269,21 @@ synthetic_check_last_run_timestamp_seconds{check_id="billing-smoke",source="edge
 The names in these examples are safe aliases and the timestamps are fixed documentation values;
 they are never injected as authenticated UI fallback data. Do not publish real URLs, IP addresses,
 tenant/account names, tokens, credentials, protocol identifiers, or subscription data in any Check
-label. Replicas of one executor location use the same logical `source`; missing `source` means one
-default source and is never inferred from `instance` or `job`. Keep `check_id` unique across all
-enabled datasources. Publish `synthetic_check_info` for expected tuples so a never-run or vanished
-result remains observable; without it, restart loses inventory that no longer exists in Prometheus.
+label. Replicas of one executor location use the same logical `source`. In the minimal contract,
+missing `source` means one private default source and is never inferred from Prometheus scrape
+`instance` or `job`. In the richer xray-e2e-prober contract, the explicitly exported `instance_id`
+then `source_id` are safe fallback identities; distinct instance IDs never collapse. Its info
+metadata is joined to state/status/last-run/target/assertion series before `mode` and `target_set_id`
+become Scenario and Variant. `entry_name` is the safe display-name fallback. Keep `check_id` unique
+across all enabled datasources. Publish `synthetic_check_info` for expected tuples so a never-run or
+vanished result remains observable; without it, restart loses inventory that no longer exists in
+Prometheus.
+
+The richer projection also supports one-hot `synthetic_check_state`, target-specific
+`synthetic_check_target_success`/`synthetic_check_target_state` plus duration/TTFB, separate
+`synthetic_check_egress_state`/`synthetic_check_egress_match` rows per `assertion_id`, and the
+cumulative allowlisted `synthetic_check_errors_total{reason}` diagnostics. Alert Hub never returns
+observed/expected egress addresses or free-form executor error text.
 
 When the executor uses other metric names, translate them before Alert Hub with reviewed recording
 rules or executor configuration. Alert Hub does not accept a metric name or PromQL from the browser.

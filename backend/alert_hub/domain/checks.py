@@ -7,6 +7,8 @@ from datetime import datetime
 from typing import Literal
 
 CheckStatus = Literal["up", "degraded", "down", "stale", "unknown"]
+CheckResultState = Literal["unknown", "success", "failure", "error", "stale", "disabled"]
+CheckAssertionState = Literal["match", "mismatch", "unknown", "error", "stale", "disabled"]
 
 # These values are deliberately private to the domain model. API serializers turn them into
 # ``null`` so a minimal check does not expose implementation-only dimensions to operators.
@@ -36,6 +38,25 @@ class CheckAssertion:
     key: str
     success: bool | None
     status_reason: str | None = None
+    name: str | None = None
+    state: CheckAssertionState | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CheckTarget:
+    target_id: str
+    name: str
+    state: CheckResultState | None
+    success: bool | None
+    duration_seconds: float | None = None
+    ttfb_seconds: float | None = None
+    status_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CheckErrorReason:
+    reason: str
+    count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +71,10 @@ class NormalizedCheckResult:
     assertions: tuple[CheckAssertion, ...] = ()
     diagnostics: tuple[str, ...] = ()
     known_via_info: bool = False
+    provisional_info_dimensions: bool = False
+    state: CheckResultState | None = None
+    targets: tuple[CheckTarget, ...] = ()
+    error_reasons: tuple[CheckErrorReason, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +92,9 @@ class CheckResultView:
     stale: bool
     data_incomplete: bool
     diagnostics: tuple[str, ...]
+    state: CheckResultState | None = None
+    targets: tuple[CheckTarget, ...] = ()
+    error_reasons: tuple[CheckErrorReason, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +142,15 @@ def _result_view(
         for diagnostic in result.diagnostics
     )
     invalid_status = any(
-        diagnostic in {"invalid_status", "conflicting_status"} for diagnostic in result.diagnostics
+        diagnostic
+        in {
+            "invalid_status",
+            "conflicting_status",
+            "invalid_state",
+            "conflicting_state",
+            "conflicting_state_status",
+        }
+        for diagnostic in result.diagnostics
     )
     invalid_inventory = "invalid_info" in result.diagnostics
     incomplete_primary = any(
@@ -123,6 +159,9 @@ def _result_view(
             "missing_status",
             "invalid_status",
             "conflicting_status",
+            "invalid_state",
+            "conflicting_state",
+            "conflicting_state_status",
             "missing_timestamp",
             "invalid_timestamp",
             "conflicting_timestamp",
@@ -133,12 +172,29 @@ def _result_view(
     )
     if result.last_run_at is None:
         status: CheckStatus = "unknown"
-        reason = "invalid_data" if invalid_timestamp or invalid_inventory else "incomplete_data"
+        if result.state in {"unknown", "error", "disabled"} and not (
+            invalid_timestamp or invalid_status or invalid_inventory
+        ):
+            reason = f"executor_{result.state}"
+        else:
+            reason = (
+                "invalid_data"
+                if invalid_timestamp or invalid_status or invalid_inventory
+                else "incomplete_data"
+            )
     else:
         age = (now - result.last_run_at).total_seconds()
         if age > stale_after_seconds:
             status = "stale"
             reason = "expired_measurements"
+        elif result.state == "stale" and not (invalid_status or invalid_inventory):
+            status = "stale"
+            reason = "executor_stale"
+        elif result.state in {"unknown", "error", "disabled"} and not (
+            invalid_status or invalid_inventory
+        ):
+            status = "unknown"
+            reason = f"executor_{result.state}"
         elif result.success is None:
             status = "unknown"
             reason = "invalid_data" if invalid_status or invalid_inventory else "incomplete_data"
@@ -162,6 +218,9 @@ def _result_view(
         stale=status == "stale",
         data_incomplete=status == "unknown" or incomplete_primary,
         diagnostics=result.diagnostics,
+        state=result.state,
+        targets=result.targets,
+        error_reasons=result.error_reasons,
     )
 
 
@@ -309,7 +368,9 @@ def aggregate_check(
         for result in views
         if result.status == "up" and result.duration_seconds is not None
     ]
-    targets = tuple(sorted({result.target for result in views if result.target is not None}))
+    explicit_targets = {result.target for result in views if result.target is not None}
+    nested_targets = {target.name for result in views for target in result.targets}
+    targets = tuple(sorted({*explicit_targets, *nested_targets}))
     scenarios = tuple(
         sorted({result.key.scenario for result in views if result.key.scenario != DEFAULT_SCENARIO})
     )
@@ -317,7 +378,7 @@ def aggregate_check(
         *diagnostics,
         *(diagnostic for result in views for diagnostic in result.diagnostics),
     }
-    if len(targets) > 1:
+    if len(explicit_targets) > 1:
         diagnostic_values.add("conflicting_target")
     combined_diagnostics = tuple(sorted(diagnostic_values))
     overall_incomplete = (
@@ -330,7 +391,9 @@ def aggregate_check(
         check_id=check_id,
         name=name,
         group=group,
-        target=targets[0] if len(targets) == 1 else None,
+        target=next(iter(explicit_targets))
+        if len(explicit_targets) == 1
+        else (targets[0] if not explicit_targets and len(targets) == 1 else None),
         targets=targets,
         status=status,
         status_reason=reason,

@@ -354,7 +354,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_checks_grafana_url(cls, value: object) -> str | None:
         try:
-            return normalize_grafana_url(value)
+            return normalize_grafana_url(value, require_dashboard=True)
         except ValueError:
             # A navigation convenience must never prevent the hub from starting. The unsafe
             # value itself is intentionally omitted from logs.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Sequence
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 DEFAULT_KEY_JOB_GLOBS = ("prometheus", "alertmanager", "blackbox*")
 DEFAULT_ALERT_HUB_JOB_GLOBS = ("alert-hub*", "alert_hub*", "alerthub*")
@@ -11,9 +11,15 @@ MAX_JOB_GLOBS = 32
 MAX_JOB_GLOB_LENGTH = 128
 
 _JOB_GLOB = re.compile(r"[A-Za-z0-9_.:/-]*(?:\*[A-Za-z0-9_.:/-]*)*")
+_GRAFANA_DASHBOARD_UID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
-def normalize_grafana_url(value: object, *, https_only: bool = False) -> str | None:
+def normalize_grafana_url(
+    value: object,
+    *,
+    https_only: bool = False,
+    require_dashboard: bool = False,
+) -> str | None:
     if value is None:
         return None
     candidate = str(value).strip()
@@ -43,7 +49,7 @@ def normalize_grafana_url(value: object, *, https_only: bool = False) -> str | N
         raise ValueError("Grafana URL must not contain credentials")
     host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
     netloc = host if parsed_port is None else f"{host}:{parsed_port}"
-    return urlunsplit(
+    normalized = urlunsplit(
         (
             parsed.scheme.lower(),
             netloc.lower(),
@@ -51,6 +57,31 @@ def normalize_grafana_url(value: object, *, https_only: bool = False) -> str | N
             parsed.query,
             parsed.fragment,
         )
+    )
+    if require_dashboard and not is_grafana_dashboard_url(normalized):
+        raise ValueError("Grafana URL must identify a dashboard view")
+    return normalized
+
+
+def is_grafana_dashboard_url(value: str) -> bool:
+    """Return whether a normalized URL points at a concrete Grafana dashboard view."""
+
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    decoded_path = unquote(parsed.path)
+    if "\\" in parsed.path or "\\" in decoded_path:
+        return False
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    decoded_segments = [segment for segment in decoded_path.split("/") if segment]
+    if any(segment in {".", ".."} for segment in (*segments, *decoded_segments)):
+        return False
+    return any(
+        segment in {"d", "d-solo"}
+        and index + 1 < len(segments)
+        and _GRAFANA_DASHBOARD_UID.fullmatch(segments[index + 1]) is not None
+        for index, segment in enumerate(segments)
     )
 
 

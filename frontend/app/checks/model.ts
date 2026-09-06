@@ -46,8 +46,25 @@ export type CheckCanary = {
 
 export type CheckAssertion = {
   key: string;
+  name: string | null;
+  state: string | null;
   success: boolean | null;
   statusReason: string | null;
+};
+
+export type CheckTarget = {
+  targetId: string;
+  name: string;
+  state: string | null;
+  success: boolean | null;
+  durationSeconds: number | null;
+  ttfbSeconds: number | null;
+  statusReason: string | null;
+};
+
+export type CheckErrorReason = {
+  reason: string;
+  count: number;
 };
 
 export type CheckResult = {
@@ -55,6 +72,7 @@ export type CheckResult = {
   scenario: string | null;
   variant: string | null;
   target: string | null;
+  state: string | null;
   status: CheckStatus;
   statusReason: string | null;
   success: boolean | null;
@@ -65,6 +83,8 @@ export type CheckResult = {
   dataIncomplete: boolean;
   canaries: CheckCanary[];
   assertions: CheckAssertion[];
+  targets: CheckTarget[];
+  errorReasons: CheckErrorReason[];
   diagnosticCodes: string[];
 };
 
@@ -139,6 +159,11 @@ export type CheckFilters = {
   search: string;
   limit: number;
   offset: number;
+};
+
+export type CheckIdentity = {
+  primary: string;
+  secondaryId: string | null;
 };
 
 const DATA_STATES = new Set<ChecksDataState>([
@@ -279,6 +304,14 @@ export function normalizeCheckListItem(value: unknown): CheckListItem | null {
   };
 }
 
+export function checkIdentity(check: Pick<CheckListItem, "checkId" | "name">): CheckIdentity {
+  const readableName = check.name.trim();
+  if (!readableName || readableName === check.checkId) {
+    return { primary: check.checkId, secondaryId: null };
+  }
+  return { primary: readableName, secondaryId: check.checkId };
+}
+
 function candidateItems(body: Record<string, unknown>): unknown[] {
   if (Array.isArray(body.checks)) return body.checks;
   if (Array.isArray(body.items)) return body.items;
@@ -356,9 +389,36 @@ function normalizeAssertion(value: unknown): CheckAssertion | null {
   if (!key) return null;
   return {
     key,
+    name: stringOrNull(body.name),
+    state: stringOrNull(body.state),
     success: booleanOrNull(body.success ?? body.result ?? body.passed),
     statusReason: stringOrNull(body.status_reason),
   };
+}
+
+function normalizeTarget(value: unknown): CheckTarget | null {
+  const body = record(value);
+  const targetId = stringOrNull(body.target_id ?? body.id);
+  if (!targetId) return null;
+  return {
+    targetId,
+    name: stringOrNull(body.name) ?? targetId,
+    state: stringOrNull(body.state),
+    success: booleanOrNull(body.success ?? body.result),
+    durationSeconds: optionalDuration(body.duration_seconds),
+    ttfbSeconds: optionalDuration(body.ttfb_seconds),
+    statusReason: stringOrNull(body.status_reason),
+  };
+}
+
+function normalizeErrorReason(value: unknown): CheckErrorReason | null {
+  const body = record(value);
+  const reason = stringOrNull(body.reason);
+  const rawCount = finiteNumber(body.count);
+  if (!reason || rawCount === null || !Number.isSafeInteger(rawCount) || rawCount < 0) {
+    return null;
+  }
+  return { reason, count: rawCount };
 }
 
 export function normalizeCheckResult(value: unknown): CheckResult {
@@ -371,6 +431,7 @@ export function normalizeCheckResult(value: unknown): CheckResult {
     scenario: stringOrNull(body.scenario),
     variant: stringOrNull(body.variant),
     target: stringOrNull(body.target),
+    state: stringOrNull(body.state),
     status: normalizedStatus,
     statusReason: stringOrNull(body.status_reason),
     success,
@@ -385,6 +446,12 @@ export function normalizeCheckResult(value: unknown): CheckResult {
     assertions: array(body.assertions)
       .map(normalizeAssertion)
       .filter((item): item is CheckAssertion => item !== null),
+    targets: array(body.targets)
+      .map(normalizeTarget)
+      .filter((item): item is CheckTarget => item !== null),
+    errorReasons: array(body.error_reasons)
+      .map(normalizeErrorReason)
+      .filter((item): item is CheckErrorReason => item !== null),
     diagnosticCodes: stringList(body.diagnostic_codes),
   };
 }
@@ -439,6 +506,18 @@ export function safeExternalUrl(value: unknown): string | null {
   try {
     const url = new URL(raw);
     if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) return null;
+    const decodedPath = decodeURIComponent(url.pathname);
+    if (decodedPath.includes("\\")) return null;
+    const segments = url.pathname.split("/").filter(Boolean);
+    const decodedSegments = decodedPath.split("/").filter(Boolean);
+    if (decodedSegments.some((segment) => segment === "." || segment === "..")) return null;
+    const dashboard = segments.some(
+      (segment, index) =>
+        ["d", "d-solo"].includes(segment) &&
+        index + 1 < segments.length &&
+        /^[A-Za-z0-9_-]{1,128}$/.test(segments[index + 1] ?? ""),
+    );
+    if (!dashboard) return null;
     return url.href;
   } catch {
     return null;
@@ -538,6 +617,10 @@ export function buildChecksQuery(filters: CheckFilters, includePagination = true
   }
   const serialized = query.toString();
   return serialized ? `?${serialized}` : "";
+}
+
+export function buildChecksSummaryQuery(filters: CheckFilters): string {
+  return buildChecksQuery({ ...filters, status: "all" }, false);
 }
 
 export function hasActiveCheckFilters(filters: CheckFilters): boolean {

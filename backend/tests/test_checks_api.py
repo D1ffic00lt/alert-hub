@@ -13,7 +13,9 @@ from alert_hub.domain.checks import (
     DEFAULT_CANARY,
     CheckAssertion,
     CheckCanary,
+    CheckErrorReason,
     CheckResultKey,
+    CheckTarget,
     NormalizedCheckResult,
 )
 from alert_hub.infrastructure.db.models import Incident
@@ -135,6 +137,8 @@ def _result(
     duration: float | None = None,
     canaries: tuple[CheckCanary, ...] = (),
     assertions: tuple[CheckAssertion, ...] = (),
+    targets: tuple[CheckTarget, ...] = (),
+    error_reasons: tuple[CheckErrorReason, ...] = (),
     diagnostics: tuple[str, ...] = (),
 ) -> NormalizedCheckResult:
     key_values: dict[str, str] = {"check_id": check_id}
@@ -150,6 +154,8 @@ def _result(
         duration_seconds=duration,
         canaries=canaries,
         assertions=assertions,
+        targets=targets,
+        error_reasons=error_reasons,
         diagnostics=diagnostics,
     )
 
@@ -221,7 +227,25 @@ def test_detail_serializes_defaults_relations_and_safe_grafana_link(tmp_path: Pa
                     success=True,
                     duration=0,
                     canaries=(CheckCanary(DEFAULT_CANARY, True),),
-                    assertions=(CheckAssertion("egress_match", True),),
+                    assertions=(
+                        CheckAssertion(
+                            "office-cidr",
+                            True,
+                            name="Office cidr",
+                            state="match",
+                        ),
+                    ),
+                    targets=(
+                        CheckTarget(
+                            target_id="status-api",
+                            name="Status api",
+                            state="success",
+                            success=True,
+                            duration_seconds=0.2,
+                            ttfb_seconds=0.1,
+                        ),
+                    ),
+                    error_reasons=(CheckErrorReason("timeout", 2),),
                     diagnostics=("conflicting_ttfb",),
                 ),
             ),
@@ -289,6 +313,27 @@ def test_detail_serializes_defaults_relations_and_safe_grafana_link(tmp_path: Pa
             None,
         )
         assert result["canaries"][0]["canary"] is None
+        assert result["targets"] == [
+            {
+                "target_id": "status-api",
+                "name": "Status api",
+                "state": "success",
+                "success": True,
+                "duration_seconds": 0.2,
+                "ttfb_seconds": 0.1,
+                "status_reason": None,
+            }
+        ]
+        assert result["assertions"] == [
+            {
+                "key": "office-cidr",
+                "name": "Office cidr",
+                "state": "match",
+                "success": True,
+                "status_reason": None,
+            }
+        ]
+        assert result["error_reasons"] == [{"reason": "timeout", "count": 2}]
         assert result["duration_seconds"] == 0
         assert result["diagnostic_codes"] == ["conflicting_ttfb"]
         assert check["diagnostic_codes"] == ["conflicting_ttfb"]
@@ -521,8 +566,20 @@ def test_checks_openapi_declares_models_and_error_statuses(tmp_path: Path) -> No
         "503",
     }
     schemas = schema["components"]["schemas"]
-    for model in ("ChecksListResponse", "ChecksSummaryResponse", "CheckDetailResponse"):
+    for model in (
+        "ChecksListResponse",
+        "ChecksSummaryResponse",
+        "CheckDetailResponse",
+        "CheckResultResponse",
+        "CheckTargetResponse",
+        "CheckAssertionResponse",
+        "CheckErrorReasonResponse",
+    ):
         assert model in schemas
+    result_properties = schemas["CheckResultResponse"]["properties"]
+    assert result_properties["targets"]["items"]["$ref"].endswith("/CheckTargetResponse")
+    assert result_properties["assertions"]["items"]["$ref"].endswith("/CheckAssertionResponse")
+    assert result_properties["error_reasons"]["items"]["$ref"].endswith("/CheckErrorReasonResponse")
     assert paths["/api/v1/checks/summary"]["get"]["operationId"].startswith("checks_summary")
 
 

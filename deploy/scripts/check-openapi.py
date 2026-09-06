@@ -49,6 +49,25 @@ for path, model_name in checks_models.items():
     if not required_statuses <= set(operation.get("responses", {})):
         failures.append(f"GET {path} response statuses")
 
+for model_name in (
+    "CheckResultResponse",
+    "CheckTargetResponse",
+    "CheckAssertionResponse",
+    "CheckErrorReasonResponse",
+):
+    if model_name not in components:
+        failures.append(f"OpenAPI component {model_name}")
+
+result_properties = components.get("CheckResultResponse", {}).get("properties", {})
+for field_name, model_name in {
+    "targets": "CheckTargetResponse",
+    "assertions": "CheckAssertionResponse",
+    "error_reasons": "CheckErrorReasonResponse",
+}.items():
+    item_ref = result_properties.get(field_name, {}).get("items", {}).get("$ref")
+    if item_ref != f"#/components/schemas/{model_name}":
+        failures.append(f"CheckResultResponse.{field_name} items must use {model_name}")
+
 checks_states = {"ready", "empty", "stale", "unavailable", "disabled"}
 for model_name in checks_models.values():
     data_state = components.get(model_name, {}).get("properties", {}).get("data_state", {})
@@ -59,13 +78,50 @@ for model_name, nullable_fields in {
     "ChecksListResponse": {"snapshot_id", "fetched_at", "evaluated_at", "total"},
     "ChecksSummaryResponse": {"total", "up", "degraded", "down", "stale", "unknown"},
     "CheckDetailResponse": {"check", "last_known"},
-    "CheckResultResponse": {"source", "scenario", "variant", "target", "success", "last_run_at"},
+    "CheckResultResponse": {
+        "source",
+        "scenario",
+        "variant",
+        "target",
+        "state",
+        "success",
+        "last_run_at",
+    },
+    "CheckTargetResponse": {
+        "state",
+        "success",
+        "duration_seconds",
+        "ttfb_seconds",
+        "status_reason",
+    },
+    "CheckAssertionResponse": {"name", "state", "success", "status_reason"},
 }.items():
     properties = components.get(model_name, {}).get("properties", {})
     for field in nullable_fields:
         variants = properties.get(field, {}).get("anyOf", [])
         if not any(variant.get("type") == "null" for variant in variants):
             failures.append(f"{model_name}.{field} must be nullable")
+
+bulk_incident_path = "/api/v1/incidents/bulk-action"
+bulk_incident_model = "IncidentBulkActionResponse"
+bulk_incident_operation = paths.get(bulk_incident_path, {}).get("post", {})
+bulk_incident_responses = bulk_incident_operation.get("responses", {})
+for response_status in ("200", "207"):
+    response_schema = (
+        bulk_incident_responses.get(response_status, {})
+        .get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+    )
+    if response_schema.get("$ref") != f"#/components/schemas/{bulk_incident_model}":
+        failures.append(
+            f"{response_status} POST {bulk_incident_path} must use {bulk_incident_model}"
+        )
+if not {"200", "207", "401", "422"} <= set(bulk_incident_responses):
+    failures.append(f"POST {bulk_incident_path} response statuses")
+if bulk_incident_model not in components:
+    failures.append(f"OpenAPI component {bulk_incident_model}")
+
 if failures:
     raise SystemExit(f"OpenAPI contract failures: {', '.join(failures)}")
 

@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildChecksQuery,
+  buildChecksSummaryQuery,
+  checkIdentity,
   groupChecks,
   hasActiveCheckFilters,
   normalizeCheckDetail,
@@ -17,6 +19,17 @@ import {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Checks API model", () => {
+  it("uses a readable name first and avoids duplicating an ID fallback", () => {
+    expect(checkIdentity({ checkId: "checkout", name: "Checkout flow" })).toEqual({
+      primary: "Checkout flow",
+      secondaryId: "checkout",
+    });
+    expect(checkIdentity({ checkId: "unnamed-check", name: "unnamed-check" })).toEqual({
+      primary: "unnamed-check",
+      secondaryId: null,
+    });
+  });
+
   it("keeps a minimal Check protocol-neutral and preserves absent optionals as null", () => {
     const check = normalizeCheckListItem({
       check_id: "minimum",
@@ -116,6 +129,7 @@ describe("Checks API model", () => {
             variant: null,
             target: null,
             status: "up",
+            state: "success",
             success: true,
             last_run_at: "2026-09-05T12:00:00Z",
             duration_seconds: 0,
@@ -130,12 +144,36 @@ describe("Checks API model", () => {
             variant: "guest",
             target: null,
             status: "down",
+            state: "failure",
             success: false,
             last_run_at: "2026-09-05T12:00:00Z",
             duration_seconds: null,
             ttfb_seconds: 0.2,
             canaries: [{ canary: "control", success: true, status_reason: null }],
-            assertions: [{ key: "egress_match", success: false, status_reason: "mismatch" }],
+            targets: [
+              {
+                target_id: "checkout-primary",
+                name: "Checkout primary",
+                state: "error",
+                success: null,
+                duration_seconds: 0.25,
+                ttfb_seconds: null,
+                status_reason: "executor_error",
+              },
+            ],
+            assertions: [
+              {
+                key: "egress_match",
+                name: "Egress match",
+                state: "mismatch",
+                success: false,
+                status_reason: "mismatch",
+              },
+            ],
+            error_reasons: [
+              { reason: "timeout", count: 3 },
+              { reason: "invalid", count: -1 },
+            ],
           },
         ],
         parts: [
@@ -178,15 +216,30 @@ describe("Checks API model", () => {
       scenario: "purchase",
       variant: null,
       target: null,
+      state: "success",
       durationSeconds: 0,
       ttfbSeconds: null,
       diagnosticCodes: ["conflicting_duration"],
     });
     expect(response.check?.results[1].assertions[0]).toEqual({
       key: "egress_match",
+      name: "Egress match",
+      state: "mismatch",
       success: false,
       statusReason: "mismatch",
     });
+    expect(response.check?.results[1].targets).toEqual([
+      {
+        targetId: "checkout-primary",
+        name: "Checkout primary",
+        state: "error",
+        success: null,
+        durationSeconds: 0.25,
+        ttfbSeconds: null,
+        statusReason: "executor_error",
+      },
+    ]);
+    expect(response.check?.results[1].errorReasons).toEqual([{ reason: "timeout", count: 3 }]);
     expect(response.check?.parts[0]).toMatchObject({ status: "down", sourcesTotal: 2 });
     expect(response.check?.alerts[0]).toMatchObject({
       name: "Checkout failed",
@@ -232,7 +285,7 @@ describe("Checks API model", () => {
   });
 
   it("builds bounded server-side filter and pagination parameters", () => {
-    const query = buildChecksQuery({
+    const filters = {
       status: "degraded",
       group: " backend ",
       source: "eu",
@@ -241,7 +294,8 @@ describe("Checks API model", () => {
       search: "checkout api",
       limit: 50,
       offset: 100,
-    });
+    } as const;
+    const query = buildChecksQuery(filters);
     const params = new URLSearchParams(query);
 
     expect(Object.fromEntries(params)).toEqual({
@@ -252,6 +306,12 @@ describe("Checks API model", () => {
       search: "checkout api",
       limit: "50",
       offset: "100",
+    });
+    expect(Object.fromEntries(new URLSearchParams(buildChecksSummaryQuery(filters)))).toEqual({
+      group: "backend",
+      source: "eu",
+      scenario: "purchase",
+      search: "checkout api",
     });
     expect(
       hasActiveCheckFilters({
@@ -280,6 +340,10 @@ describe("Checks API model", () => {
   it("rejects unsafe Grafana URLs", () => {
     expect(safeExternalUrl("javascript:alert(1)")).toBeNull();
     expect(safeExternalUrl("https://user:secret@grafana.example.test/d/checks")).toBeNull();
+    expect(safeExternalUrl("https://grafana.example.test/")).toBeNull();
+    expect(safeExternalUrl("https://grafana.example.test/d/checks/../../")).toBeNull();
+    expect(safeExternalUrl("https://grafana.example.test/d/checks/..%2f..")).toBeNull();
+    expect(safeExternalUrl("https://grafana.example.test/d/checks/%5c..")).toBeNull();
     expect(safeExternalUrl("https://grafana.example.test/d/checks")).toBe(
       "https://grafana.example.test/d/checks",
     );

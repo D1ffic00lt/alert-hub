@@ -94,10 +94,11 @@ unrelated address, verify the peer hostname fails closed.
 ### Checks data boundary
 
 Checks reuses the validated Prometheus datasource transport and cannot select an upstream URL,
-metric name, or PromQL from request parameters. All seven query expressions are fixed on the
+metric name, or PromQL from request parameters. All twelve query expressions are fixed on the
 server, use one evaluation time, ignore environment proxies, reject redirects, and retain the
-existing DNS/address, timeout, sample, and body-size controls. `CHECKS_MAX_SERIES` adds a combined
-bound across all fixed query responses and the retained in-memory registry. A limit violation is a
+existing DNS/address, timeout, sample, and body-size controls. One shared internal semaphore caps
+the complete refresh at 16 concurrent Prometheus requests across all fixed queries and datasources.
+`CHECKS_MAX_SERIES` adds a combined bound across all fixed query responses and the retained in-memory registry. A limit violation is a
 fail-closed `checks_limit_exceeded`, never a truncated normal summary.
 
 Every `/api/v1/checks*` request requires the existing authentication and authorization checks,
@@ -120,11 +121,17 @@ and a 2 MiB encoded API-response ceiling fail closed with `checks_limit_exceeded
 oversized authenticated response is returned.
 
 `CHECKS_GRAFANA_BASE_URL` is navigation metadata, not a datasource or credential. The backend
-accepts only an absolute HTTP(S) URL with a host and no userinfo; invalid values disable only the
-link and are logged without the value. HTTPS is required by default. Enabling internal HTTP uses
+accepts only an absolute HTTP(S) URL to a concrete Grafana `/d/` or `d-solo` dashboard view with a
+host and no userinfo; origin/home and invalid values disable only the link and are logged without
+the value. HTTPS is required by default. Enabling internal HTTP uses
 the existing explicit monitoring exception and still requires egress-network controls. Labels and
 browser input can supply only an encoded allowlisted variable value and cannot replace the
 administrator-selected scheme, authority, or path.
+
+The replicated general Grafana setting applies the same concrete-dashboard rule to new API writes.
+An origin/home URL stored by an older release is returned as `null` and canonicalized to `null` on
+the next settings mutation. A peer event with such a legacy URL still applies independently valid
+job globs; one invalid navigation convenience never discards the rest of the monitoring policy.
 
 ## Authentication and browser policy
 

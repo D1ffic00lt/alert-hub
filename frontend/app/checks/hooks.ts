@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   buildChecksQuery,
+  buildChecksSummaryQuery,
   type CheckDetail,
   type CheckFilters,
   type CheckListItem,
@@ -112,7 +113,8 @@ export function useChecksOverview(
       setState((current) => ({
         ...current,
         phase: "loading",
-        enabled: current.meta?.enabled ?? null,
+        enabled: current.enabled,
+        meta: null,
         summary: null,
         problems: [],
         error: null,
@@ -223,7 +225,7 @@ export function useChecksList(
   }));
   const requestEpoch = useRef(0);
   const query = buildChecksQuery(filters);
-  const summaryQuery = buildChecksQuery(filters, false);
+  const summaryQuery = buildChecksSummaryQuery(filters);
 
   useEffect(() => {
     const local = localState(mode);
@@ -238,6 +240,7 @@ export function useChecksList(
       setState((current) => ({
         ...current,
         phase: "loading",
+        meta: null,
         items: [],
         summary: null,
         total: 0,
@@ -375,6 +378,7 @@ export function useCheckDetail(
       setState((current) => ({
         ...current,
         phase: "loading",
+        meta: null,
         check: null,
         error: null,
         refreshing: current.meta !== null,

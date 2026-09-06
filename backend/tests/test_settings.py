@@ -107,6 +107,11 @@ def test_grafana_url_is_normalized_and_never_accepts_credentials() -> None:
         Settings(grafana_url="https://operator:secret@grafana.example/d/ops")
     with pytest.raises(ValueError, match="must use http or https"):
         Settings(grafana_url="javascript:alert(1)")
+    # Startup remains compatible with an older origin-only setting. Read-side navigation
+    # sanitizes it until an administrator stores a concrete dashboard view.
+    assert Settings(grafana_url="https://grafana.example/").grafana_url == (
+        "https://grafana.example/"
+    )
 
 
 def test_checks_settings_have_safe_bounded_defaults() -> None:
@@ -177,3 +182,6 @@ def test_checks_grafana_url_requires_explicit_http_and_preserves_admin_path() ->
     )
     assert rejected_http.checks_grafana_base_url is None
     assert allowed_http.checks_grafana_base_url == "http://grafana.example/d/checks"
+
+    root_only = Settings(checks_grafana_base_url="https://grafana.example/")
+    assert root_only.checks_grafana_base_url is None

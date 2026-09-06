@@ -53,11 +53,18 @@ SQLite. Existing alert and incident history remains durable: a Check may read ac
 by exact safe `check_id`, but a failed Check does not create an incident and alert state does not
 override Check aggregation.
 
+The normalization boundary also understands the richer xray-e2e-prober projection without making
+it mandatory. It joins safe info metadata to other families by `check_id` plus exported
+`instance_id`, keeps each target and egress `assertion_id` nested under the universal result, and
+exposes only allowlisted one-hot states and structured cumulative reason counters. Free-form error
+text and raw/expected addresses never cross the boundary. A declared generic `source` still has
+priority; otherwise separate prober instances remain separate sources.
+
 Every node evaluates its own configured Prometheus view and owns its own short-lived cache. Checks
 failure or disablement cannot affect local ingest, incident actions, notification work, peer sync,
 or readiness. A failed required Prometheus refresh becomes `data_state: unavailable`; a previous
 success is never silently served as current. Optional metric failures remove only the associated
-duration, TTFB, canary, or assertion capability and add a warning.
+state, target, duration, TTFB, canary, assertion, or error-counter capability and add a warning.
 
 Only operator-managed reverse proxies terminate public HTTPS. Production host
 proxies target fixed web/API addresses on the managed edge bridge; a

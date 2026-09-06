@@ -123,12 +123,13 @@ async def query_datasource_targets(
     job_globs: Sequence[str] | None = None,
     evaluated_at: datetime | None = None,
     allow_non_finite_values: bool = False,
+    concurrency_limiter: asyncio.Semaphore | None = None,
 ) -> tuple[list[DatasourceQueryResult], list[DatasourceQueryFailure]]:
     async def query_one(
         target: DatasourceQueryTarget,
     ) -> DatasourceQueryResult | DatasourceQueryFailure:
-        try:
-            samples = await client.query(
+        async def execute() -> list[VectorSample]:
+            return await client.query(
                 target.url,
                 target.credentials,
                 query_name,
@@ -136,6 +137,13 @@ async def query_datasource_targets(
                 evaluated_at=evaluated_at,
                 allow_non_finite_values=allow_non_finite_values,
             )
+
+        try:
+            if concurrency_limiter is None:
+                samples = await execute()
+            else:
+                async with concurrency_limiter:
+                    samples = await execute()
         except PrometheusQueryError as exc:
             return DatasourceQueryFailure(
                 target.datasource_id,
