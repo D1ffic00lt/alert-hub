@@ -19,7 +19,12 @@ import {
   type ChecksRuntimeMode,
   useChecksOverview,
 } from "./checks/hooks";
-import { mergeIncidentSummariesWithHistory } from "./incidents";
+import {
+  createRefreshBurstCoalescer,
+  incidentListPath,
+  mergeIncidentSummariesWithHistory,
+  normalizeIncidentSearch,
+} from "./incidents";
 import {
   applicationServerKeyMatches,
   blockedPermissionHelp,
@@ -82,6 +87,7 @@ let bootstrapSuggested = false;
 let demoModeActive = false;
 let offlineReadOnlyActive = false;
 const verifiedPeerBases = new Set<string>();
+const apiResponseSource = new WeakMap<Response, "origin" | "peer">();
 const SESSION_EXPIRED_EVENT = "alert-hub:session-expired";
 const SESSION_RESTORED_EVENT = "alert-hub:session-restored";
 const SESSION_HINT_KEY = "alert-hub-session-partition-v1";
@@ -129,6 +135,7 @@ type Incident = {
   labels: Record<string, string>;
   annotations: Record<string, string>;
   events: IncidentEvent[];
+  summaryOnly?: boolean;
   checkIds?: string[];
   checksRelationState?: "available" | "disabled" | "unavailable";
 };
@@ -316,6 +323,40 @@ type HubData = {
 };
 
 type DataMode = "demo" | "live" | "cached";
+type HubResource =
+  | "incidents"
+  | "cluster"
+  | "sources"
+  | "channels"
+  | "routes"
+  | "datasources"
+  | "devices"
+  | "audit"
+  | "reachability"
+  | "firingAlerts"
+  | "keyJobsUp"
+  | "alertHubHealth"
+  | "summary";
+type HubResourceState = Record<HubResource, boolean>;
+
+const PENDING_HUB_RESOURCES: HubResourceState = {
+  incidents: false,
+  cluster: false,
+  sources: false,
+  channels: false,
+  routes: false,
+  datasources: false,
+  devices: false,
+  audit: false,
+  reachability: false,
+  firingAlerts: false,
+  keyJobsUp: false,
+  alertHubHealth: false,
+  summary: false,
+};
+const SETTLED_HUB_RESOURCES: HubResourceState = Object.fromEntries(
+  Object.keys(PENDING_HUB_RESOURCES).map((key) => [key, true]),
+) as HubResourceState;
 
 const EMPTY_DATA: HubData = {
   incidents: [],
@@ -1439,6 +1480,7 @@ function normalizeIncident(item: unknown, index: number): Incident {
     ),
     labels: asStringRecord(row.labels_json ?? row.labels),
     annotations: asStringRecord(row.annotations_json ?? row.annotations),
+    summaryOnly: Boolean(row.summary_only),
     checkIds: [...new Set(linkedCheckIds)],
     checksRelationState,
     events: rawEvents.map((event, eventIndex) => {
@@ -1821,6 +1863,18 @@ function normalizeGrafanaUrl(value: unknown): string | null {
   try {
     const url = new URL(value);
     if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) return null;
+    const decodedPath = decodeURIComponent(url.pathname);
+    if (decodedPath.includes("\\")) return null;
+    const segments = url.pathname.split("/").filter(Boolean);
+    const decodedSegments = decodedPath.split("/").filter(Boolean);
+    if (decodedSegments.some((segment) => segment === "." || segment === "..")) return null;
+    const dashboard = segments.some(
+      (segment, index) =>
+        ["d", "d-solo"].includes(segment) &&
+        index + 1 < segments.length &&
+        /^[A-Za-z0-9_-]{1,128}$/.test(segments[index + 1] ?? ""),
+    );
+    if (!dashboard) return null;
     return url.href;
   } catch {
     return null;
@@ -2103,14 +2157,20 @@ async function apiFetch(
           requestInit,
         );
         assertExpectedAuthContext();
-        if (response.ok) return response;
+        if (response.ok) {
+          apiResponseSource.set(response, "peer");
+          return response;
+        }
       } catch {
         assertExpectedAuthContext();
         // Move to the next saved peer without hiding the original response.
       }
     }
   }
-  if (primary) return primary;
+  if (primary) {
+    apiResponseSource.set(primary, "origin");
+    return primary;
+  }
   throw primaryError instanceof Error
     ? primaryError
     : new Error(tr("Ни один узел API не ответил", "No API node responded"));
@@ -2143,9 +2203,18 @@ async function mutationJson(path: string, init: RequestInit) {
 async function getJson(path: string, signal?: AbortSignal) {
   const response = await apiFetch(path, { signal });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  const cached = response.headers.get("X-Alert-Hub-Cache") === "hit";
   return {
     payload: (await response.json()) as unknown,
-    cached: response.headers.get("X-Alert-Hub-Cache") === "hit",
+    cached,
+    // Mutations always execute on the authenticated origin. A peer or service-
+    // worker snapshot can safely drive explicit-ID actions, but it must never
+    // define an origin-side filter-wide mutation under eventual consistency.
+    mutationAuthoritative:
+      apiResponseSource.get(response) === "origin" &&
+      !cached &&
+      Boolean(memoryAccessToken) &&
+      !offlineReadOnlyActive,
   };
 }
 
@@ -2396,8 +2465,12 @@ function useAuthSession() {
   };
 }
 
-function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
-  const queryClient = useQueryClient();
+function useHubData(
+  enabled: boolean,
+  demo: boolean,
+  demoLanguage: UiLanguage,
+  incidentPageOwnsList: boolean,
+) {
   const localizedDataVersion = demo ? demoLanguage : "live";
   const [data, setData] = useState<HubData>(EMPTY_DATA);
   const [mode, setMode] = useState<DataMode>("live");
@@ -2407,6 +2480,8 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [liveUpdates, setLiveUpdates] = useState(false);
+  const [resources, setResources] = useState<HubResourceState>(PENDING_HUB_RESOURCES);
+  const [incidentsVersion, setIncidentsVersion] = useState(0);
   const [auditLoadingMore, setAuditLoadingMore] = useState(false);
   const [auditLoadError, setAuditLoadError] = useState<string | null>(null);
   const mounted = useRef(true);
@@ -2437,58 +2512,62 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), 6500);
       try {
-        const requests = await queryClient.fetchQuery({
-          queryKey: ["hub-snapshot", memorySessionId ?? "unpartitioned"],
-          queryFn: () =>
-            Promise.allSettled([
-              getJson("/incidents?limit=100", controller.signal),
-              getJson("/cluster/status", controller.signal),
-              getJson("/sources", controller.signal),
-              getJson("/channels", controller.signal),
-              getJson("/routes", controller.signal),
-              getJson("/prometheus-datasources", controller.signal),
-              getJson("/devices", controller.signal),
-              getJson("/audit?limit=100", controller.signal),
-              getJson("/metrics/reachability", controller.signal),
-              getJson("/metrics/queries/firing_alerts", controller.signal),
-              getJson("/metrics/queries/key_jobs_up", controller.signal),
-              getJson("/metrics/queries/alert_hub_health", controller.signal),
-              getJson("/metrics/summary", controller.signal),
-            ]),
-          staleTime: 0,
-        });
-        if (!isCurrentRequest()) return;
-        const successful = requests.filter((result) => result.status === "fulfilled").length;
-        if (successful === 0)
-          throw new Error(tr("Ни один узел API не ответил", "No API node responded"));
-        const cachedResponses = requests.filter(
-          (result) => result.status === "fulfilled" && result.value.cached,
-        ).length;
-        if (requests[7]?.status === "fulfilled") setAuditLoadError(null);
+        // Start every resource together, but publish the incident/core groups before
+        // slow Prometheus requests settle. The previous allSettled snapshot made a
+        // healthy SQLite list wait for the slowest monitoring datasource.
+        // The dedicated incidents route owns its filtered, paginated list. Do not
+        // issue the global top-100 snapshot there: it would duplicate the page
+        // request and its completion used to invalidate that same request again.
+        const incidentRequest = incidentPageOwnsList
+          ? null
+          : Promise.allSettled([getJson("/incidents?limit=100&view=compact", controller.signal)]);
+        const coreRequest = Promise.allSettled([
+          getJson("/cluster/status", controller.signal),
+          getJson("/sources", controller.signal),
+          getJson("/channels", controller.signal),
+          getJson("/routes", controller.signal),
+          getJson("/prometheus-datasources", controller.signal),
+          getJson("/devices", controller.signal),
+          getJson("/audit?limit=100", controller.signal),
+        ]);
+        const monitoringRequest = Promise.allSettled([
+          getJson("/metrics/reachability", controller.signal),
+          getJson("/metrics/queries/firing_alerts", controller.signal),
+          getJson("/metrics/queries/key_jobs_up", controller.signal),
+          getJson("/metrics/queries/alert_hub_health", controller.signal),
+          getJson("/metrics/summary", controller.signal),
+        ]);
 
-        setData((current) => {
-          const next: HubData = { ...(verifiedData.current ?? EMPTY_DATA) };
-          const [
-            incidents,
-            nodes,
-            sources,
-            channels,
-            routes,
-            datasources,
-            devices,
-            audit,
-            reachability,
-            firingAlerts,
-            keyJobsUp,
-            alertHubHealth,
-            summary,
-          ] = requests;
-          if (incidents.status === "fulfilled") {
+        const [incidents] = incidentRequest ? await incidentRequest : [];
+        if (!isCurrentRequest()) return;
+        if (incidents) setResources((current) => ({ ...current, incidents: true }));
+        if (incidents?.status === "fulfilled") {
+          setData((current) => {
+            const next = { ...(verifiedData.current ?? EMPTY_DATA) };
             const summaries = listFrom(incidents.value.payload, "incidents").map(normalizeIncident);
             next.incidents = mergeIncidentSummariesWithHistory(summaries, current.incidents);
-          }
+            verifiedData.current = next;
+            return next;
+          });
+        }
+
+        const [nodes, sources, channels, routes, datasources, devices, audit] = await coreRequest;
+        if (!isCurrentRequest()) return;
+        setResources((current) => ({
+          ...current,
+          cluster: true,
+          sources: true,
+          channels: true,
+          routes: true,
+          datasources: true,
+          devices: true,
+          audit: true,
+        }));
+        if (audit?.status === "fulfilled") setAuditLoadError(null);
+        setData(() => {
+          const next = { ...(verifiedData.current ?? EMPTY_DATA) };
           if (clusterEpoch === clusterRequestEpoch.current) {
-            if (nodes.status === "fulfilled") {
+            if (nodes?.status === "fulfilled") {
               const cluster = normalizeClusterSnapshot(nodes.value.payload, !nodes.value.cached);
               next.nodes = cluster.nodes;
               next.clusterMeta = cluster.meta;
@@ -2497,9 +2576,7 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
                 .filter((item): item is string => Boolean(item));
               if (discovered.length) {
                 try {
-                  const current = JSON.parse(
-                    localStorage.getItem("alert-hub-api-endpoints") ?? "[]",
-                  );
+                  const saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
                   const disabled = JSON.parse(
                     localStorage.getItem("alert-hub-disabled-api-endpoints") ?? "[]",
                   );
@@ -2509,7 +2586,7 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
                     JSON.stringify(
                       [
                         ...new Set([
-                          ...(Array.isArray(current) ? current : []),
+                          ...(Array.isArray(saved) ? saved : []),
                           ...discovered.filter((item) => !disabledSet.has(item)),
                         ]),
                       ].slice(0, 8),
@@ -2519,25 +2596,25 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
                   // Endpoint discovery is a device-local optimization only.
                 }
               }
-            } else {
+            } else if (nodes?.status === "rejected") {
               next.nodes = unavailableNodeTelemetry(next.nodes);
             }
           }
-          if (sources.status === "fulfilled") {
+          if (sources?.status === "fulfilled") {
             next.sources = listFrom(sources.value.payload, "sources").map(normalizeSource);
           }
-          if (channels.status === "fulfilled") {
+          if (channels?.status === "fulfilled") {
             next.channels = listFrom(channels.value.payload, "channels").map(normalizeChannel);
           }
-          if (routes.status === "fulfilled") {
+          if (routes?.status === "fulfilled") {
             next.routes = listFrom(routes.value.payload, "routes").map(normalizeRoute);
           }
-          if (datasources.status === "fulfilled") {
+          if (datasources?.status === "fulfilled") {
             next.datasources = listFrom(datasources.value.payload, "datasources").map(
               normalizeDatasource,
             );
           }
-          if (devices.status === "fulfilled") {
+          if (devices?.status === "fulfilled") {
             next.devices = listFrom(devices.value.payload, "devices").map((item, index) => {
               const row = asRecord(item);
               return {
@@ -2559,13 +2636,30 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
               };
             });
           }
-          if (audit.status === "fulfilled") {
+          if (audit?.status === "fulfilled") {
             const auditBody = asRecord(audit.value.payload);
             const firstPage = listFrom(auditBody, "items").map(normalizeAudit);
             Object.assign(next, rebaseAuditHead(next, firstPage, asFiniteNumber(auditBody.total)));
             auditDataEpoch.current += 1;
           }
-          if (reachability.status === "fulfilled") {
+          verifiedData.current = next;
+          return next;
+        });
+
+        const [reachability, firingAlerts, keyJobsUp, alertHubHealth, summary] =
+          await monitoringRequest;
+        if (!isCurrentRequest()) return;
+        setResources((current) => ({
+          ...current,
+          reachability: true,
+          firingAlerts: true,
+          keyJobsUp: true,
+          alertHubHealth: true,
+          summary: true,
+        }));
+        setData(() => {
+          const next = { ...(verifiedData.current ?? EMPTY_DATA) };
+          if (reachability?.status === "fulfilled") {
             const reachabilityBody = asRecord(reachability.value.payload);
             next.reachability = listFrom(reachabilityBody, "cells").map(normalizeReachability);
             const statusValue = String(reachabilityBody.status ?? "unknown");
@@ -2597,19 +2691,19 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
           }
           next.fixedMetrics = {
             firingAlerts:
-              firingAlerts.status === "fulfilled"
+              firingAlerts?.status === "fulfilled"
                 ? normalizeFixedMetricResult(firingAlerts.value.payload)
                 : next.fixedMetrics.firingAlerts,
             keyJobsUp:
-              keyJobsUp.status === "fulfilled"
+              keyJobsUp?.status === "fulfilled"
                 ? normalizeFixedMetricResult(keyJobsUp.value.payload)
                 : next.fixedMetrics.keyJobsUp,
             alertHubHealth:
-              alertHubHealth.status === "fulfilled"
+              alertHubHealth?.status === "fulfilled"
                 ? normalizeFixedMetricResult(alertHubHealth.value.payload)
                 : next.fixedMetrics.alertHubHealth,
           };
-          if (summary.status === "fulfilled") {
+          if (summary?.status === "fulfilled") {
             const row = asRecord(summary.value.payload);
             const deliveryAttempts = asFiniteNumber(row.deliveries_24h);
             next.summary = {
@@ -2668,6 +2762,28 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
           verifiedData.current = next;
           return next;
         });
+
+        const requests = [
+          ...(incidents ? [incidents] : []),
+          nodes,
+          sources,
+          channels,
+          routes,
+          datasources,
+          devices,
+          audit,
+          reachability,
+          firingAlerts,
+          keyJobsUp,
+          alertHubHealth,
+          summary,
+        ];
+        const successful = requests.filter((result) => result.status === "fulfilled").length;
+        if (successful === 0)
+          throw new Error(tr("Ни один узел API не ответил", "No API node responded"));
+        const cachedResponses = requests.filter(
+          (result) => result.status === "fulfilled" && result.value.cached,
+        ).length;
         if (cachedResponses > 0 || !navigator.onLine) {
           setMode("cached");
           setError(
@@ -2732,7 +2848,15 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
         if (isCurrentRequest()) setRefreshing(false);
       }
     },
-    [demo, enabled, queryClient],
+    [demo, enabled, incidentPageOwnsList],
+  );
+
+  const refreshVisibleData = useCallback(
+    async (quiet = false) => {
+      setIncidentsVersion((current) => current + 1);
+      await refresh(quiet);
+    },
+    [refresh],
   );
 
   const refreshClusterTelemetry = useCallback(async () => {
@@ -2863,6 +2987,7 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
         setRefreshing(false);
         setAuditLoadingMore(false);
         setAuditLoadError(null);
+        setResources(SETTLED_HUB_RESOURCES);
       }, 0);
       return () => {
         mounted.current = false;
@@ -2887,6 +3012,8 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
         setRefreshing(false);
         setAuditLoadingMore(false);
         setAuditLoadError(null);
+        setResources(PENDING_HUB_RESOURCES);
+        setIncidentsVersion(0);
       }, 0);
       return () => {
         mounted.current = false;
@@ -2904,13 +3031,15 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
       auditLoadController.current = null;
       verifiedData.current = null;
       verifiedPartition.current = memorySessionId;
+      setResources(PENDING_HUB_RESOURCES);
+      setIncidentsVersion(0);
       setAuditLoadingMore(false);
       setAuditLoadError(null);
     }
     const initialRefresh = window.setTimeout(() => void refresh(), 0);
     const onOnline = () => {
       setOnline(true);
-      void refresh();
+      void refreshVisibleData();
     };
     const onOffline = () => {
       fullRefreshEpoch.current += 1;
@@ -2947,7 +3076,7 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
     };
-  }, [demo, enabled, localizedDataVersion, refresh]);
+  }, [demo, enabled, localizedDataVersion, refresh, refreshVisibleData]);
 
   useEffect(() => {
     if (!enabled || demo || !online) return;
@@ -2958,7 +3087,7 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
   useEffect(() => {
     if (!enabled || demo || !online || mode !== "live") return;
     if (typeof EventSource === "undefined") {
-      const fallbackPoller = window.setInterval(() => void refresh(true), 30000);
+      const fallbackPoller = window.setInterval(() => void refreshVisibleData(true), 30000);
       return () => window.clearInterval(fallbackPoller);
     }
     let stopped = false;
@@ -2967,8 +3096,12 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
     let renewalTimer: number | undefined;
     let stream: EventSource | undefined;
     let renewal: Promise<void> | null = null;
+    const eventRefresh = createRefreshBurstCoalescer(async () => {
+      if (!stopped) await refreshVisibleData(true);
+    });
     const startPolling = () => {
-      if (!stopped && !poller) poller = window.setInterval(() => void refresh(true), 30000);
+      if (!stopped && !poller)
+        poller = window.setInterval(() => void refreshVisibleData(true), 30000);
     };
     const clearTimers = () => {
       if (retryTimer) window.clearTimeout(retryTimer);
@@ -3023,7 +3156,7 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
         setLiveUpdates(true);
         scheduleRenewal();
       };
-      stream.onmessage = () => void refresh(true);
+      stream.onmessage = eventRefresh.request;
       stream.onerror = () => {
         if (stopped) return;
         setLiveUpdates(false);
@@ -3035,11 +3168,12 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
     return () => {
       stopped = true;
       stream?.close();
+      eventRefresh.cancel();
       if (poller) window.clearInterval(poller);
       clearTimers();
       setLiveUpdates(false);
     };
-  }, [demo, enabled, mode, online, refresh]);
+  }, [demo, enabled, mode, online, refreshVisibleData]);
 
   return {
     data,
@@ -3048,10 +3182,12 @@ function useHubData(enabled: boolean, demo: boolean, demoLanguage: UiLanguage) {
     refreshing,
     error,
     liveUpdates,
+    resources,
+    incidentsVersion,
     auditLoadingMore,
     auditLoadError,
     loadMoreAudit,
-    refresh,
+    refresh: refreshVisibleData,
     setData,
   };
 }
@@ -4074,10 +4210,59 @@ export function AlertHubApp({ appName = "Alert Hub" }: { appName?: string }) {
   );
 }
 
+function HubPageSkeleton({ label }: { label: string }) {
+  return (
+    <div className="page-stack" aria-busy="true" aria-live="polite">
+      <PageHeading
+        eyebrow={tr("Подтверждённые данные", "Verified data")}
+        title={label}
+        description={tr(
+          "Получаем первый подтверждённый ответ текущей сессии…",
+          "Waiting for the first verified response in this session…",
+        )}
+      />
+      <Panel className="incident-table-panel">
+        <div className="filter-bar">
+          <span className="filter-result">{tr("Загрузка…", "Loading…")}</span>
+        </div>
+        <div className="incidents-table-wrap" aria-hidden="true">
+          <table className="incidents-table">
+            <thead>
+              <tr>
+                <th>{tr("Данные", "Data")}</th>
+                <th>{tr("Состояние", "State")}</th>
+                <th>{tr("Источник", "Source")}</th>
+                <th>{tr("Обновление", "Update")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Array.from({ length: 5 }, (_, index) => (
+                <tr key={index}>
+                  <td>
+                    <span className="table-severity table-severity--unknown" />
+                    <span>
+                      <b>••••••••••••••••••</b>
+                      <small>••••••••</small>
+                    </span>
+                  </td>
+                  <td>••••••</td>
+                  <td>••••••••••</td>
+                  <td>••••••••</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
 function AlertHubRuntime() {
   const queryClient = useQueryClient();
   const { language } = useContext(LanguageContext);
   const auth = useAuthSession();
+  const { route, navigate } = useRoute();
   const {
     data,
     mode,
@@ -4085,6 +4270,8 @@ function AlertHubRuntime() {
     refreshing,
     error,
     liveUpdates,
+    resources,
+    incidentsVersion,
     auditLoadingMore,
     auditLoadError,
     loadMoreAudit,
@@ -4094,6 +4281,7 @@ function AlertHubRuntime() {
     auth.state.status === "authenticated" || auth.state.status === "offline",
     auth.state.status === "demo",
     language,
+    route.id === "incidents" || route.id === "incident",
   );
   const checksRuntimeMode: ChecksRuntimeMode =
     auth.state.status === "authenticated"
@@ -4102,7 +4290,6 @@ function AlertHubRuntime() {
         ? "unavailable"
         : "disabled";
   const [checksOverview, refreshChecks] = useChecksOverview(getChecksJson, checksRuntimeMode);
-  const { route, navigate } = useRoute();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenu, setMobileMenu] = useState(false);
   const [sourceWizard, setSourceWizard] = useState(false);
@@ -4133,6 +4320,17 @@ function AlertHubRuntime() {
       setLogoutBusy(false);
     }
   };
+  const updateIncidentStatuses = useCallback(
+    (updates: Record<string, IncidentStatus>) => {
+      setData((current) => ({
+        ...current,
+        incidents: current.incidents.map((incident) =>
+          updates[incident.id] ? { ...incident, status: updates[incident.id] } : incident,
+        ),
+      }));
+    },
+    [setData],
+  );
 
   useEffect(() => {
     if (import.meta.env.DEV && "serviceWorker" in navigator) {
@@ -4167,126 +4365,186 @@ function AlertHubRuntime() {
     return <AuthGate onAuthenticated={auth.authenticate} onDemo={auth.useDemo} />;
   }
 
-  const view = (() => {
+  const hubPageReady = (() => {
     switch (route.id) {
       case "incidents":
-        return <IncidentsPage incidents={data.incidents} navigate={navigate} />;
-      case "incident":
-        return (
-          <IncidentDetailPage
-            incidentId={route.incidentId ?? ""}
-            incidents={data.incidents}
-            navigate={navigate}
-            setData={setData}
-            readOnly={readOnly}
-            checksVisible={checksVisible}
-          />
-        );
       case "checks":
-        return (
-          <ChecksPage
-            request={getChecksJson}
-            runtimeMode={checksRuntimeMode}
-            language={language}
-            navigate={navigate}
-          />
-        );
       case "check":
-        return (
-          <CheckDetailPage
-            checkId={route.checkId ?? ""}
-            request={getChecksJson}
-            runtimeMode={checksRuntimeMode}
-            language={language}
-            navigate={navigate}
-          />
-        );
-      case "reachability":
-        return (
-          <ReachabilityPage
-            cells={data.reachability}
-            meta={data.reachabilityMeta}
-            grafanaUrl={data.summary.grafanaUrl}
-            datasources={data.datasources}
-            readOnly={readOnly}
-            onRefresh={() => void refresh()}
-            setData={setData}
-          />
-        );
-      case "sources":
-        return (
-          <SourcesPage
-            sources={data.sources}
-            readOnly={readOnly}
-            onAdd={() => setSourceWizard(true)}
-            setData={setData}
-          />
-        );
-      case "channels":
-        return (
-          <ChannelsPage
-            channels={data.channels}
-            routes={data.routes}
-            outboxPending={data.summary.outboxPending}
-            readOnly={readOnly}
-            setData={setData}
-            onNotifications={openNotifications}
-          />
-        );
-      case "devices":
-        return (
-          <DevicesPage
-            devices={data.devices}
-            readOnly={readOnly}
-            setData={setData}
-            onNotifications={openNotifications}
-          />
-        );
+      case "incident":
+        return true;
       case "cluster":
-        return (
-          <ClusterPage
-            nodes={data.nodes}
-            meta={data.clusterMeta}
-            outboxPending={data.summary.outboxPending}
-            onRefresh={() => void refresh()}
-          />
-        );
+        return resources.cluster;
+      case "reachability":
+        return resources.reachability && resources.datasources;
+      case "sources":
+        return resources.sources;
+      case "channels":
+        return resources.channels && resources.routes;
+      case "devices":
+        return resources.devices;
       case "audit":
-        return (
-          <AuditPage
-            items={data.audit}
-            nextOffset={data.auditNextOffset}
-            total={data.auditTotal}
-            nodes={data.nodes}
-            loadingMore={auditLoadingMore}
-            loadError={auditLoadError}
-            onLoadMore={() => void loadMoreAudit()}
-            readOnly={readOnly}
-          />
-        );
+        return resources.audit;
       case "settings":
-        return (
-          <SettingsPage
-            nodes={data.nodes}
-            summary={data.summary}
-            readOnly={readOnly}
-            setData={setData}
-            onRefresh={() => refresh(true)}
-          />
-        );
+        return resources.cluster && resources.summary;
       default:
         return (
-          <OverviewPage
-            data={data}
-            checks={checksOverview}
-            refreshChecks={refreshChecks}
-            readOnly={readOnly}
-            navigate={navigate}
-            onNotifications={openNotifications}
-          />
+          resources.incidents &&
+          resources.cluster &&
+          resources.sources &&
+          resources.channels &&
+          resources.reachability &&
+          resources.summary
         );
     }
   })();
+  const pageLabel =
+    route.id === "incident"
+      ? tr("Инцидент", "Incident")
+      : (NAV_ITEMS.find((item) => item.id === route.id)?.label ?? tr("Обзор", "Overview"));
+
+  const view = !hubPageReady ? (
+    <HubPageSkeleton label={pageLabel} />
+  ) : (
+    (() => {
+      switch (route.id) {
+        case "incidents":
+          return (
+            <IncidentsPage
+              incidents={data.incidents}
+              navigate={navigate}
+              requestList={auth.state.status !== "demo"}
+              readOnly={readOnly}
+              externalRefreshVersion={incidentsVersion}
+              onStatusesChanged={updateIncidentStatuses}
+            />
+          );
+        case "incident":
+          return (
+            <IncidentDetailPage
+              key={`${route.incidentId}:${auth.state.status}:${memorySessionId ?? "none"}:${authGeneration}`}
+              incidentId={route.incidentId ?? ""}
+              incidents={data.incidents}
+              navigate={navigate}
+              setData={setData}
+              readOnly={readOnly}
+              checksVisible={checksVisible}
+              externalRefreshVersion={incidentsVersion}
+              requestMode={
+                auth.state.status === "demo"
+                  ? "demo"
+                  : auth.state.status === "offline"
+                    ? "offline"
+                    : "live"
+              }
+            />
+          );
+        case "checks":
+          return (
+            <ChecksPage
+              request={getChecksJson}
+              runtimeMode={checksRuntimeMode}
+              language={language}
+              navigate={navigate}
+            />
+          );
+        case "check":
+          return (
+            <CheckDetailPage
+              checkId={route.checkId ?? ""}
+              request={getChecksJson}
+              runtimeMode={checksRuntimeMode}
+              language={language}
+              navigate={navigate}
+            />
+          );
+        case "reachability":
+          return (
+            <ReachabilityPage
+              cells={data.reachability}
+              meta={data.reachabilityMeta}
+              grafanaUrl={data.summary.grafanaUrl}
+              datasources={data.datasources}
+              readOnly={readOnly}
+              onRefresh={() => void refresh()}
+              setData={setData}
+            />
+          );
+        case "sources":
+          return (
+            <SourcesPage
+              sources={data.sources}
+              readOnly={readOnly}
+              onAdd={() => setSourceWizard(true)}
+              setData={setData}
+            />
+          );
+        case "channels":
+          return (
+            <ChannelsPage
+              channels={data.channels}
+              routes={data.routes}
+              outboxPending={data.summary.outboxPending}
+              readOnly={readOnly}
+              setData={setData}
+              onNotifications={openNotifications}
+            />
+          );
+        case "devices":
+          return (
+            <DevicesPage
+              devices={data.devices}
+              readOnly={readOnly}
+              setData={setData}
+              onNotifications={openNotifications}
+            />
+          );
+        case "cluster":
+          return (
+            <ClusterPage
+              nodes={data.nodes}
+              meta={data.clusterMeta}
+              outboxPending={data.summary.outboxPending}
+              grafanaUrl={data.summary.grafanaUrl}
+              onRefresh={() => void refresh()}
+            />
+          );
+        case "audit":
+          return (
+            <AuditPage
+              items={data.audit}
+              nextOffset={data.auditNextOffset}
+              total={data.auditTotal}
+              nodes={data.nodes}
+              loadingMore={auditLoadingMore}
+              loadError={auditLoadError}
+              onLoadMore={() => void loadMoreAudit()}
+              readOnly={readOnly}
+            />
+          );
+        case "settings":
+          return (
+            <SettingsPage
+              nodes={data.nodes}
+              summary={data.summary}
+              readOnly={readOnly}
+              setData={setData}
+              onRefresh={() => refresh(true)}
+            />
+          );
+        default:
+          return (
+            <OverviewPage
+              data={data}
+              checks={checksOverview}
+              refreshChecks={refreshChecks}
+              readOnly={readOnly}
+              navigate={navigate}
+              onNotifications={openNotifications}
+            />
+          );
+      }
+    })()
+  );
 
   return (
     <div className="app-shell">
@@ -4398,11 +4656,20 @@ function KpiCard({
   );
 }
 
-function GrafanaLink({ url }: { url: string | null }) {
+function GrafanaLink({
+  url,
+  block = false,
+  label,
+}: {
+  url: string | null;
+  block?: boolean;
+  label?: string;
+}) {
+  const className = `button button--quiet grafana-link ${block ? "button--block" : ""}`.trim();
   if (!url) {
     return (
       <span
-        className="button button--quiet grafana-link grafana-link--missing"
+        className={`${className} grafana-link--missing`}
         aria-label={tr("Grafana не настроена", "Grafana not configured")}
         aria-disabled="true"
       >
@@ -4411,13 +4678,8 @@ function GrafanaLink({ url }: { url: string | null }) {
     );
   }
   return (
-    <a
-      className="button button--quiet grafana-link"
-      href={url}
-      target="_blank"
-      rel="noopener noreferrer"
-    >
-      <Icon symbol="∿" /> {tr("Открыть Grafana", "Open Grafana")}
+    <a className={className} href={url} target="_blank" rel="noopener noreferrer">
+      <Icon symbol="∿" /> {label ?? tr("Открыть Grafana", "Open Grafana")}
     </a>
   );
 }
@@ -4923,38 +5185,427 @@ function OverviewPage({
   );
 }
 
+type IncidentStatusCounts = {
+  active: number;
+  open: number;
+  acknowledged: number;
+  resolved: number;
+  silenced: number;
+  all: number;
+};
+
+type IncidentPageSnapshot = {
+  items: Incident[];
+  total: number;
+  counts: IncidentStatusCounts;
+  bulkLimit: number;
+};
+
+type RemoteIncidentPageSnapshot = IncidentPageSnapshot & {
+  requestPath: string | null;
+  filterBulkAuthoritative: boolean;
+};
+
+type IncidentBulkAction = "acknowledge" | "resolve" | "silence";
+
+const INCIDENT_PAGE_SIZE = 50;
+const EMPTY_INCIDENT_COUNTS: IncidentStatusCounts = {
+  active: 0,
+  open: 0,
+  acknowledged: 0,
+  resolved: 0,
+  silenced: 0,
+  all: 0,
+};
+const EMPTY_INCIDENT_PAGE: IncidentPageSnapshot = {
+  items: [],
+  total: 0,
+  counts: EMPTY_INCIDENT_COUNTS,
+  bulkLimit: 500,
+};
+
+function incidentCounts(value: unknown): IncidentStatusCounts {
+  const row = asRecord(value);
+  return Object.fromEntries(
+    Object.keys(EMPTY_INCIDENT_COUNTS).map((key) => [
+      key,
+      Math.max(0, Math.trunc(asFiniteNumber(row[key]) ?? 0)),
+    ]),
+  ) as IncidentStatusCounts;
+}
+
 function IncidentsPage({
   incidents,
   navigate,
+  requestList,
+  readOnly,
+  externalRefreshVersion,
+  onStatusesChanged,
 }: {
   incidents: Incident[];
   navigate: (path: string) => void;
+  requestList: boolean;
+  readOnly: boolean;
+  externalRefreshVersion: number;
+  onStatusesChanged: (updates: Record<string, IncidentStatus>) => void;
 }) {
   const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [status, setStatus] = useState<"active" | "all" | IncidentStatus>("active");
   const [severity, setSeverity] = useState<"all" | Severity>("all");
-  const filtered = useMemo(
-    () =>
-      incidents.filter((incident) => {
-        const searchMatch =
-          `${incident.title} ${incident.description} ${incident.source} ${Object.values(incident.labels).join(" ")}`
-            .toLowerCase()
-            .includes(query.toLowerCase());
-        const statusMatch =
-          status === "all" ||
-          (status === "active" ? incident.status !== "resolved" : incident.status === status);
-        const severityMatch = severity === "all" || incident.severity === severity;
-        return searchMatch && statusMatch && severityMatch;
-      }),
-    [incidents, query, severity, status],
+  const [offset, setOffset] = useState(0);
+  const [remote, setRemote] = useState<RemoteIncidentPageSnapshot>({
+    ...EMPTY_INCIDENT_PAGE,
+    requestPath: null,
+    filterBulkAuthoritative: false,
+  });
+  const [hasLoaded, setHasLoaded] = useState(!requestList);
+  const [loadFailure, setLoadFailure] = useState<{
+    requestKey: string;
+    message: string;
+  } | null>(null);
+  const [reloadVersion, setReloadVersion] = useState(0);
+  const [settledRequestKey, setSettledRequestKey] = useState<string | null>(
+    requestList ? null : "local",
   );
-  const counts = {
-    active: incidents.filter((item) => item.status !== "resolved").length,
-    acknowledged: incidents.filter((item) => item.status === "acknowledged").length,
-    resolved: incidents.filter((item) => item.status === "resolved").length,
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [allResultsSelected, setAllResultsSelected] = useState(false);
+  const [excludedIds, setExcludedIds] = useState<Set<string>>(() => new Set());
+  const [bulkAction, setBulkAction] = useState<IncidentBulkAction>("acknowledge");
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkOutcome, setBulkOutcome] = useState<string | null>(null);
+  const [bulkFailed, setBulkFailed] = useState(false);
+  const settledExternalRefreshVersion = useRef(externalRefreshVersion);
+
+  const normalizedQuery = normalizeIncidentSearch(query);
+  const requestPath = useMemo(
+    () =>
+      incidentListPath({
+        status,
+        severity,
+        query: debouncedQuery,
+        limit: INCIDENT_PAGE_SIZE,
+        offset,
+      }),
+    [debouncedQuery, offset, severity, status],
+  );
+  const requestKey = `${externalRefreshVersion}:${reloadVersion}:${requestPath}`;
+  const loading =
+    requestList && (normalizedQuery !== debouncedQuery || settledRequestKey !== requestKey);
+  const loadError =
+    requestList && loadFailure?.requestKey === requestKey ? loadFailure.message : null;
+  const actionsBlocked = loading || loadError !== null;
+
+  const resetSelection = () => {
+    setSelectedIds(new Set());
+    setAllResultsSelected(false);
+    setExcludedIds(new Set());
+    setBulkOutcome(null);
   };
+
+  const resetPageAndSelection = () => {
+    setOffset(0);
+    resetSelection();
+  };
+
+  const reload = () => {
+    setReloadVersion((current) => current + 1);
+  };
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQuery(normalizedQuery), 250);
+    return () => window.clearTimeout(timer);
+  }, [normalizedQuery]);
+
+  useEffect(() => {
+    if (!requestList) {
+      let active = true;
+      queueMicrotask(() => {
+        if (active) setSettledRequestKey("local");
+      });
+      return () => {
+        active = false;
+      };
+    }
+    let active = true;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 6500);
+    const clearSelectionAfterRefresh =
+      externalRefreshVersion !== settledExternalRefreshVersion.current;
+    void getJson(requestPath, controller.signal)
+      .then((result) => {
+        if (!active) return;
+        const body = asRecord(result.payload);
+        // `incidents` keeps compatibility with an N-1 list envelope; listFrom
+        // transparently falls back to the current `items` field.
+        const items = listFrom(body, "incidents").map(normalizeIncident);
+        const total = Math.max(0, Math.trunc(asFiniteNumber(body.total) ?? items.length));
+        const nextOffset =
+          offset > 0 && offset >= total
+            ? Math.max(
+                0,
+                Math.floor((Math.max(total, 1) - 1) / INCIDENT_PAGE_SIZE) * INCIDENT_PAGE_SIZE,
+              )
+            : offset;
+        if (nextOffset !== offset) {
+          setOffset(nextOffset);
+          setHasLoaded(true);
+          return;
+        }
+        setRemote({
+          items,
+          total,
+          counts: incidentCounts(body.counts),
+          bulkLimit: Math.max(1, Math.trunc(asFiniteNumber(body.bulk_limit) ?? 500)),
+          requestPath,
+          filterBulkAuthoritative: result.mutationAuthoritative,
+        });
+        if (!result.mutationAuthoritative) {
+          // Explicit IDs stay selected and remain safe to send to the origin,
+          // but a previous filter-wide selection must not survive a source
+          // downgrade to a peer or the service-worker cache.
+          setAllResultsSelected(false);
+          setExcludedIds(new Set());
+        }
+        if (clearSelectionAfterRefresh) {
+          setSelectedIds(new Set());
+          setAllResultsSelected(false);
+          setExcludedIds(new Set());
+          settledExternalRefreshVersion.current = externalRefreshVersion;
+        }
+        setLoadFailure(null);
+        setHasLoaded(true);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setSelectedIds(new Set());
+        setAllResultsSelected(false);
+        setExcludedIds(new Set());
+        if (clearSelectionAfterRefresh) {
+          settledExternalRefreshVersion.current = externalRefreshVersion;
+        }
+        setHasLoaded(true);
+        setLoadFailure({
+          requestKey,
+          message:
+            error instanceof Error
+              ? error.message
+              : tr("Не удалось загрузить инциденты.", "Could not load incidents."),
+        });
+      })
+      .finally(() => {
+        window.clearTimeout(timer);
+        if (active) setSettledRequestKey(requestKey);
+      });
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [externalRefreshVersion, offset, requestKey, requestList, requestPath]);
+
+  const localSnapshot = useMemo<IncidentPageSnapshot>(() => {
+    const needle = query.trim().toLowerCase();
+    const matchingBase: Incident[] = [];
+    const counts = { ...EMPTY_INCIDENT_COUNTS };
+    for (const incident of incidents) {
+      if (severity !== "all" && incident.severity !== severity) continue;
+      if (
+        needle &&
+        !`${incident.title} ${incident.description} ${incident.source} ${Object.values(
+          incident.labels,
+        ).join(" ")}`
+          .toLowerCase()
+          .includes(needle)
+      ) {
+        continue;
+      }
+      matchingBase.push(incident);
+      counts.all += 1;
+      counts[incident.status] += 1;
+      if (incident.status !== "resolved") counts.active += 1;
+    }
+    const filtered = matchingBase.filter(
+      (incident) =>
+        status === "all" ||
+        (status === "active" ? incident.status !== "resolved" : incident.status === status),
+    );
+    return {
+      items: filtered.slice(offset, offset + INCIDENT_PAGE_SIZE),
+      total: filtered.length,
+      counts,
+      bulkLimit: 500,
+    };
+  }, [incidents, offset, query, severity, status]);
+
+  const snapshot = requestList
+    ? remote.requestPath === requestPath
+      ? remote
+      : EMPTY_INCIDENT_PAGE
+    : localSnapshot;
+  const filterBulkAuthoritative =
+    requestList &&
+    remote.requestPath === requestPath &&
+    remote.filterBulkAuthoritative &&
+    !readOnly;
+  const selectedCount = allResultsSelected
+    ? Math.max(0, snapshot.total - excludedIds.size)
+    : selectedIds.size;
+  const rowSelected = (incidentId: string) =>
+    allResultsSelected ? !excludedIds.has(incidentId) : selectedIds.has(incidentId);
+  const selectedOnPage = snapshot.items.filter((incident) => rowSelected(incident.id)).length;
+  const allPageSelected = snapshot.items.length > 0 && selectedOnPage === snapshot.items.length;
+  const somePageSelected = selectedOnPage > 0 && !allPageSelected;
+
+  const togglePage = () => {
+    if (actionsBlocked || bulkBusy || readOnly) return;
+    if (allResultsSelected) {
+      setExcludedIds((current) => {
+        const next = new Set(current);
+        snapshot.items.forEach((incident) => {
+          if (allPageSelected) next.add(incident.id);
+          else next.delete(incident.id);
+        });
+        return next;
+      });
+      return;
+    }
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      snapshot.items.forEach((incident) => {
+        if (allPageSelected) next.delete(incident.id);
+        else next.add(incident.id);
+      });
+      return next;
+    });
+  };
+
+  const toggleIncident = (incidentId: string) => {
+    if (actionsBlocked || bulkBusy || readOnly) return;
+    if (allResultsSelected) {
+      setExcludedIds((current) => {
+        const next = new Set(current);
+        if (next.has(incidentId)) next.delete(incidentId);
+        else next.add(incidentId);
+        return next;
+      });
+      return;
+    }
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(incidentId)) next.delete(incidentId);
+      else next.add(incidentId);
+      return next;
+    });
+  };
+
+  const selectAllResults = () => {
+    if (actionsBlocked || bulkBusy || readOnly || !filterBulkAuthoritative) return;
+    setSelectedIds(new Set());
+    setExcludedIds(new Set());
+    setAllResultsSelected(true);
+    setBulkOutcome(null);
+  };
+
+  const applyBulkAction = async () => {
+    if (
+      !selectedCount ||
+      readOnly ||
+      bulkBusy ||
+      actionsBlocked ||
+      (allResultsSelected && !filterBulkAuthoritative) ||
+      selectedCount > snapshot.bulkLimit
+    )
+      return;
+    if (
+      bulkAction === "resolve" &&
+      !window.confirm(
+        tr(
+          `Решить выбранные инциденты (${selectedCount})? Возврат в активное состояние возможен только после нового firing-события.`,
+          `Resolve the selected incidents (${selectedCount})? They become active again only after a new firing event.`,
+        ),
+      )
+    ) {
+      return;
+    }
+    setBulkBusy(true);
+    setBulkOutcome(null);
+    setBulkFailed(false);
+    const filters: Record<string, string> = {};
+    if (status !== "all") filters.status = status;
+    if (severity !== "all") filters.severity = severity;
+    if (debouncedQuery) filters.q = debouncedQuery;
+    try {
+      const response = await mutationJson("/incidents/bulk-action", {
+        method: "POST",
+        body: JSON.stringify(
+          allResultsSelected
+            ? {
+                action: bulkAction,
+                selection_mode: "filter",
+                excluded_incident_ids: [...excludedIds],
+                filters,
+              }
+            : {
+                action: bulkAction,
+                selection_mode: "ids",
+                incident_ids: [...selectedIds],
+              },
+        ),
+      });
+      const body = asRecord(response);
+      const results = listFrom(body.results, "results");
+      const updates: Record<string, IncidentStatus> = {};
+      const failureDetails: string[] = [];
+      for (const result of results) {
+        const row = asRecord(result);
+        const incidentId = String(row.incident_id ?? "");
+        const resultStatus = String(row.status ?? "");
+        if (incidentId && ["open", "acknowledged", "resolved", "silenced"].includes(resultStatus)) {
+          updates[incidentId] = resultStatus as IncidentStatus;
+        }
+        if (["not_found", "conflict"].includes(String(row.outcome))) {
+          failureDetails.push(String(row.detail ?? row.outcome));
+        }
+      }
+      onStatusesChanged(updates);
+      const updated = Math.max(0, Math.trunc(asFiniteNumber(body.updated) ?? 0));
+      const unchanged = Math.max(0, Math.trunc(asFiniteNumber(body.unchanged) ?? 0));
+      const failed = Math.max(0, Math.trunc(asFiniteNumber(body.failed) ?? 0));
+      setBulkFailed(failed > 0);
+      setBulkOutcome(
+        `${tr("Изменено", "Updated")}: ${updated} · ${tr("без изменений", "unchanged")}: ${unchanged} · ${tr("ошибок", "failed")}: ${failed}${
+          failureDetails.length ? ` — ${failureDetails.slice(0, 2).join("; ")}` : ""
+        }`,
+      );
+      // A successful request clears only the selection. Keep the operation
+      // summary visible so partial failures are not silently lost.
+      setSelectedIds(new Set());
+      setAllResultsSelected(false);
+      setExcludedIds(new Set());
+      reload();
+    } catch (error) {
+      setBulkFailed(true);
+      setBulkOutcome(
+        error instanceof Error
+          ? error.message
+          : tr("Массовое действие не выполнено.", "Bulk action failed."),
+      );
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  if (requestList && !hasLoaded) {
+    return <HubPageSkeleton label={tr("Инциденты", "Incidents")} />;
+  }
+
+  const counts = snapshot.counts;
+  const canSelectAllResults = snapshot.total <= snapshot.bulkLimit && filterBulkAuthoritative;
+  const pageNumber = Math.floor(offset / INCIDENT_PAGE_SIZE) + 1;
+  const pageCount = Math.max(1, Math.ceil(snapshot.total / INCIDENT_PAGE_SIZE));
   return (
-    <div className="page-stack incidents-page">
+    <div className="page-stack incidents-page" aria-busy={loading || bulkBusy}>
       <PageHeading
         eyebrow={tr("Единый журнал", "Unified journal")}
         title={tr("Инциденты", "Incidents")}
@@ -4965,26 +5616,52 @@ function IncidentsPage({
       />
       <div
         className="incident-tabs"
-        role="tablist"
+        role="group"
         aria-label={tr("Статус инцидента", "Incident status")}
       >
-        <button className={status === "active" ? "active" : ""} onClick={() => setStatus("active")}>
+        <button
+          type="button"
+          className={status === "active" ? "active" : ""}
+          onClick={() => {
+            if (status === "active") return;
+            setStatus("active");
+            resetPageAndSelection();
+          }}
+        >
           {tr("Активные", "Active")} <span>{counts.active}</span>
         </button>
         <button
+          type="button"
           className={status === "acknowledged" ? "active" : ""}
-          onClick={() => setStatus("acknowledged")}
+          onClick={() => {
+            if (status === "acknowledged") return;
+            setStatus("acknowledged");
+            resetPageAndSelection();
+          }}
         >
           {tr("В работе", "Acknowledged")} <span>{counts.acknowledged}</span>
         </button>
         <button
+          type="button"
           className={status === "resolved" ? "active" : ""}
-          onClick={() => setStatus("resolved")}
+          onClick={() => {
+            if (status === "resolved") return;
+            setStatus("resolved");
+            resetPageAndSelection();
+          }}
         >
           {tr("Решённые", "Resolved")} <span>{counts.resolved}</span>
         </button>
-        <button className={status === "all" ? "active" : ""} onClick={() => setStatus("all")}>
-          {tr("Все", "All")} <span>{incidents.length}</span>
+        <button
+          type="button"
+          className={status === "all" ? "active" : ""}
+          onClick={() => {
+            if (status === "all") return;
+            setStatus("all");
+            resetPageAndSelection();
+          }}
+        >
+          {tr("Все", "All")} <span>{counts.all}</span>
         </button>
       </div>
       <Panel className="incident-table-panel">
@@ -4994,12 +5671,21 @@ function IncidentsPage({
             <span className="sr-only">{tr("Поиск инцидентов", "Search incidents")}</span>
             <input
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder={tr("Название, источник или метка…", "Title, source, or label…")}
+              onChange={(event) => {
+                setQuery(event.target.value);
+                resetPageAndSelection();
+              }}
+              placeholder={tr(
+                "Название, описание, источник или метка…",
+                "Title, description, source, or label…",
+              )}
             />
             {query && (
               <button
-                onClick={() => setQuery("")}
+                onClick={() => {
+                  setQuery("");
+                  resetPageAndSelection();
+                }}
                 aria-label={tr("Очистить поиск", "Clear search")}
               >
                 ×
@@ -5010,7 +5696,10 @@ function IncidentsPage({
             <span>{tr("Критичность", "Severity")}</span>
             <select
               value={severity}
-              onChange={(event) => setSeverity(event.target.value as "all" | Severity)}
+              onChange={(event) => {
+                setSeverity(event.target.value as "all" | Severity);
+                resetPageAndSelection();
+              }}
             >
               <option value="all">{tr("Любая", "Any")}</option>
               <option value="critical">{tr("Критическая", "Critical")}</option>
@@ -5019,88 +5708,281 @@ function IncidentsPage({
               <option value="unknown">{tr("Неизвестно", "Unknown")}</option>
             </select>
           </label>
-          <span className="filter-result">
-            {tr("Найдено", "Found")}: {filtered.length}
+          <span className="filter-result" aria-live="polite">
+            {loading
+              ? tr("Обновление…", "Updating…")
+              : `${tr("Найдено", "Found")}: ${snapshot.total}`}
           </span>
         </div>
-        {filtered.length ? (
-          <div className="incidents-table-wrap">
-            <table className="incidents-table">
-              <thead>
-                <tr>
-                  <th>{tr("Инцидент", "Incident")}</th>
-                  <th>{tr("Статус", "Status")}</th>
-                  <th>{tr("Источник / регион", "Source / region")}</th>
-                  <th>{tr("Цель", "Target")}</th>
-                  <th>{tr("Последнее событие", "Last event")}</th>
-                  <th>
-                    <span className="sr-only">{tr("Открыть", "Open")}</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((incident) => (
-                  <tr key={incident.id} onClick={() => navigate(`/incidents/${incident.id}`)}>
-                    <td>
-                      <span className={`table-severity table-severity--${incident.severity}`} />
-                      <span>
-                        <b>{incident.title}</b>
-                        <small>
-                          <SeverityBadge severity={incident.severity} />
-                          {compactId(incident.id)}
-                        </small>
-                      </span>
-                    </td>
-                    <td>
-                      <IncidentStatusBadge status={incident.status} />
-                    </td>
-                    <td>
-                      <b className="table-regular">{incident.source}</b>
-                      <small>{incident.region}</small>
-                    </td>
-                    <td>
-                      <code>{incident.target}</code>
-                    </td>
-                    <td>
-                      <b className="table-regular">{formatRelative(incident.lastEventAt)}</b>
-                      <small>{formatDate(incident.lastEventAt)}</small>
-                    </td>
-                    <td>
-                      <button
-                        className="row-open"
-                        aria-label={`${tr("Открыть", "Open")} ${incident.title}`}
-                      >
-                        <Icon symbol="›" />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+
+        {selectedCount > 0 && (
+          <div className="filter-bar" aria-label={tr("Массовое действие", "Bulk action")}>
+            <span>
+              {tr("Выбрано", "Selected")}: <b>{selectedCount}</b>
+            </span>
+            <label className="select-field">
+              <span>{tr("Действие", "Action")}</span>
+              <select
+                value={bulkAction}
+                onChange={(event) => setBulkAction(event.target.value as IncidentBulkAction)}
+                disabled={bulkBusy || actionsBlocked || readOnly}
+              >
+                <option value="acknowledge">{tr("Принять в работу", "Acknowledge")}</option>
+                <option value="resolve">{tr("Решить", "Resolve")}</option>
+                <option value="silence">{tr("Заглушить", "Silence")}</option>
+              </select>
+            </label>
+            <button
+              className="button button--quiet button--small"
+              type="button"
+              onClick={() => void applyBulkAction()}
+              disabled={
+                bulkBusy ||
+                actionsBlocked ||
+                readOnly ||
+                (allResultsSelected && !filterBulkAuthoritative) ||
+                selectedCount > snapshot.bulkLimit
+              }
+            >
+              {bulkBusy ? tr("Применяем…", "Applying…") : tr("Применить", "Apply")}
+            </button>
+            <button
+              className="text-button"
+              type="button"
+              onClick={resetSelection}
+              disabled={bulkBusy}
+            >
+              {tr("Снять выбор", "Clear selection")}
+            </button>
           </div>
+        )}
+
+        {allPageSelected && !allResultsSelected && snapshot.total > snapshot.items.length && (
+          <div className="permission-message permission-message--success" role="status">
+            <Icon symbol="✓" />
+            <span>
+              {tr("Выбрана текущая страница", "Current page selected")} ({snapshot.items.length}).
+            </span>
+            {canSelectAllResults ? (
+              <button
+                className="text-button"
+                type="button"
+                onClick={selectAllResults}
+                disabled={actionsBlocked}
+              >
+                {tr(
+                  `Выбрать все ${snapshot.total} результатов`,
+                  `Select all ${snapshot.total} matching results`,
+                )}
+              </button>
+            ) : snapshot.total > snapshot.bulkLimit ? (
+              <span>
+                {tr(
+                  `Для выбора всех сузьте фильтр до ${snapshot.bulkLimit} инцидентов.`,
+                  `Narrow the filters to ${snapshot.bulkLimit} incidents before selecting all.`,
+                )}
+              </span>
+            ) : (
+              <span>
+                {tr(
+                  "Выбор всех результатов доступен после свежего ответа текущего узла. Пока можно изменить выбранные строки.",
+                  "Select-all is available after a fresh response from the current origin. You can still update the selected rows.",
+                )}{" "}
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={reload}
+                  disabled={actionsBlocked}
+                >
+                  {tr("Обновить список", "Refresh list")}
+                </button>
+              </span>
+            )}
+          </div>
+        )}
+        {allResultsSelected && (
+          <div className="permission-message permission-message--success" role="status">
+            <Icon symbol="✓" />
+            {tr(
+              `Выбраны все результаты фильтра; исключено: ${excludedIds.size}.`,
+              `All matching results selected; excluded: ${excludedIds.size}.`,
+            )}
+          </div>
+        )}
+        {selectedCount > snapshot.bulkLimit && (
+          <div className="permission-message permission-message--warning" role="alert">
+            <Icon symbol="!" />
+            {tr(
+              `За одно действие можно изменить не более ${snapshot.bulkLimit} инцидентов.`,
+              `A single action can change at most ${snapshot.bulkLimit} incidents.`,
+            )}
+          </div>
+        )}
+        {loadError && (
+          <div className="permission-message permission-message--warning" role="alert">
+            <Icon symbol="!" /> {loadError}
+            <button className="text-button" type="button" onClick={reload}>
+              {tr("Повторить", "Retry")}
+            </button>
+          </div>
+        )}
+
+        {snapshot.items.length ? (
+          <>
+            <div className="incidents-table-wrap">
+              <table className="incidents-table">
+                <thead>
+                  <tr>
+                    <th>
+                      <input
+                        type="checkbox"
+                        checked={allPageSelected}
+                        ref={(element) => {
+                          if (element) element.indeterminate = somePageSelected;
+                        }}
+                        onChange={togglePage}
+                        disabled={readOnly || bulkBusy || actionsBlocked}
+                        aria-label={tr("Выбрать текущую страницу", "Select current page")}
+                      />{" "}
+                      {tr("Инцидент", "Incident")}
+                    </th>
+                    <th>{tr("Статус", "Status")}</th>
+                    <th>{tr("Источник / регион", "Source / region")}</th>
+                    <th>{tr("Цель", "Target")}</th>
+                    <th>{tr("Последнее событие", "Last event")}</th>
+                    <th>
+                      <span className="sr-only">{tr("Открыть", "Open")}</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {snapshot.items.map((incident) => (
+                    <tr key={incident.id} onClick={() => navigate(`/incidents/${incident.id}`)}>
+                      <td>
+                        <span className={`table-severity table-severity--${incident.severity}`} />
+                        <span>
+                          <b>
+                            <input
+                              type="checkbox"
+                              checked={rowSelected(incident.id)}
+                              onChange={() => toggleIncident(incident.id)}
+                              onClick={(event) => event.stopPropagation()}
+                              disabled={readOnly || bulkBusy || actionsBlocked}
+                              aria-label={`${tr("Выбрать", "Select")} ${incident.title}`}
+                            />{" "}
+                            {incident.title}
+                          </b>
+                          <small>
+                            <SeverityBadge severity={incident.severity} />
+                            {compactId(incident.id)}
+                          </small>
+                        </span>
+                      </td>
+                      <td>
+                        <IncidentStatusBadge status={incident.status} />
+                      </td>
+                      <td>
+                        <b className="table-regular">{incident.source}</b>
+                        <small>{incident.region}</small>
+                      </td>
+                      <td>
+                        <code>{incident.target}</code>
+                      </td>
+                      <td>
+                        <b className="table-regular">{formatRelative(incident.lastEventAt)}</b>
+                        <small>{formatDate(incident.lastEventAt)}</small>
+                      </td>
+                      <td>
+                        <button
+                          className="row-open"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            navigate(`/incidents/${incident.id}`);
+                          }}
+                          aria-label={`${tr("Открыть", "Open")} ${incident.title}`}
+                        >
+                          <Icon symbol="›" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {snapshot.total > INCIDENT_PAGE_SIZE && (
+              <div className="audit-load-more">
+                <button
+                  className="button button--quiet button--small"
+                  type="button"
+                  onClick={() => {
+                    setOffset((value) => Math.max(0, value - INCIDENT_PAGE_SIZE));
+                  }}
+                  disabled={offset === 0 || loading}
+                >
+                  {tr("Назад", "Previous")}
+                </button>
+                <span aria-live="polite">
+                  {tr("Страница", "Page")} {pageNumber} / {pageCount}
+                </span>
+                <button
+                  className="button button--quiet button--small"
+                  type="button"
+                  onClick={() => {
+                    setOffset((value) => value + INCIDENT_PAGE_SIZE);
+                  }}
+                  disabled={offset + INCIDENT_PAGE_SIZE >= snapshot.total || loading}
+                >
+                  {tr("Далее", "Next")}
+                </button>
+              </div>
+            )}
+          </>
         ) : (
           <EmptyState
-            icon="⌕"
-            title={tr("Ничего не найдено", "No incidents found")}
-            message={tr(
-              "Сбросьте фильтры или измените поисковый запрос.",
-              "Clear the filters or adjust your search query.",
-            )}
+            icon={loadError ? "!" : "⌕"}
+            title={
+              loadError
+                ? tr("Инциденты недоступны", "Incidents unavailable")
+                : tr("Ничего не найдено", "No incidents found")
+            }
+            message={
+              loadError
+                ? tr(
+                    "Первый подтверждённый ответ не получен. Повторите загрузку.",
+                    "No verified response was received. Retry the request.",
+                  )
+                : tr(
+                    "Сбросьте фильтры или измените поисковый запрос.",
+                    "Clear the filters or adjust your search query.",
+                  )
+            }
             action={
               <button
                 className="button button--quiet"
                 onClick={() => {
-                  setQuery("");
-                  setStatus("all");
-                  setSeverity("all");
+                  if (loadError) reload();
+                  else {
+                    setQuery("");
+                    setStatus("all");
+                    setSeverity("all");
+                    resetPageAndSelection();
+                  }
                 }}
               >
-                {tr("Сбросить фильтры", "Reset filters")}
+                {loadError ? tr("Повторить", "Retry") : tr("Сбросить фильтры", "Reset filters")}
               </button>
             }
           />
         )}
       </Panel>
+      {bulkOutcome && (
+        <div
+          className={`permission-message ${bulkFailed ? "permission-message--warning" : "permission-message--success"}`}
+          role={bulkFailed ? "alert" : "status"}
+        >
+          <Icon symbol={bulkFailed ? "!" : "✓"} /> {bulkOutcome}
+        </div>
+      )}
     </div>
   );
 }
@@ -5112,6 +5994,8 @@ function IncidentDetailPage({
   setData,
   readOnly,
   checksVisible,
+  externalRefreshVersion,
+  requestMode,
 }: {
   incidentId: string;
   incidents: Incident[];
@@ -5119,8 +6003,23 @@ function IncidentDetailPage({
   setData: React.Dispatch<React.SetStateAction<HubData>>;
   readOnly: boolean;
   checksVisible: boolean;
+  externalRefreshVersion: number;
+  requestMode: "live" | "offline" | "demo";
 }) {
-  const incident = incidents.find((item) => item.id === incidentId);
+  const summaryIncident = incidents.find((item) => item.id === incidentId);
+  const detailRequestKey = `${requestMode}:${externalRefreshVersion}:${incidentId}`;
+  const [loadedIncident, setLoadedIncident] = useState<Incident | null>(null);
+  const [settledDetailRequestKey, setSettledDetailRequestKey] = useState<string | null>(
+    requestMode === "demo" ? detailRequestKey : null,
+  );
+  const [detailFailure, setDetailFailure] = useState<{
+    requestKey: string;
+    kind: "not_found" | "unavailable";
+  } | null>(null);
+  const detailLoading = requestMode !== "demo" && settledDetailRequestKey !== detailRequestKey;
+  const detailLoadError =
+    detailFailure?.requestKey === detailRequestKey ? detailFailure.kind : null;
+  const incident = loadedIncident ?? (requestMode === "live" ? undefined : summaryIncident);
   const [busy, setBusy] = useState<string | null>(null);
   const [comment, setComment] = useState("");
   const [commentOpen, setCommentOpen] = useState(false);
@@ -5128,6 +6027,14 @@ function IncidentDetailPage({
   const applyDetail = useCallback(
     (payload: unknown) => {
       const detail = normalizeIncident(payload, 0);
+      setDetailFailure(null);
+      setLoadedIncident((current) => {
+        const [stableDetail] = mergeIncidentSummariesWithHistory(
+          [detail],
+          current ? [current] : [],
+        );
+        return stableDetail ?? detail;
+      });
       setData((current) => {
         const [stableDetail] = mergeIncidentSummariesWithHistory([detail], current.incidents);
         return {
@@ -5143,27 +6050,55 @@ function IncidentDetailPage({
     [setData],
   );
   useEffect(() => {
-    if (!incidentId || !memoryAccessToken) return;
+    if (!incidentId || requestMode === "demo") return;
     let active = true;
-    void getJson(`/incidents/${encodeURIComponent(incidentId)}`)
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 6500);
+    void getJson(`/incidents/${encodeURIComponent(incidentId)}`, controller.signal)
       .then((result) => {
         if (!active) return;
         applyDetail(result.payload);
       })
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        if (!active) return;
+        const errorKind =
+          error instanceof Error && error.message.startsWith("404") ? "not_found" : "unavailable";
+        if (errorKind === "not_found") setLoadedIncident(null);
+        setDetailFailure({ requestKey: detailRequestKey, kind: errorKind });
+      })
+      .finally(() => {
+        window.clearTimeout(timer);
+        if (active) setSettledDetailRequestKey(detailRequestKey);
+      });
     return () => {
       active = false;
+      controller.abort();
+      window.clearTimeout(timer);
     };
-  }, [applyDetail, incidentId]);
+  }, [applyDetail, detailRequestKey, incidentId, requestMode]);
+  if (detailLoading && !loadedIncident) {
+    return <HubPageSkeleton label={tr("Инцидент", "Incident")} />;
+  }
   if (!incident) {
     return (
       <EmptyState
         icon="!"
-        title={tr("Инцидент не найден", "Incident not found")}
-        message={tr(
-          "Возможно, его нет в текущем локальном снимке.",
-          "It may not be present in the current local snapshot.",
-        )}
+        title={
+          detailLoadError === "unavailable"
+            ? tr("Инцидент временно недоступен", "Incident temporarily unavailable")
+            : tr("Инцидент не найден", "Incident not found")
+        }
+        message={
+          detailLoadError === "unavailable"
+            ? tr(
+                "Узел не вернул подтверждённые детали. Повторите после восстановления связи.",
+                "The node did not return verified details. Retry after connectivity recovers.",
+              )
+            : tr(
+                "Инцидент отсутствует на текущем узле или уже недоступен.",
+                "The incident is absent from the current node or is no longer available.",
+              )
+        }
         action={
           <button className="button button--quiet" onClick={() => navigate("/incidents")}>
             {tr("Вернуться к инцидентам", "Back to incidents")}
@@ -5219,11 +6154,20 @@ function IncidentDetailPage({
     }
   };
   return (
-    <div className="page-stack incident-detail-page">
+    <div className="page-stack incident-detail-page" aria-busy={detailLoading || Boolean(busy)}>
       <button className="breadcrumb-button" onClick={() => navigate("/incidents")}>
         <Icon symbol="←" />
         {tr("Инциденты", "Incidents")}
       </button>
+      {detailLoadError === "unavailable" && (
+        <div className="permission-message permission-message--warning" role="alert">
+          <Icon symbol="!" />
+          {tr(
+            "Не удалось подтвердить свежие детали; показан последний доступный снимок.",
+            "Fresh details could not be verified; the last available snapshot is shown.",
+          )}
+        </div>
+      )}
       <div className="incident-detail-head">
         <div
           className={`incident-detail-head__signal incident-detail-head__signal--${incident.severity}`}
@@ -7084,11 +8028,13 @@ function ClusterPage({
   nodes,
   meta,
   outboxPending,
+  grafanaUrl,
   onRefresh,
 }: {
   nodes: ClusterNode[];
   meta: ClusterMeta;
   outboxPending: number | null;
+  grafanaUrl: string | null;
   onRefresh: () => void;
 }) {
   const [selected, setSelected] = useState(nodes[0]?.id ?? "");
@@ -7265,15 +8211,11 @@ function ClusterPage({
               <b>{nodes.length}</b>
             </span>
           </div>
-          <a
-            className="button button--quiet button--block"
-            href="/metrics"
-            target="_blank"
-            rel="noreferrer"
-          >
-            <Icon symbol="↗" />
-            {tr("Открыть метрики приложения", "Open application metrics")}
-          </a>
+          <GrafanaLink
+            url={grafanaUrl}
+            block
+            label={tr("Открыть дашборд приложения", "Open application dashboard")}
+          />
         </Panel>
       </div>
     </div>
@@ -7623,13 +8565,15 @@ function SettingsPage({
     if (normalizedGrafana) {
       try {
         const parsed = new URL(normalizedGrafana);
-        if (parsed.protocol !== "https:" || parsed.username || parsed.password) throw new Error();
+        if (parsed.protocol !== "https:" || normalizeGrafanaUrl(normalizedGrafana) === null) {
+          throw new Error();
+        }
       } catch {
         setMonitoringMessage({
           tone: "warning",
           text: tr(
-            "Укажите HTTPS-адрес Grafana без логина и пароля в URL.",
-            "Enter a Grafana HTTPS URL without embedded credentials.",
+            "Укажите HTTPS-ссылку на конкретный дашборд Grafana (/d/<uid> или /d-solo/<uid>) без логина и пароля.",
+            "Enter an HTTPS link to a concrete Grafana dashboard (/d/<uid> or /d-solo/<uid>) without embedded credentials.",
           ),
         });
         return;

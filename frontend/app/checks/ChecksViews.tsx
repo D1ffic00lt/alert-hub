@@ -1,7 +1,15 @@
-import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
+import {
+  FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  ReactNode,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 import {
   CHECK_STATUSES,
+  checkIdentity,
   type CheckDetail,
   type CheckFilters,
   type CheckListItem,
@@ -12,6 +20,11 @@ import {
   problemChecks,
   resultMatrix,
 } from "./model";
+import {
+  describeCheckDiagnostic,
+  describeCheckErrorReason,
+  describeCheckExecutorState,
+} from "./diagnostics";
 import {
   type CheckDetailState,
   type ChecksListState,
@@ -56,6 +69,10 @@ const REASON_COPY: Record<string, readonly [string, string]> = {
   expired_measurements: ["Все измерения устарели", "All measurements have expired"],
   invalid_data: ["Получены недостоверные данные", "Invalid or conflicting data was returned"],
   prometheus_unavailable: ["Prometheus временно недоступен", "Prometheus is unavailable"],
+  executor_error: ["Исполнитель завершился с ошибкой", "The runner ended with an error"],
+  executor_stale: ["Состояние исполнителя устарело", "The runner state is stale"],
+  executor_disabled: ["Исполнение отключено", "Execution is disabled"],
+  executor_unknown: ["Исполнитель не сообщил итог", "The runner did not report an outcome"],
 };
 
 function reasonLabel(language: ChecksLanguage, reason: string | null) {
@@ -89,6 +106,52 @@ function Glyph({ children }: { children: ReactNode }) {
   );
 }
 
+function DiagnosticList({
+  codes,
+  language,
+  compact = false,
+}: {
+  codes: string[];
+  language: ChecksLanguage;
+  compact?: boolean;
+}) {
+  if (!codes.length) return null;
+  return (
+    <ul
+      className={`check-diagnostics ${compact ? "check-diagnostics--compact" : ""}`}
+      aria-label={tx(language, "Диагностика Check", "Check diagnostics")}
+    >
+      {codes.map((rawCode, index) => {
+        const diagnostic = describeCheckDiagnostic(rawCode, language);
+        return (
+          <li key={`${diagnostic.code}-${index}`}>
+            <Glyph>△</Glyph>
+            <div>
+              <span className="check-diagnostics__heading">
+                <b>{diagnostic.title}</b>
+                <code>{diagnostic.code}</code>
+              </span>
+              <p>{diagnostic.detail}</p>
+              <dl>
+                <div>
+                  <dt>{tx(language, "Метрика / поле", "Metric / field")}</dt>
+                  <dd>
+                    <code>{diagnostic.metric}</code>
+                  </dd>
+                </div>
+                <div>
+                  <dt>{tx(language, "Что делать", "Action")}</dt>
+                  <dd>{diagnostic.action}</dd>
+                </div>
+              </dl>
+            </div>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function WarningCodesNotice({
   codes,
   language,
@@ -113,11 +176,7 @@ function WarningCodesNotice({
             "Some optional Checks metrics are unavailable.",
           )}
         </b>
-        <span className="checks-warning-codes">
-          {codes.map((code) => (
-            <code key={code}>{code}</code>
-          ))}
-        </span>
+        <DiagnosticList codes={codes} language={language} compact />
       </span>
     </div>
   );
@@ -138,6 +197,39 @@ export function CheckStatusBadge({
     <span className={`check-status check-status--${status}`} aria-label={label}>
       <Glyph>{icon}</Glyph>
       {!compact && <span>{label}</span>}
+    </span>
+  );
+}
+
+function ExecutorStateBadge({
+  state,
+  success,
+  language,
+  assertion = false,
+}: {
+  state: string | null;
+  success: boolean | null;
+  language: ChecksLanguage;
+  assertion?: boolean;
+}) {
+  const fallback =
+    success === null
+      ? null
+      : assertion
+        ? success
+          ? "match"
+          : "mismatch"
+        : success
+          ? "success"
+          : "failure";
+  if (!state && !fallback) return null;
+  const description = describeCheckExecutorState(state ?? fallback ?? "unknown", language);
+  return (
+    <span
+      className={`check-executor-state check-executor-state--${description.state}`}
+      title={tx(language, "Состояние исполнителя", "Executor state")}
+    >
+      {description.label}
     </span>
   );
 }
@@ -168,6 +260,148 @@ function Panel({
       )}
       {children}
     </section>
+  );
+}
+
+function SkeletonLine({ size = "medium" }: { size?: "short" | "medium" | "long" }) {
+  return <span className={`checks-skeleton-line checks-skeleton-line--${size}`} />;
+}
+
+function SummarySkeleton() {
+  return (
+    <div className="checks-summary checks-summary--skeleton" aria-hidden="true">
+      {Array.from({ length: 6 }, (_, index) => (
+        <div className="checks-summary__item" key={index}>
+          <span className="checks-skeleton-dot" />
+          <span className="checks-skeleton-number" />
+          <SkeletonLine size="short" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChecksWidgetSkeleton({ language }: { language: ChecksLanguage }) {
+  return (
+    <div
+      className="checks-loading checks-widget-skeleton"
+      role="status"
+      aria-label={tx(language, "Загружаем сводку Checks", "Loading Checks summary")}
+    >
+      <span className="sr-only">{tx(language, "Загружаем Checks", "Loading Checks")}</span>
+      <SummarySkeleton />
+      <div className="checks-problem-list checks-problem-list--skeleton" aria-hidden="true">
+        <SkeletonLine size="short" />
+        {Array.from({ length: 4 }, (_, index) => (
+          <div className="checks-problem-row checks-problem-row--skeleton" key={index}>
+            <span className="checks-skeleton-status" />
+            <span>
+              <SkeletonLine size="medium" />
+              <SkeletonLine size="long" />
+            </span>
+            <span className="checks-skeleton-chevron" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ChecksListSkeleton({ language }: { language: ChecksLanguage }) {
+  return (
+    <div
+      className="checks-loading checks-list-skeleton"
+      role="status"
+      aria-label={tx(language, "Загружаем список Checks", "Loading Checks list")}
+    >
+      <span className="sr-only">{tx(language, "Загружаем Checks", "Loading Checks")}</span>
+      <div className="checks-skeleton-result-count" aria-hidden="true">
+        <SkeletonLine size="short" />
+      </div>
+      <div className="checks-skeleton-table" aria-hidden="true">
+        <div className="checks-skeleton-table__head">
+          {Array.from({ length: 6 }, (_, index) => (
+            <SkeletonLine size="short" key={index} />
+          ))}
+        </div>
+        {Array.from({ length: 5 }, (_, index) => (
+          <div className="checks-skeleton-table__row" key={index}>
+            <span>
+              <SkeletonLine size="medium" />
+              <SkeletonLine size="long" />
+            </span>
+            <span className="checks-skeleton-status" />
+            <SkeletonLine size="medium" />
+            <SkeletonLine size="short" />
+            <SkeletonLine size="short" />
+            <SkeletonLine size="short" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CheckDetailSkeleton({ language }: { language: ChecksLanguage }) {
+  return (
+    <div
+      className="checks-loading check-detail-skeleton"
+      role="status"
+      aria-label={tx(language, "Загружаем Check", "Loading Check")}
+    >
+      <span className="sr-only">{tx(language, "Загружаем Check", "Loading Check")}</span>
+      <header className="check-detail-hero check-detail-hero--skeleton" aria-hidden="true">
+        <span className="checks-skeleton-status" />
+        <div>
+          <SkeletonLine size="short" />
+          <span className="checks-skeleton-title" />
+          <SkeletonLine size="long" />
+        </div>
+        <div className="check-detail-actions">
+          <span className="checks-skeleton-button" />
+          <span className="checks-skeleton-button" />
+        </div>
+      </header>
+      <div className="check-detail-summary check-detail-summary--skeleton" aria-hidden="true">
+        {Array.from({ length: 4 }, (_, index) => (
+          <div key={index}>
+            <SkeletonLine size="short" />
+            <SkeletonLine size="medium" />
+          </div>
+        ))}
+      </div>
+      <section className="panel check-detail-skeleton__results" aria-hidden="true">
+        <div className="panel__header">
+          <div>
+            <SkeletonLine size="short" />
+            <SkeletonLine size="medium" />
+          </div>
+        </div>
+        <div className="check-detail-skeleton__metrics">
+          {Array.from({ length: 3 }, (_, index) => (
+            <span key={index}>
+              <SkeletonLine size="short" />
+              <SkeletonLine size="medium" />
+            </span>
+          ))}
+        </div>
+      </section>
+      <section className="panel check-detail-skeleton__links" aria-hidden="true">
+        <div className="panel__header">
+          <div>
+            <SkeletonLine size="short" />
+            <SkeletonLine size="medium" />
+          </div>
+        </div>
+        <div className="check-detail-skeleton__link-row">
+          <span className="checks-skeleton-dot" />
+          <span>
+            <SkeletonLine size="medium" />
+            <SkeletonLine size="long" />
+          </span>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -336,7 +570,9 @@ export function ChecksWidget({
       }
     >
       <WarningCodesNotice codes={state.meta?.warningCodes ?? []} language={language} compact />
-      {state.phase === "loading" || state.phase === "unavailable" ? (
+      {state.phase === "loading" ? (
+        <ChecksWidgetSkeleton language={language} />
+      ) : state.phase === "unavailable" ? (
         <StateMessage
           language={language}
           phase={state.phase}
@@ -362,23 +598,31 @@ export function ChecksWidget({
           ) : problems.length ? (
             <div className="checks-problem-list">
               <h3>{tx(language, "Требуют внимания", "Needs attention")}</h3>
-              {problems.map((check) => (
-                <button
-                  key={check.checkId}
-                  className="checks-problem-row"
-                  onClick={() => navigate(`/checks/${encodeURIComponent(check.checkId)}`)}
-                >
-                  <CheckStatusBadge status={check.status} language={language} compact />
-                  <span>
-                    <b>{check.name}</b>
-                    <small>
-                      {check.group ?? tx(language, "Без группы", "Ungrouped")}
-                      {check.statusReason ? ` · ${reasonLabel(language, check.statusReason)}` : ""}
-                    </small>
-                  </span>
-                  <span aria-hidden="true">›</span>
-                </button>
-              ))}
+              {problems.map((check) => {
+                const identity = checkIdentity(check);
+                return (
+                  <button
+                    key={check.checkId}
+                    className="checks-problem-row"
+                    onClick={() => navigate(`/checks/${encodeURIComponent(check.checkId)}`)}
+                  >
+                    <CheckStatusBadge status={check.status} language={language} compact />
+                    <span>
+                      <b>{identity.primary}</b>
+                      {identity.secondaryId && (
+                        <code className="check-identity__id">{identity.secondaryId}</code>
+                      )}
+                      <small>
+                        {check.group ?? tx(language, "Без группы", "Ungrouped")}
+                        {check.statusReason
+                          ? ` · ${reasonLabel(language, check.statusReason)}`
+                          : ""}
+                      </small>
+                    </span>
+                    <span aria-hidden="true">›</span>
+                  </button>
+                );
+              })}
             </div>
           ) : (
             <div className="checks-all-up">
@@ -509,14 +753,22 @@ export function ChecksPage({
         </div>
       </div>
 
-      {state.summary && (
+      {state.phase === "loading" ? (
+        <div
+          className="checks-summary-loading"
+          role="status"
+          aria-label={tx(language, "Загружаем сводку Checks", "Loading Checks summary")}
+        >
+          <SummarySkeleton />
+        </div>
+      ) : state.summary ? (
         <SummaryStrip
           summary={state.summary}
           language={language}
           activeStatus={filters.status}
           onStatus={(status) => setFilter("status", status)}
         />
-      )}
+      ) : null}
       <WarningCodesNotice codes={state.meta?.warningCodes ?? []} language={language} />
 
       <Panel className="checks-list-panel">
@@ -579,7 +831,9 @@ export function ChecksPage({
           </div>
         </details>
 
-        {state.phase === "empty" && filtersActive ? (
+        {state.phase === "loading" ? (
+          <ChecksListSkeleton language={language} />
+        ) : state.phase === "empty" && filtersActive ? (
           <div className="checks-state" role="status">
             <Glyph>⌕</Glyph>
             <div>
@@ -596,8 +850,7 @@ export function ChecksPage({
               {tx(language, "Сбросить фильтры", "Reset filters")}
             </button>
           </div>
-        ) : state.phase === "loading" ||
-          state.phase === "disabled" ||
+        ) : state.phase === "disabled" ||
           state.phase === "unavailable" ||
           state.phase === "empty" ? (
           <StateMessage
@@ -707,77 +960,85 @@ function ChecksTable({
           </tr>
         </thead>
         <tbody>
-          {items.map((check) => (
-            <tr key={check.checkId}>
-              <td data-label="Check">
-                <b>{check.name}</b>
-                <small>
-                  <code>{check.checkId}</code>
-                  {check.target && <> · Target: {check.target}</>}
-                </small>
-                {check.dataIncomplete && (
-                  <span className="checks-inline-warning">
-                    <Glyph>△</Glyph>
-                    {tx(language, "Неполные данные", "Incomplete data")}
-                  </span>
-                )}
-                {check.diagnosticCodes.length > 0 && (
-                  <span className="checks-inline-warning">
-                    <Glyph>△</Glyph>
-                    <span>
-                      {tx(language, "Диагностика", "Diagnostics")}:{" "}
-                      <code>{check.diagnosticCodes.join(", ")}</code>
+          {items.map((check) => {
+            const identity = checkIdentity(check);
+            const open = () => navigate(`/checks/${encodeURIComponent(check.checkId)}`);
+            const onKeyDown = (event: ReactKeyboardEvent<HTMLTableRowElement>) => {
+              if (event.key !== "Enter") return;
+              event.preventDefault();
+              open();
+            };
+            return (
+              <tr
+                key={check.checkId}
+                role="link"
+                tabIndex={0}
+                aria-label={`${tx(language, "Открыть Check", "Open Check")} ${identity.primary}`}
+                onClick={open}
+                onKeyDown={onKeyDown}
+              >
+                <td data-label="Check">
+                  <b>{identity.primary}</b>
+                  {(identity.secondaryId || check.target) && (
+                    <small>
+                      {identity.secondaryId && (
+                        <code className="check-identity__id">{identity.secondaryId}</code>
+                      )}
+                      {identity.secondaryId && check.target && " · "}
+                      {check.target && <>Target: {check.target}</>}
+                    </small>
+                  )}
+                  {check.dataIncomplete && (
+                    <span className="checks-inline-warning">
+                      <Glyph>△</Glyph>
+                      {tx(language, "Неполные данные", "Incomplete data")}
                     </span>
-                  </span>
-                )}
-              </td>
-              <td data-label={tx(language, "Статус", "Status")}>
-                <CheckStatusBadge status={check.status} language={language} />
-                {check.statusReason && <small>{reasonLabel(language, check.statusReason)}</small>}
-                {check.staleResults > 0 && (
-                  <small>
-                    {tx(language, "Устаревших результатов", "Stale results")}: {check.staleResults}
-                  </small>
-                )}
-              </td>
-              <td data-label={tx(language, "Последний запуск", "Last run")}>
-                <time dateTime={check.lastCheckedAt ?? undefined}>
-                  {formatTimestamp(language, check.lastCheckedAt)}
-                </time>
-                {check.oldestCheckedAt && check.oldestCheckedAt !== check.lastCheckedAt && (
-                  <small>
-                    {tx(language, "Самый старый", "Oldest")}:{" "}
-                    {formatTimestamp(language, check.oldestCheckedAt)}
-                  </small>
-                )}
-              </td>
-              <td data-label={tx(language, "Макс. latency", "Max latency")}>
-                {check.latencySeconds === null
-                  ? "—"
-                  : formatDuration(language, check.latencySeconds)}
-              </td>
-              <td data-label="Sources">
-                <b>
-                  {check.sourcesUp}/{check.sourcesTotal}
-                </b>
-                <small>{tx(language, "полностью успешны", "fully successful")}</small>
-              </td>
-              <td data-label={tx(language, "Алерты", "Alerts")}>
-                {check.activeAlerts === null
-                  ? tx(language, "Недоступно", "Unavailable")
-                  : check.activeAlerts}
-              </td>
-              <td>
-                <button
-                  className="row-open"
-                  onClick={() => navigate(`/checks/${encodeURIComponent(check.checkId)}`)}
-                  aria-label={`${tx(language, "Открыть Check", "Open Check")} ${check.name}`}
-                >
-                  <span aria-hidden="true">›</span>
-                </button>
-              </td>
-            </tr>
-          ))}
+                  )}
+                  <DiagnosticList codes={check.diagnosticCodes} language={language} compact />
+                </td>
+                <td data-label={tx(language, "Статус", "Status")}>
+                  <CheckStatusBadge status={check.status} language={language} />
+                  {check.statusReason && <small>{reasonLabel(language, check.statusReason)}</small>}
+                  {check.staleResults > 0 && (
+                    <small>
+                      {tx(language, "Устаревших результатов", "Stale results")}:{" "}
+                      {check.staleResults}
+                    </small>
+                  )}
+                </td>
+                <td data-label={tx(language, "Последний запуск", "Last run")}>
+                  <time dateTime={check.lastCheckedAt ?? undefined}>
+                    {formatTimestamp(language, check.lastCheckedAt)}
+                  </time>
+                  {check.oldestCheckedAt && check.oldestCheckedAt !== check.lastCheckedAt && (
+                    <small>
+                      {tx(language, "Самый старый", "Oldest")}:{" "}
+                      {formatTimestamp(language, check.oldestCheckedAt)}
+                    </small>
+                  )}
+                </td>
+                <td data-label={tx(language, "Макс. latency", "Max latency")}>
+                  {check.latencySeconds === null
+                    ? "—"
+                    : formatDuration(language, check.latencySeconds)}
+                </td>
+                <td data-label="Sources">
+                  <b>
+                    {check.sourcesUp}/{check.sourcesTotal}
+                  </b>
+                  <small>{tx(language, "полностью успешны", "fully successful")}</small>
+                </td>
+                <td data-label={tx(language, "Алерты", "Alerts")}>
+                  {check.activeAlerts === null
+                    ? tx(language, "Недоступно", "Unavailable")
+                    : check.activeAlerts}
+                </td>
+                <td className="checks-table__open" aria-hidden="true">
+                  <span>›</span>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -787,6 +1048,14 @@ function ChecksTable({
 function ResultMetrics({ result, language }: { result: CheckResult; language: ChecksLanguage }) {
   return (
     <dl className="check-result-metrics">
+      {result.state && (
+        <div>
+          <dt>{tx(language, "Состояние исполнителя", "Executor state")}</dt>
+          <dd>
+            <ExecutorStateBadge state={result.state} success={result.success} language={language} />
+          </dd>
+        </div>
+      )}
       {result.durationSeconds !== null && (
         <div>
           <dt>Duration</dt>
@@ -807,11 +1076,141 @@ function ResultMetrics({ result, language }: { result: CheckResult; language: Ch
   );
 }
 
+function ResultContext({ result }: { result: CheckResult }) {
+  const entries = [
+    ["Source", result.source],
+    ["Scenario", result.scenario],
+    ["Variant", result.variant],
+  ].filter((entry): entry is [string, string] => entry[1] !== null);
+  if (!entries.length) return null;
+  return (
+    <div className="check-result-context">
+      {entries.map(([label, value]) => (
+        <span key={label}>
+          {label} · <code>{value}</code>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function ResultTargets({ result, language }: { result: CheckResult; language: ChecksLanguage }) {
+  if (!result.targets.length) return null;
+  return (
+    <section className="check-result-targets">
+      <h4>Targets</h4>
+      <div className="check-target-list">
+        {result.targets.map((target) => (
+          <article key={target.targetId}>
+            <header>
+              <span>
+                <b>{target.name}</b>
+                {target.name !== target.targetId && (
+                  <code className="check-identity__id">{target.targetId}</code>
+                )}
+              </span>
+              <ExecutorStateBadge
+                state={target.state}
+                success={target.success}
+                language={language}
+              />
+            </header>
+            {target.statusReason && <p>{reasonLabel(language, target.statusReason)}</p>}
+            {(target.durationSeconds !== null || target.ttfbSeconds !== null) && (
+              <dl className="check-result-metrics">
+                {target.durationSeconds !== null && (
+                  <div>
+                    <dt>Duration</dt>
+                    <dd>{formatDuration(language, target.durationSeconds)}</dd>
+                  </div>
+                )}
+                {target.ttfbSeconds !== null && (
+                  <div>
+                    <dt>TTFB</dt>
+                    <dd>{formatDuration(language, target.ttfbSeconds)}</dd>
+                  </div>
+                )}
+              </dl>
+            )}
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ResultErrorReasons({
+  result,
+  language,
+}: {
+  result: CheckResult;
+  language: ChecksLanguage;
+}) {
+  if (!result.errorReasons.length) return null;
+  return (
+    <section className="check-result-errors">
+      <h4>
+        {tx(language, "Накопительные счётчики ошибок", "Cumulative error counters")}
+        <span
+          className="check-result-errors__help"
+          title={tx(
+            language,
+            "Наблюдаемые накопительные счётчики по безопасным категориям. Они не обязательно описывают причину текущего результата.",
+            "Observed cumulative counters by safe category. They do not necessarily describe the current result's cause.",
+          )}
+          aria-label={tx(
+            language,
+            "Справка о накопительных счётчиках ошибок",
+            "About cumulative error counters",
+          )}
+        >
+          ?
+        </span>
+      </h4>
+      <p className="check-result-errors__note">
+        {tx(
+          language,
+          "Наблюдаемые значения за время работы исполнителя; это не текст текущей ошибки.",
+          "Observed over the runner lifetime; these are not the current error message.",
+        )}
+      </p>
+      <ul>
+        {result.errorReasons.map((item, index) => {
+          const reason = describeCheckErrorReason(item.reason, language);
+          return (
+            <li key={`${reason.reason}-${index}`}>
+              <Glyph>!</Glyph>
+              <span>
+                <b>{reason.label}</b>
+                <small>{reason.detail}</small>
+                <code>{reason.reason}</code>
+              </span>
+              <strong
+                aria-label={`${reason.label}: ${item.count}`}
+                title={tx(language, "Наблюдаемое значение счётчика", "Observed counter value")}
+              >
+                ×{item.count}
+              </strong>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 function ResultExtras({ result, language }: { result: CheckResult; language: ChecksLanguage }) {
-  if (!result.canaries.length && !result.assertions.length && !result.diagnosticCodes.length)
+  if (
+    !result.canaries.length &&
+    !result.assertions.length &&
+    !result.targets.length &&
+    !result.errorReasons.length &&
+    !result.diagnosticCodes.length
+  )
     return null;
   return (
     <div className="check-result-extras">
+      <ResultTargets result={result} language={language} />
       {result.canaries.length > 0 && (
         <section>
           <h4>Canary</h4>
@@ -843,30 +1242,31 @@ function ResultExtras({ result, language }: { result: CheckResult; language: Che
                 <Glyph>
                   {assertion.success === true ? "✓" : assertion.success === false ? "!" : "?"}
                 </Glyph>
-                <code>{assertion.key}</code>
-                <b>
-                  {assertion.success === true
-                    ? tx(language, "выполнено", "passed")
-                    : assertion.success === false
-                      ? tx(language, "не выполнено", "failed")
-                      : tx(language, "нет данных", "unknown")}
-                </b>
+                <span>
+                  <b>{assertion.name ?? assertion.key}</b>
+                  {assertion.name && assertion.name !== assertion.key && (
+                    <code className="check-identity__id">{assertion.key}</code>
+                  )}
+                  {assertion.statusReason && (
+                    <small>{reasonLabel(language, assertion.statusReason)}</small>
+                  )}
+                </span>
+                <ExecutorStateBadge
+                  state={assertion.state}
+                  success={assertion.success}
+                  language={language}
+                  assertion
+                />
               </li>
             ))}
           </ul>
         </section>
       )}
+      <ResultErrorReasons result={result} language={language} />
       {result.diagnosticCodes.length > 0 && (
-        <section>
+        <section className="check-result-diagnostics">
           <h4>{tx(language, "Диагностика", "Diagnostics")}</h4>
-          <ul>
-            {result.diagnosticCodes.map((code) => (
-              <li key={code}>
-                <Glyph>△</Glyph>
-                <code>{code}</code>
-              </li>
-            ))}
-          </ul>
+          <DiagnosticList codes={result.diagnosticCodes} language={language} />
         </section>
       )}
     </div>
@@ -877,11 +1277,7 @@ function CompactResult({ result, language }: { result: CheckResult; language: Ch
   return (
     <article className="check-compact-result">
       <div className="check-compact-result__head">
-        <div>
-          {result.source && <span>Source · {result.source}</span>}
-          {result.scenario && <span>Scenario · {result.scenario}</span>}
-          {result.variant && <span>Variant · {result.variant}</span>}
-        </div>
+        <ResultContext result={result} />
         <CheckStatusBadge status={result.status} language={language} />
       </div>
       {result.statusReason && <p>{reasonLabel(language, result.statusReason)}</p>}
@@ -942,10 +1338,13 @@ function ResultsMatrix({
                       results.map((result, index) => {
                         const resultKey = `${key}\u0000${result.variant ?? ""}\u0000${index}`;
                         const hasDetails =
+                          result.state !== null ||
                           result.durationSeconds !== null ||
                           result.ttfbSeconds !== null ||
                           result.canaries.length > 0 ||
+                          result.targets.length > 0 ||
                           result.assertions.length > 0 ||
+                          result.errorReasons.length > 0 ||
                           result.diagnosticCodes.length > 0 ||
                           Boolean(result.statusReason);
                         return hasDetails ? (
@@ -1033,11 +1432,7 @@ function LinksPanel({
               {check.incidentsTotal ?? "?"}.
             </span>
             {check.relationWarningCodes.length > 0 && (
-              <span className="checks-warning-codes">
-                {check.relationWarningCodes.map((code) => (
-                  <code key={code}>{code}</code>
-                ))}
-              </span>
+              <DiagnosticList codes={check.relationWarningCodes} language={language} compact />
             )}
           </span>
         </div>
@@ -1136,27 +1531,32 @@ export function CheckDetailPage({
         <button className="breadcrumb-button" onClick={() => navigate("/checks")}>
           ← Checks
         </button>
-        <Panel>
-          <StateMessage
-            language={language}
-            phase={state.phase}
-            error={state.error}
-            onRetry={refresh}
-          />
-          <WarningCodesNotice codes={state.meta?.warningCodes ?? []} language={language} />
-          {state.phase === "not_found" && (
-            <div className="checks-state-action">
-              <button className="button button--quiet" onClick={() => navigate("/checks")}>
-                {tx(language, "Вернуться к списку", "Back to Checks")}
-              </button>
-            </div>
-          )}
-        </Panel>
+        {state.phase === "loading" ? (
+          <CheckDetailSkeleton language={language} />
+        ) : (
+          <Panel>
+            <StateMessage
+              language={language}
+              phase={state.phase}
+              error={state.error}
+              onRetry={refresh}
+            />
+            <WarningCodesNotice codes={state.meta?.warningCodes ?? []} language={language} />
+            {state.phase === "not_found" && (
+              <div className="checks-state-action">
+                <button className="button button--quiet" onClick={() => navigate("/checks")}>
+                  {tx(language, "Вернуться к списку", "Back to Checks")}
+                </button>
+              </div>
+            )}
+          </Panel>
+        )}
       </div>
     );
   }
 
   const check = state.check;
+  const identity = checkIdentity(check);
   return (
     <div className="page-stack check-detail-page">
       <button className="breadcrumb-button" onClick={() => navigate("/checks")}>
@@ -1166,11 +1566,16 @@ export function CheckDetailPage({
         <CheckStatusBadge status={check.status} language={language} />
         <div>
           <span className="eyebrow">{check.group ?? tx(language, "Без группы", "Ungrouped")}</span>
-          <h1>{check.name}</h1>
-          <p>
-            <code>{check.checkId}</code>
-            {check.target && <> · Target: {check.target}</>}
-          </p>
+          <h1>{identity.primary}</h1>
+          {(identity.secondaryId || check.target) && (
+            <p>
+              {identity.secondaryId && (
+                <code className="check-identity__id">{identity.secondaryId}</code>
+              )}
+              {identity.secondaryId && check.target && " · "}
+              {check.target && <>Target: {check.target}</>}
+            </p>
+          )}
           {check.statusReason && <strong>{reasonLabel(language, check.statusReason)}</strong>}
         </div>
         <div className="check-detail-actions">
@@ -1184,6 +1589,12 @@ export function CheckDetailPage({
               href={check.grafanaUrl}
               target="_blank"
               rel="noopener noreferrer"
+              aria-label={tx(language, "Открыть Check в Grafana", "Open Check in Grafana")}
+              title={tx(
+                language,
+                "Открыть backend deep link в новой вкладке",
+                "Open the backend deep link in a new tab",
+              )}
             >
               <Glyph>↗</Glyph> Grafana
             </a>
@@ -1217,11 +1628,10 @@ export function CheckDetailPage({
 
       <div className="check-detail-summary">
         <div>
-          <span>Sources</span>
+          <span>{tx(language, "Успешные Sources", "Successful Sources")}</span>
           <b>
             {check.sourcesUp}/{check.sourcesTotal}
           </b>
-          <small>{tx(language, "полностью успешны", "fully successful")}</small>
         </div>
         <div>
           <span>{tx(language, "Последний запуск", "Latest run")}</span>

@@ -10,6 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
@@ -25,39 +26,82 @@ from alert_hub.domain.checks import (
     DEFAULT_VARIANT,
     AggregatedCheck,
     CheckAssertion,
+    CheckAssertionState,
     CheckCanary,
+    CheckErrorReason,
     CheckResultKey,
+    CheckResultState,
     CheckStatus,
+    CheckTarget,
     NormalizedCheckResult,
     aggregate_check,
 )
+from alert_hub.domain.monitoring import is_grafana_dashboard_url
 from alert_hub.infrastructure.prometheus import CheckQueryName, PrometheusClient, VectorSample
 from alert_hub.settings import Settings
 
 CHECK_QUERY_NAMES: tuple[CheckQueryName, ...] = (
     "check_info",
+    "check_state",
     "check_status",
     "check_last_run",
     "check_canary_success",
+    "check_target_success",
+    "check_target_state",
     "check_duration",
     "check_ttfb",
+    "check_egress_state",
     "check_egress_match",
+    "check_errors_total",
 )
 MANDATORY_CHECK_QUERIES: frozenset[CheckQueryName] = frozenset({"check_status", "check_last_run"})
 MAX_RESULTS_PER_CHECK = 1_000
 MAX_CANARIES_PER_RESULT = 100
+MAX_TARGETS_PER_RESULT = 100
+MAX_ASSERTIONS_PER_RESULT = 100
+MAX_CONCURRENT_CHECK_REQUESTS = 16
 
 _PRIMARY_CHECK_QUERIES: frozenset[CheckQueryName] = frozenset(
-    {"check_info", "check_status", "check_last_run"}
+    {"check_info", "check_state", "check_status", "check_last_run"}
 )
 _LIMIT_FAILURE_CODES = frozenset({"too_many_samples", "response_too_large"})
 _OPTIONAL_WARNING_CODES: dict[CheckQueryName, str] = {
     "check_info": "check_info_unavailable",
+    "check_state": "check_state_unavailable",
     "check_canary_success": "check_canary_unavailable",
+    "check_target_success": "check_targets_unavailable",
+    "check_target_state": "check_target_states_unavailable",
     "check_duration": "check_duration_unavailable",
     "check_ttfb": "check_ttfb_unavailable",
+    "check_egress_state": "check_assertion_states_unavailable",
     "check_egress_match": "check_assertions_unavailable",
+    "check_errors_total": "check_error_reasons_unavailable",
 }
+_CHECK_STATES = frozenset({"unknown", "success", "failure", "error", "stale", "disabled"})
+_EGRESS_STATES = frozenset({"match", "mismatch", "unknown", "error", "stale", "disabled"})
+_SAFE_ERROR_REASONS = frozenset(
+    {
+        "connect",
+        "proxy",
+        "dns",
+        "timeout",
+        "tls",
+        "http_status",
+        "body_mismatch",
+        "egress_mismatch",
+        "response_invalid",
+        "config_invalid",
+        "unsupported",
+        "runtime_start",
+        "runtime_exit",
+        "scheduler",
+        "source_fetch",
+        "source_parse",
+        "identity_conflict",
+        "internal",
+    }
+)
+_DEFAULT_ASSERTION = "__alert_hub_default_assertion__"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:\-]{0,127}")
 _RESERVED_IDENTIFIER_PREFIX = "__alert_hub_"
 _RESERVED_IDENTIFIERS = frozenset({"summary"})
@@ -241,9 +285,29 @@ class _AcceptedSample:
     sample: VectorSample
     key: CheckResultKey
     name: str | None
+    name_priority: int | None
+    derived_name: str | None
     group: str | None
     target: str | None
     canary: str | None
+    target_id: str | None
+    assertion_id: str | None
+    state: str | None
+    reason: str | None
+    info_conflict: bool = False
+    scenario_info_hint_applied: bool = False
+    variant_info_hint_applied: bool = False
+    key_dimensions_defaulted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _InfoHint:
+    scenario: str | None
+    variant: str | None
+    target: str | None
+    scenario_conflict: bool = False
+    variant_conflict: bool = False
+    target_conflict: bool = False
 
 
 def normalize_check_identifier(
@@ -307,19 +371,202 @@ def _optional_identifier(
     return normalize_check_identifier(raw, allow_reserved_routes=True), False
 
 
+def _priority_identifier(
+    labels: Mapping[str, str],
+    names: Sequence[str],
+    default: str,
+) -> tuple[str | None, bool]:
+    """Choose the first declared safe identifier without silently skipping an invalid label."""
+
+    for name in names:
+        raw = labels.get(name)
+        if raw is None or raw == "":
+            continue
+        return normalize_check_identifier(raw, allow_reserved_routes=True), False
+    return default, True
+
+
+def _humanize_identifier(value: str) -> str:
+    """Turn a validated opaque identifier into display text without inventing metadata."""
+
+    words = " ".join(part for part in re.split(r"[_.:\-]+", value) if part)
+    return words[:1].upper() + words[1:] if words else value
+
+
+def _derived_info_name(labels: Mapping[str, str]) -> str | None:
+    parts: list[str] = []
+    for label in ("mode", "source_id", "target_set_id"):
+        identifier, missing = _optional_identifier(labels, label, DEFAULT_VARIANT)
+        if not missing and identifier is not None:
+            parts.append(_humanize_identifier(identifier))
+    candidate = " · ".join(parts)
+    return _safe_display(candidate, max_length=255) if candidate else None
+
+
+def _build_info_hints(samples: Sequence[VectorSample]) -> dict[tuple[str, str], _InfoHint]:
+    values: dict[tuple[str, str], dict[str, set[str]]] = defaultdict(
+        lambda: {"scenario": set(), "variant": set(), "target": set()}
+    )
+    for sample in samples:
+        check_id = normalize_check_identifier(sample.labels.get("check_id"))
+        source, _ = _priority_identifier(
+            sample.labels,
+            ("source", "instance_id", "source_id"),
+            DEFAULT_SOURCE,
+        )
+        if check_id is None or source is None:
+            continue
+        scenario, scenario_missing = _priority_identifier(
+            sample.labels,
+            ("scenario", "mode"),
+            DEFAULT_SCENARIO,
+        )
+        variant, variant_missing = _priority_identifier(
+            sample.labels,
+            ("variant", "target_set_id"),
+            DEFAULT_VARIANT,
+        )
+        if not scenario_missing and scenario is not None:
+            values[(check_id, source)]["scenario"].add(scenario)
+        if not variant_missing and variant is not None:
+            values[(check_id, source)]["variant"].add(variant)
+
+        raw_target = sample.labels.get("target")
+        explicit_target = _safe_display(raw_target, max_length=255)
+        if raw_target and explicit_target is not None:
+            values[(check_id, source)]["target"].add(explicit_target)
+
+    hints: dict[tuple[str, str], _InfoHint] = {}
+    for key, fields in values.items():
+        hints[key] = _InfoHint(
+            scenario=next(iter(fields["scenario"])) if len(fields["scenario"]) == 1 else None,
+            variant=next(iter(fields["variant"])) if len(fields["variant"]) == 1 else None,
+            target=next(iter(fields["target"])) if len(fields["target"]) == 1 else None,
+            scenario_conflict=len(fields["scenario"]) > 1,
+            variant_conflict=len(fields["variant"]) > 1,
+            target_conflict=len(fields["target"]) > 1,
+        )
+    return hints
+
+
+def _build_previous_info_hints(previous: ChecksSnapshot) -> dict[tuple[str, str], _InfoHint]:
+    """Recover only unambiguous dimensions that a prior authoritative info row established."""
+
+    values: dict[tuple[str, str], dict[str, set[str]]] = defaultdict(
+        lambda: {"scenario": set(), "variant": set(), "target": set()}
+    )
+    for check in previous.checks:
+        for result in check.results:
+            if not result.known_via_info:
+                continue
+            base_key = (result.key.check_id, result.key.source)
+            values[base_key]["scenario"].add(result.key.scenario)
+            values[base_key]["variant"].add(result.key.variant)
+            if result.target is not None:
+                values[base_key]["target"].add(result.target)
+
+    hints: dict[tuple[str, str], _InfoHint] = {}
+    for key, fields in values.items():
+        hints[key] = _InfoHint(
+            scenario=next(iter(fields["scenario"])) if len(fields["scenario"]) == 1 else None,
+            variant=next(iter(fields["variant"])) if len(fields["variant"]) == 1 else None,
+            target=next(iter(fields["target"])) if len(fields["target"]) == 1 else None,
+            scenario_conflict=len(fields["scenario"]) > 1,
+            variant_conflict=len(fields["variant"]) > 1,
+            target_conflict=len(fields["target"]) > 1,
+        )
+    return hints
+
+
+def _matches_proven_info_rekey(
+    previous_result: NormalizedCheckResult,
+    declared_keys: set[CheckResultKey],
+    hinted_dimensions_by_key: Mapping[CheckResultKey, set[str]],
+) -> bool:
+    """Identify a proven missing-info key superseded by one authoritative declaration."""
+
+    previous_key = previous_result.key
+    if (
+        not previous_result.provisional_info_dimensions
+        or len(declared_keys) != 1
+        or (previous_key.scenario != DEFAULT_SCENARIO and previous_key.variant != DEFAULT_VARIANT)
+    ):
+        return False
+    declared = next(iter(declared_keys))
+    hinted_dimensions = hinted_dimensions_by_key.get(declared, set())
+    required_hints = {
+        dimension
+        for dimension, previous_value, declared_value in (
+            ("scenario", previous_key.scenario, declared.scenario),
+            ("variant", previous_key.variant, declared.variant),
+        )
+        if previous_value != declared_value
+    }
+    return (
+        bool(required_hints)
+        and required_hints <= hinted_dimensions
+        and previous_key.scenario
+        in {
+            DEFAULT_SCENARIO,
+            declared.scenario,
+        }
+        and previous_key.variant in {DEFAULT_VARIANT, declared.variant}
+    )
+
+
 def _accept_sample(
     query_name: CheckQueryName,
     sample: VectorSample,
     diagnostics: dict[str, set[str]],
+    info_hints: Mapping[tuple[str, str], _InfoHint],
 ) -> _AcceptedSample | None:
     raw_check_id = sample.labels.get("check_id")
     check_id = normalize_check_identifier(raw_check_id)
     if check_id is None:
         return None
 
-    source, _ = _optional_identifier(sample.labels, "source", DEFAULT_SOURCE)
-    scenario, _ = _optional_identifier(sample.labels, "scenario", DEFAULT_SCENARIO)
-    variant, _ = _optional_identifier(sample.labels, "variant", DEFAULT_VARIANT)
+    source, _ = _priority_identifier(
+        sample.labels,
+        ("source", "instance_id", "source_id"),
+        DEFAULT_SOURCE,
+    )
+    if source is None:
+        diagnostics[check_id].add(
+            "invalid_identifier"
+            if query_name in _PRIMARY_CHECK_QUERIES
+            else "invalid_optional_identifier"
+        )
+        return None
+
+    hint = info_hints.get((check_id, source))
+    scenario, scenario_missing = _priority_identifier(
+        sample.labels,
+        ("scenario", "mode"),
+        DEFAULT_SCENARIO,
+    )
+    variant, variant_missing = _priority_identifier(
+        sample.labels,
+        ("variant", "target_set_id"),
+        DEFAULT_VARIANT,
+    )
+    info_conflict = False
+    scenario_info_hint_applied = False
+    variant_info_hint_applied = False
+    key_dimensions_defaulted = False
+    if scenario_missing and hint is not None:
+        if hint.scenario is not None:
+            scenario = hint.scenario
+            scenario_info_hint_applied = True
+        info_conflict = info_conflict or hint.scenario_conflict
+    if scenario_missing and (hint is None or hint.scenario is None):
+        key_dimensions_defaulted = True
+    if variant_missing and hint is not None:
+        if hint.variant is not None:
+            variant = hint.variant
+            variant_info_hint_applied = True
+        info_conflict = info_conflict or hint.variant_conflict
+    if variant_missing and (hint is None or hint.variant is None):
+        key_dimensions_defaulted = True
     if source is None or scenario is None or variant is None:
         diagnostics[check_id].add(
             "invalid_identifier"
@@ -328,15 +575,33 @@ def _accept_sample(
         )
         return None
 
-    name = _safe_display(sample.labels.get("check_name"), max_length=255)
-    if sample.labels.get("check_name", "").strip() and name is None:
+    raw_check_name = sample.labels.get("check_name")
+    raw_entry_name = sample.labels.get("entry_name") if query_name == "check_info" else None
+    check_name = _safe_display(raw_check_name, max_length=255)
+    entry_name = _safe_display(raw_entry_name, max_length=255)
+    if raw_check_name and raw_check_name.strip() and check_name is None:
         diagnostics[check_id].add("invalid_name")
+    if raw_entry_name and raw_entry_name.strip() and entry_name is None:
+        diagnostics[check_id].add("invalid_name")
+    if check_name is not None:
+        name = check_name
+        name_priority = 0
+    elif entry_name is not None:
+        name = entry_name
+        name_priority = 1
+    else:
+        name = None
+        name_priority = None
     group = _safe_display(sample.labels.get("group"), max_length=128)
     if sample.labels.get("group", "").strip() and group is None:
         diagnostics[check_id].add("invalid_group")
-    target = _safe_display(sample.labels.get("target"), max_length=255)
-    if sample.labels.get("target", "").strip() and target is None:
+    raw_target = sample.labels.get("target")
+    target = _safe_display(raw_target, max_length=255)
+    if raw_target and raw_target.strip() and target is None:
         diagnostics[check_id].add("invalid_target")
+    if not raw_target and target is None and hint is not None:
+        target = hint.target
+        info_conflict = info_conflict or hint.target_conflict
 
     canary: str | None = None
     if query_name == "check_canary_success":
@@ -346,13 +611,57 @@ def _accept_sample(
             return None
         canary = parsed_canary
 
+    target_id: str | None = None
+    if query_name in {
+        "check_target_success",
+        "check_target_state",
+        "check_duration",
+        "check_ttfb",
+    }:
+        raw_target_id = sample.labels.get("target_id")
+        if raw_target_id:
+            target_id = normalize_check_identifier(raw_target_id, allow_reserved_routes=True)
+            if target_id is None:
+                diagnostics[check_id].add("invalid_target_id")
+                return None
+        elif query_name in {"check_target_success", "check_target_state"}:
+            diagnostics[check_id].add("invalid_target_id")
+            return None
+
+    assertion_id: str | None = None
+    if query_name in {"check_egress_state", "check_egress_match"}:
+        parsed_assertion_id, assertion_missing = _optional_identifier(
+            sample.labels, "assertion_id", _DEFAULT_ASSERTION
+        )
+        if parsed_assertion_id is None:
+            diagnostics[check_id].add("invalid_assertion_id")
+            return None
+        assertion_id = None if assertion_missing else parsed_assertion_id
+
+    state = (
+        sample.labels.get("state")
+        if query_name in {"check_state", "check_target_state", "check_egress_state"}
+        else None
+    )
+    reason = sample.labels.get("reason") if query_name == "check_errors_total" else None
+
     return _AcceptedSample(
         sample=sample,
         key=CheckResultKey(check_id, source, scenario, variant),
         name=name,
+        name_priority=name_priority,
+        derived_name=_derived_info_name(sample.labels) if query_name == "check_info" else None,
         group=group,
         target=target,
         canary=canary,
+        target_id=target_id,
+        assertion_id=assertion_id,
+        state=state,
+        reason=reason,
+        info_conflict=info_conflict,
+        scenario_info_hint_applied=scenario_info_hint_applied,
+        variant_info_hint_applied=variant_info_hint_applied,
+        key_dimensions_defaulted=key_dimensions_defaulted,
     )
 
 
@@ -379,6 +688,127 @@ def _binary_value(
     if len(values) != 1:
         return None, {conflict_code}
     return next(iter(values)), set()
+
+
+def _one_hot_state(
+    samples: Sequence[_AcceptedSample],
+    *,
+    allowed: frozenset[str],
+    invalid_code: str,
+    conflict_code: str,
+) -> tuple[str | None, set[str]]:
+    if not samples:
+        return None, set()
+    values_by_state: dict[str, set[bool]] = defaultdict(set)
+    invalid = False
+    for item in samples:
+        if item.state not in allowed:
+            invalid = True
+            continue
+        value = item.sample.value
+        if not math.isfinite(value) or value not in {0.0, 1.0}:
+            invalid = True
+            continue
+        values_by_state[item.state].add(bool(value))
+    if invalid:
+        return None, {invalid_code}
+    if any(len(values) != 1 for values in values_by_state.values()):
+        return None, {conflict_code}
+    active = sorted(state for state, values in values_by_state.items() if True in values)
+    if len(active) != 1:
+        return None, {invalid_code if not active else conflict_code}
+    return active[0], set()
+
+
+def _reconcile_success(
+    binary_samples: Sequence[_AcceptedSample],
+    state_samples: Sequence[_AcceptedSample],
+    *,
+    allowed_states: frozenset[str],
+    success_state: str,
+    failure_state: str,
+    missing_code: str | None,
+    invalid_binary_code: str,
+    conflicting_binary_code: str,
+    invalid_state_code: str,
+    conflicting_state_code: str,
+    conflicting_pair_code: str,
+    require_binary_for_result_states: bool = False,
+) -> tuple[bool | None, str | None, set[str]]:
+    binary, diagnostics = _binary_value(
+        binary_samples,
+        missing_code=None,
+        invalid_code=invalid_binary_code,
+        conflict_code=conflicting_binary_code,
+    )
+    state, state_diagnostics = _one_hot_state(
+        state_samples,
+        allowed=allowed_states,
+        invalid_code=invalid_state_code,
+        conflict_code=conflicting_state_code,
+    )
+    diagnostics.update(state_diagnostics)
+    if state_diagnostics:
+        return None, None, diagnostics
+
+    state_success: bool | None = None
+    if state == success_state:
+        state_success = True
+    elif state == failure_state:
+        state_success = False
+
+    if state is not None:
+        if binary is not None and (state_success is None or binary != state_success):
+            diagnostics.add(conflicting_pair_code)
+            return None, state, diagnostics
+        if (
+            binary is None
+            and not diagnostics
+            and require_binary_for_result_states
+            and state_success is not None
+        ):
+            if missing_code is not None:
+                diagnostics.add(missing_code)
+        elif binary is None and not diagnostics:
+            binary = state_success
+    elif binary is None and not diagnostics and missing_code is not None:
+        diagnostics.add(missing_code)
+    elif state is None and binary is not None:
+        state = success_state if binary else failure_state
+    return binary, state, diagnostics
+
+
+def _nested_status_reason(
+    state: str | None,
+    success: bool | None,
+    diagnostics: set[str],
+) -> str | None:
+    if diagnostics:
+        return "invalid_data"
+    if state in {"error", "stale", "disabled", "unknown"}:
+        return f"executor_{state}"
+    if success is None:
+        return "incomplete_data"
+    return None
+
+
+def _counter_value(
+    samples: Sequence[_AcceptedSample],
+) -> tuple[int | None, set[str]]:
+    if not samples:
+        return None, set()
+    if any(
+        not math.isfinite(item.sample.value)
+        or item.sample.value < 0
+        or not item.sample.value.is_integer()
+        or item.sample.value > 9_007_199_254_740_991
+        for item in samples
+    ):
+        return None, {"invalid_error_count"}
+    valid_values = {item.sample.value for item in samples}
+    if len(valid_values) != 1:
+        return None, {"conflicting_error_count"}
+    return int(next(iter(valid_values))), set()
 
 
 def _last_run_value(
@@ -447,6 +877,7 @@ def normalize_check_metrics(
     future_tolerance_seconds: float,
     max_series: int,
     previous: ChecksSnapshot | None = None,
+    reuse_previous_info_dimensions: bool = False,
 ) -> tuple[NormalizedCheck, ...]:
     """Normalize allowlisted metric fields and merge replicas by logical result key."""
 
@@ -461,9 +892,17 @@ def normalize_check_metrics(
         query_name: [] for query_name in CHECK_QUERY_NAMES
     }
     check_diagnostics: dict[str, set[str]] = defaultdict(set)
+    raw_info_samples = samples_by_query.get("check_info", ())
+    info_hints = _build_info_hints(raw_info_samples)
+    reuse_previous_info_metadata = (
+        reuse_previous_info_dimensions and previous is not None and not raw_info_samples
+    )
+    if reuse_previous_info_metadata:
+        assert previous is not None
+        info_hints = _build_previous_info_hints(previous)
     for query_name in CHECK_QUERY_NAMES:
         for sample in samples_by_query.get(query_name, ()):
-            item = _accept_sample(query_name, sample, check_diagnostics)
+            item = _accept_sample(query_name, sample, check_diagnostics, info_hints)
             if item is not None:
                 accepted[query_name].append(item)
 
@@ -471,7 +910,6 @@ def normalize_check_metrics(
         item.key for query_name in _PRIMARY_CHECK_QUERIES for item in accepted[query_name]
     }
     current_check_ids = {key.check_id for key in primary_keys}
-    raw_info_samples = samples_by_query.get("check_info", ())
     info_is_authoritative = bool(raw_info_samples) and len(accepted["check_info"]) == len(
         raw_info_samples
     )
@@ -482,6 +920,16 @@ def normalize_check_metrics(
     valid_info_keys = (
         {item.key for item in accepted["check_info"]} if info_is_authoritative else set()
     )
+    valid_info_keys_by_base: dict[tuple[str, str], set[CheckResultKey]] = defaultdict(set)
+    for key in valid_info_keys:
+        valid_info_keys_by_base[(key.check_id, key.source)].add(key)
+    info_hinted_operational_dimensions: dict[CheckResultKey, set[str]] = defaultdict(set)
+    for query_name in ("check_state", "check_status", "check_last_run"):
+        for item in accepted[query_name]:
+            if item.scenario_info_hint_applied:
+                info_hinted_operational_dimensions[item.key].add("scenario")
+            if item.variant_info_hint_applied:
+                info_hinted_operational_dimensions[item.key].add("variant")
     # Only a wholly valid info response can be treated as an authoritative inventory. Invalid
     # or rejected samples are still normalized where possible so operators see `invalid_data`,
     # but they must not make previous results disappear and accidentally improve a Check.
@@ -496,14 +944,17 @@ def normalize_check_metrics(
     by_query_key: dict[CheckQueryName, dict[CheckResultKey, list[_AcceptedSample]]] = {
         query_name: defaultdict(list) for query_name in CHECK_QUERY_NAMES
     }
-    names: dict[str, set[str]] = defaultdict(set)
+    names: dict[str, dict[int, set[str]]] = defaultdict(lambda: defaultdict(set))
+    derived_names: dict[str, set[str]] = defaultdict(set)
     groups: dict[str, set[str]] = defaultdict(set)
     targets: dict[CheckResultKey, set[str]] = defaultdict(set)
     for query_name, items in accepted.items():
         for item in items:
             by_query_key[query_name][item.key].append(item)
-            if item.name is not None:
-                names[item.key.check_id].add(item.name)
+            if item.name is not None and item.name_priority is not None:
+                names[item.key.check_id][item.name_priority].add(item.name)
+            if item.derived_name is not None:
+                derived_names[item.key.check_id].add(item.derived_name)
             if item.group is not None:
                 groups[item.key.check_id].add(item.group)
             if item.target is not None:
@@ -512,27 +963,38 @@ def normalize_check_metrics(
     normalized_results: dict[CheckResultKey, NormalizedCheckResult] = {}
     for key in sorted(primary_keys):
         result_diagnostics: set[str] = set()
-        success, status_diagnostics = _binary_value(
+        success, state, status_diagnostics = _reconcile_success(
             by_query_key["check_status"].get(key, ()),
+            by_query_key["check_state"].get(key, ()),
+            allowed_states=_CHECK_STATES,
+            success_state="success",
+            failure_state="failure",
             missing_code="missing_status",
-            invalid_code="invalid_status",
-            conflict_code="conflicting_status",
+            invalid_binary_code="invalid_status",
+            conflicting_binary_code="conflicting_status",
+            invalid_state_code="invalid_state",
+            conflicting_state_code="conflicting_state",
+            conflicting_pair_code="conflicting_state_status",
+            require_binary_for_result_states=True,
         )
         result_diagnostics.update(status_diagnostics)
+        last_run_samples = by_query_key["check_last_run"].get(key, ())
         last_run_at, timestamp_diagnostics = _last_run_value(
-            by_query_key["check_last_run"].get(key, ()),
+            last_run_samples,
             evaluated_at=evaluated_at,
             future_tolerance_seconds=future_tolerance_seconds,
         )
+        if (state in {"unknown", "error", "stale", "disabled"} and not last_run_samples) or (
+            success is None
+            and bool(last_run_samples)
+            and all(item.sample.value == 0.0 for item in last_run_samples)
+        ):
+            # The prober deliberately exports zero before the first completed run. Epoch is not
+            # evidence of a stale run when there is no confirmed binary result; a non-result
+            # one-hot state already explains why the binary status is absent.
+            last_run_at = None
+            timestamp_diagnostics = set()
         result_diagnostics.update(timestamp_diagnostics)
-        duration, duration_diagnostics = _non_negative_value(
-            by_query_key["check_duration"].get(key, ()), label="duration"
-        )
-        result_diagnostics.update(duration_diagnostics)
-        ttfb, ttfb_diagnostics = _non_negative_value(
-            by_query_key["check_ttfb"].get(key, ()), label="ttfb"
-        )
-        result_diagnostics.update(ttfb_diagnostics)
         target, target_diagnostics = _metadata_value(
             targets[key], conflict_code="conflicting_target"
         )
@@ -544,6 +1006,12 @@ def normalize_check_metrics(
             for item in info_samples
         ):
             result_diagnostics.add("invalid_info")
+        if any(
+            item.info_conflict
+            for query_name in CHECK_QUERY_NAMES
+            for item in by_query_key[query_name].get(key, ())
+        ):
+            result_diagnostics.update({"conflicting_info_metadata", "invalid_info"})
 
         canary_groups: dict[str, list[_AcceptedSample]] = defaultdict(list)
         for item in by_query_key["check_canary_success"].get(key, ()):
@@ -568,25 +1036,184 @@ def normalize_check_metrics(
                 )
             )
 
-        assertions: list[CheckAssertion] = []
-        assertion_samples = by_query_key["check_egress_match"].get(key, ())
-        if assertion_samples:
-            assertion_success, assertion_diagnostics = _binary_value(
-                assertion_samples,
+        target_ids = sorted(
+            {
+                item.target_id
+                for query_name in (
+                    "check_target_success",
+                    "check_target_state",
+                    "check_duration",
+                    "check_ttfb",
+                )
+                for item in by_query_key[query_name].get(key, ())
+                if item.target_id is not None
+            }
+        )
+        if len(target_ids) > MAX_TARGETS_PER_RESULT:
+            raise ChecksDataError("checks_limit_exceeded")
+        normalized_targets: list[CheckTarget] = []
+        for target_id in target_ids:
+            target_success, target_state, target_status_diagnostics = _reconcile_success(
+                tuple(
+                    item
+                    for item in by_query_key["check_target_success"].get(key, ())
+                    if item.target_id == target_id
+                ),
+                tuple(
+                    item
+                    for item in by_query_key["check_target_state"].get(key, ())
+                    if item.target_id == target_id
+                ),
+                allowed_states=_CHECK_STATES,
+                success_state="success",
+                failure_state="failure",
                 missing_code=None,
-                invalid_code="invalid_assertion",
-                conflict_code="conflicting_assertion",
+                invalid_binary_code="invalid_target_status",
+                conflicting_binary_code="conflicting_target_status",
+                invalid_state_code="invalid_target_state",
+                conflicting_state_code="conflicting_target_state",
+                conflicting_pair_code="conflicting_target_state_status",
             )
-            result_diagnostics.update(assertion_diagnostics)
-            assertions.append(
-                CheckAssertion(
-                    key="egress_match",
-                    success=assertion_success,
-                    status_reason="invalid_data" if assertion_success is None else None,
+            target_duration, target_duration_diagnostics = _non_negative_value(
+                tuple(
+                    item
+                    for item in by_query_key["check_duration"].get(key, ())
+                    if item.target_id == target_id
+                ),
+                label="target_duration",
+            )
+            target_ttfb, target_ttfb_diagnostics = _non_negative_value(
+                tuple(
+                    item
+                    for item in by_query_key["check_ttfb"].get(key, ())
+                    if item.target_id == target_id
+                ),
+                label="target_ttfb",
+            )
+            nested_diagnostics = {
+                *target_status_diagnostics,
+                *target_duration_diagnostics,
+                *target_ttfb_diagnostics,
+            }
+            result_diagnostics.update(nested_diagnostics)
+            normalized_targets.append(
+                CheckTarget(
+                    target_id=target_id,
+                    name=_humanize_identifier(target_id),
+                    state=cast(CheckResultState | None, target_state),
+                    success=target_success,
+                    duration_seconds=target_duration,
+                    ttfb_seconds=target_ttfb,
+                    status_reason=_nested_status_reason(
+                        target_state,
+                        target_success,
+                        nested_diagnostics,
+                    ),
                 )
             )
 
+        legacy_duration, duration_diagnostics = _non_negative_value(
+            tuple(
+                item
+                for item in by_query_key["check_duration"].get(key, ())
+                if item.target_id is None
+            ),
+            label="duration",
+        )
+        result_diagnostics.update(duration_diagnostics)
+        legacy_ttfb, ttfb_diagnostics = _non_negative_value(
+            tuple(
+                item for item in by_query_key["check_ttfb"].get(key, ()) if item.target_id is None
+            ),
+            label="ttfb",
+        )
+        result_diagnostics.update(ttfb_diagnostics)
+        duration_values = [
+            value
+            for value in (
+                legacy_duration,
+                *(item.duration_seconds for item in normalized_targets),
+            )
+            if value is not None
+        ]
+        ttfb_values = [
+            value
+            for value in (
+                legacy_ttfb,
+                *(item.ttfb_seconds for item in normalized_targets),
+            )
+            if value is not None
+        ]
+        duration = max(duration_values) if duration_values else None
+        ttfb = max(ttfb_values) if ttfb_values else None
+
+        assertions: list[CheckAssertion] = []
+        assertion_ids = sorted(
+            {
+                item.assertion_id or _DEFAULT_ASSERTION
+                for query_name in ("check_egress_state", "check_egress_match")
+                for item in by_query_key[query_name].get(key, ())
+            }
+        )
+        if len(assertion_ids) > MAX_ASSERTIONS_PER_RESULT:
+            raise ChecksDataError("checks_limit_exceeded")
+        for assertion_id in assertion_ids:
+            assertion_success, assertion_state, assertion_diagnostics = _reconcile_success(
+                tuple(
+                    item
+                    for item in by_query_key["check_egress_match"].get(key, ())
+                    if (item.assertion_id or _DEFAULT_ASSERTION) == assertion_id
+                ),
+                tuple(
+                    item
+                    for item in by_query_key["check_egress_state"].get(key, ())
+                    if (item.assertion_id or _DEFAULT_ASSERTION) == assertion_id
+                ),
+                allowed_states=_EGRESS_STATES,
+                success_state="match",
+                failure_state="mismatch",
+                missing_code=None,
+                invalid_binary_code="invalid_assertion",
+                conflicting_binary_code="conflicting_assertion",
+                invalid_state_code="invalid_assertion_state",
+                conflicting_state_code="conflicting_assertion_state",
+                conflicting_pair_code="conflicting_assertion_state_match",
+            )
+            result_diagnostics.update(assertion_diagnostics)
+            public_key = "egress_match" if assertion_id == _DEFAULT_ASSERTION else assertion_id
+            assertions.append(
+                CheckAssertion(
+                    key=public_key,
+                    success=assertion_success,
+                    status_reason=_nested_status_reason(
+                        assertion_state,
+                        assertion_success,
+                        assertion_diagnostics,
+                    ),
+                    name=_humanize_identifier(public_key),
+                    state=cast(CheckAssertionState | None, assertion_state),
+                )
+            )
+
+        errors_by_reason: dict[str, list[_AcceptedSample]] = defaultdict(list)
+        for item in by_query_key["check_errors_total"].get(key, ()):
+            if item.reason not in _SAFE_ERROR_REASONS:
+                result_diagnostics.add("invalid_error_reason")
+                continue
+            errors_by_reason[item.reason].append(item)
+        error_reasons: list[CheckErrorReason] = []
+        for reason, reason_samples in sorted(errors_by_reason.items()):
+            count, count_diagnostics = _counter_value(reason_samples)
+            result_diagnostics.update(count_diagnostics)
+            if count is not None:
+                error_reasons.append(CheckErrorReason(reason=reason, count=count))
+
         previously_declared = previous_results_by_key.get(key)
+        provisional_info_dimensions = reuse_previous_info_dimensions and any(
+            item.key_dimensions_defaulted
+            for query_name in ("check_state", "check_status", "check_last_run")
+            for item in by_query_key[query_name].get(key, ())
+        )
         normalized_results[key] = NormalizedCheckResult(
             key=key,
             target=target,
@@ -605,6 +1232,17 @@ def normalize_check_metrics(
                     and previously_declared.known_via_info
                 )
             ),
+            provisional_info_dimensions=(
+                provisional_info_dimensions
+                or (
+                    not info_is_present
+                    and previously_declared is not None
+                    and previously_declared.provisional_info_dimensions
+                )
+            ),
+            state=cast(CheckResultState | None, state),
+            targets=tuple(normalized_targets),
+            error_reasons=tuple(error_reasons),
         )
 
     if previous is not None:
@@ -618,6 +1256,17 @@ def normalize_check_metrics(
                 # unrelated info series must not silently erase their remembered inventory.
                 if info_is_present and previous_result.known_via_info:
                     continue
+                if info_is_present and _matches_proven_info_rekey(
+                    previous_result,
+                    valid_info_keys_by_base[
+                        (previous_result.key.check_id, previous_result.key.source)
+                    ],
+                    info_hinted_operational_dimensions,
+                ):
+                    # A result first observed while info was unavailable used one or more private
+                    # default dimensions. Once a single authoritative info row declares that same
+                    # check/source, its enriched current key replaces the provisional tuple.
+                    continue
                 retained_missing_count += 1
                 if sample_count + retained_missing_count > max_series:
                     raise ChecksDataError("checks_limit_exceeded")
@@ -626,10 +1275,31 @@ def normalize_check_metrics(
                     target=previous_result.target,
                     success=None,
                     last_run_at=previous_result.last_run_at,
+                    assertions=tuple(
+                        CheckAssertion(
+                            key=assertion.key,
+                            success=None,
+                            status_reason="incomplete_data",
+                            name=assertion.name,
+                            state=None,
+                        )
+                        for assertion in previous_result.assertions
+                    ),
                     diagnostics=tuple(
                         sorted({*previous_result.diagnostics, "missing_current_result"})
                     ),
                     known_via_info=previous_result.known_via_info,
+                    provisional_info_dimensions=previous_result.provisional_info_dimensions,
+                    targets=tuple(
+                        CheckTarget(
+                            target_id=item.target_id,
+                            name=item.name,
+                            state=None,
+                            success=None,
+                            status_reason="incomplete_data",
+                        )
+                        for item in previous_result.targets
+                    ),
                 )
         if len(normalized_results) > max_series:
             raise ChecksDataError("checks_limit_exceeded")
@@ -643,16 +1313,27 @@ def normalize_check_metrics(
         if len(results) > MAX_RESULTS_PER_CHECK:
             raise ChecksDataError("checks_limit_exceeded")
         diagnostics = check_diagnostics[check_id]
-        name_values = names[check_id]
+        name_values = next(
+            (names[check_id][priority] for priority in (0, 1) if names[check_id][priority]),
+            set(),
+        )
         if len(name_values) > 1:
             name = check_id
             diagnostics.add("conflicting_name")
         elif name_values:
             name = next(iter(name_values))
-        elif check_id not in current_check_ids and check_id in previous_by_id:
+        elif len(derived_names[check_id]) > 1:
+            name = _humanize_identifier(check_id)
+            diagnostics.add("conflicting_name")
+        elif derived_names[check_id]:
+            name = next(iter(derived_names[check_id]))
+        elif check_id in previous_by_id and (
+            check_id not in current_check_ids
+            or (reuse_previous_info_metadata and "invalid_name" not in diagnostics)
+        ):
             name = previous_by_id[check_id].name
         else:
-            name = check_id
+            name = _humanize_identifier(check_id)
 
         group_values = groups[check_id]
         if len(group_values) > 1:
@@ -660,7 +1341,10 @@ def normalize_check_metrics(
             diagnostics.add("conflicting_group")
         elif group_values:
             group = next(iter(group_values))
-        elif check_id not in current_check_ids and check_id in previous_by_id:
+        elif check_id in previous_by_id and (
+            check_id not in current_check_ids
+            or (reuse_previous_info_metadata and "invalid_group" not in diagnostics)
+        ):
             group = previous_by_id[check_id].group
         else:
             group = None
@@ -700,6 +1384,7 @@ async def refresh_checks_snapshot(
         query_name: [] for query_name in CHECK_QUERY_NAMES
     }
     if targets:
+        concurrency_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECK_REQUESTS)
         try:
             query_results = await asyncio.gather(
                 *(
@@ -709,6 +1394,7 @@ async def refresh_checks_snapshot(
                         query_name,
                         evaluated_at=query_time,
                         allow_non_finite_values=True,
+                        concurrency_limiter=concurrency_limiter,
                     )
                     for query_name in CHECK_QUERY_NAMES
                 )
@@ -752,6 +1438,7 @@ async def refresh_checks_snapshot(
         future_tolerance_seconds=settings.checks_future_tolerance_seconds,
         max_series=settings.checks_max_series,
         previous=previous,
+        reuse_previous_info_dimensions=bool(failures_by_query["check_info"]),
     )
     fetched_at = utc_clock().astimezone(UTC)
     return ChecksSnapshot(
@@ -864,7 +1551,12 @@ def filter_checks(
         ):
             return False
         if filters.target is not None and not any(
-            result.target == filters.target for result in check.results
+            result.target == filters.target
+            or any(
+                target.target_id == filters.target or target.name == filters.target
+                for target in result.targets
+            )
+            for result in check.results
         ):
             return False
         if filters.scenario is not None and not any(
@@ -877,6 +1569,7 @@ def filter_checks(
                 check.check_id,
                 check.name,
                 *(result.target for result in check.results if result.target is not None),
+                *(target.name for result in check.results for target in result.targets),
             )
         )
 
@@ -937,7 +1630,11 @@ def build_check_grafana_url(base_url: str | None, check_id: str) -> str | None:
         return None
     try:
         parsed = urlsplit(base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or not is_grafana_dashboard_url(base_url)
+        ):
             return None
         if parsed.username is not None or parsed.password is not None:
             return None

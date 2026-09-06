@@ -298,8 +298,9 @@ timestamp tolerance, and a combined 5,000-sample refresh/registry limit. The
 accepted configuration ranges are 1–86,400 seconds for stale age, 1–1,000
 failure sources, 0.1–5 seconds for cache TTL, 0–300 seconds for future
 tolerance, and 1–100,000 series. `CHECKS_GRAFANA_BASE_URL` is non-secret
-navigation metadata; use an absolute HTTPS URL without credentials. An invalid
-or disallowed URL disables only the link.
+navigation metadata; use an absolute HTTPS URL without credentials that points to a concrete
+Grafana `/d/<uid>[/slug]` or `d-solo` dashboard view. An origin/home, invalid, or disallowed URL
+disables only the link.
 
 The workflow passes Checks variables only to `api` and `all` deployment steps.
 The root-owned engine validates them, writes them to the private runtime env,
