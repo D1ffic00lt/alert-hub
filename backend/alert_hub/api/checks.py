@@ -34,10 +34,14 @@ from alert_hub.domain.checks import (
     DEFAULT_VARIANT,
     AggregatedCheck,
     CheckAssertion,
+    CheckAssertionState,
     CheckCanary,
+    CheckErrorReason,
     CheckPart,
+    CheckResultState,
     CheckResultView,
     CheckStatus,
+    CheckTarget,
 )
 from alert_hub.infrastructure.db.models import Incident, IncidentEvent, User
 from alert_hub.infrastructure.encryption import EnvelopeCipher
@@ -101,8 +105,25 @@ class CheckCanaryResponse(BaseModel):
 
 class CheckAssertionResponse(BaseModel):
     key: str
+    name: str | None
+    state: CheckAssertionState | None
     success: bool | None
     status_reason: str | None
+
+
+class CheckTargetResponse(BaseModel):
+    target_id: str
+    name: str
+    state: CheckResultState | None
+    success: bool | None
+    duration_seconds: float | None
+    ttfb_seconds: float | None
+    status_reason: str | None
+
+
+class CheckErrorReasonResponse(BaseModel):
+    reason: str
+    count: int
 
 
 class CheckResultResponse(BaseModel):
@@ -112,12 +133,15 @@ class CheckResultResponse(BaseModel):
     target: str | None
     status: CheckStatus
     status_reason: str
+    state: CheckResultState | None
     success: bool | None
     last_run_at: datetime | None
     duration_seconds: float | None
     ttfb_seconds: float | None
     canaries: list[CheckCanaryResponse]
+    targets: list[CheckTargetResponse]
     assertions: list[CheckAssertionResponse]
+    error_reasons: list[CheckErrorReasonResponse]
     stale: bool
     data_incomplete: bool
     diagnostic_codes: list[str]
@@ -391,12 +415,26 @@ def _unavailable_result(result: CheckResultView) -> CheckResultView:
                 key=assertion.key,
                 success=None,
                 status_reason="prometheus_unavailable",
+                name=assertion.name,
+                state=None,
             )
             for assertion in result.assertions
         ),
         stale=False,
         data_incomplete=True,
         diagnostics=(),
+        state=None,
+        targets=tuple(
+            CheckTarget(
+                target_id=target.target_id,
+                name=target.name,
+                state=None,
+                success=None,
+                status_reason="prometheus_unavailable",
+            )
+            for target in result.targets
+        ),
+        error_reasons=(),
     )
 
 
@@ -572,9 +610,27 @@ def _canary_response(canary: CheckCanary) -> CheckCanaryResponse:
 def _assertion_response(assertion: CheckAssertion) -> CheckAssertionResponse:
     return CheckAssertionResponse(
         key=assertion.key,
+        name=assertion.name,
+        state=assertion.state,
         success=assertion.success,
         status_reason=assertion.status_reason,
     )
+
+
+def _target_response(target: CheckTarget) -> CheckTargetResponse:
+    return CheckTargetResponse(
+        target_id=target.target_id,
+        name=target.name,
+        state=target.state,
+        success=target.success,
+        duration_seconds=target.duration_seconds,
+        ttfb_seconds=target.ttfb_seconds,
+        status_reason=target.status_reason,
+    )
+
+
+def _error_reason_response(error: CheckErrorReason) -> CheckErrorReasonResponse:
+    return CheckErrorReasonResponse(reason=error.reason, count=error.count)
 
 
 def _result_response(result: CheckResultView) -> CheckResultResponse:
@@ -585,12 +641,15 @@ def _result_response(result: CheckResultView) -> CheckResultResponse:
         target=result.target,
         status=result.status,
         status_reason=result.status_reason,
+        state=result.state,
         success=result.success,
         last_run_at=result.last_run_at,
         duration_seconds=result.duration_seconds,
         ttfb_seconds=result.ttfb_seconds,
         canaries=[_canary_response(canary) for canary in result.canaries],
+        targets=[_target_response(target) for target in result.targets],
         assertions=[_assertion_response(assertion) for assertion in result.assertions],
+        error_reasons=[_error_reason_response(error) for error in result.error_reasons],
         stale=result.stale,
         data_incomplete=result.data_incomplete,
         diagnostic_codes=list(result.diagnostics),

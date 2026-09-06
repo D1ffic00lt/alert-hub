@@ -45,6 +45,25 @@ def _vector(*samples: tuple[dict[str, str], float, float]) -> dict[str, Any]:
     }
 
 
+def test_fixed_check_queries_match_the_exported_metric_families() -> None:
+    assert {
+        name: FIXED_PROMQL[name]
+        for name in (
+            "check_state",
+            "check_target_success",
+            "check_target_state",
+            "check_egress_state",
+            "check_errors_total",
+        )
+    } == {
+        "check_state": "synthetic_check_state",
+        "check_target_success": "synthetic_check_target_success",
+        "check_target_state": "synthetic_check_target_state",
+        "check_egress_state": "synthetic_check_egress_state",
+        "check_errors_total": "synthetic_check_errors_total",
+    }
+
+
 def test_vector_parser_preserves_labels_and_rejects_invalid_values() -> None:
     payload = _vector(
         (
@@ -372,6 +391,14 @@ def test_application_monitoring_settings_drive_safe_server_owned_job_queries(
         ).status_code
         == 422
     )
+    assert (
+        client.patch(
+            "/api/v1/application-settings",
+            headers=auth,
+            json={"grafana_url": "https://grafana.example/"},
+        ).status_code
+        == 422
+    )
 
     key_jobs = client.get("/api/v1/metrics/queries/key_jobs_up", headers=auth)
     alert_hub = client.get("/api/v1/metrics/queries/alert_hub_health", headers=auth)
@@ -491,6 +518,69 @@ def test_application_monitoring_settings_replicate_idempotently(tmp_path: Path) 
             replicated = db.get(ApplicationSetting, "monitoring")
             assert replicated is not None
             assert replicated.grafana_url == "https://grafana.example/d/ops"
+
+        invalid_navigation = IncomingClusterEvent(
+            event_id="00000000-0000-0000-0000-000000009999",
+            origin_node_id="new-settings-node",
+            origin_seq=1,
+            entity_type="application_setting",
+            entity_id="monitoring",
+            operation="upsert",
+            occurred_at=incoming.occurred_at + timedelta(seconds=1),
+            payload={
+                **incoming.payload,
+                "grafana_url": "https://grafana.example/",
+                "key_job_globs": ["prometheus-new"],
+                "updated_at": (incoming.occurred_at + timedelta(seconds=1)).isoformat(),
+            },
+        )
+        with app_b.state.session_factory.begin() as db:
+            assert apply_cluster_events(db, [invalid_navigation], settings_b).applied == 1
+        with app_b.state.session_factory() as db:
+            replicated = db.get(ApplicationSetting, "monitoring")
+            assert replicated is not None
+            assert replicated.grafana_url is None
+            assert replicated.key_job_globs == ["prometheus-new"]
+
+
+def test_legacy_grafana_home_is_hidden_and_cleaned_on_unrelated_patch(
+    client: TestClient,
+    auth: dict[str, str],
+    app: Any,
+) -> None:
+    now = datetime.now(UTC)
+    with app.state.session_factory.begin() as db:
+        db.add(
+            ApplicationSetting(
+                id="monitoring",
+                grafana_url="https://grafana.example/",
+                key_job_globs=["prometheus"],
+                alert_hub_job_globs=["alert-hub*"],
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    response = client.get("/api/v1/application-settings", headers=auth)
+    assert response.status_code == 200
+    assert response.json()["grafana_url"] is None
+
+    patched = client.patch(
+        "/api/v1/application-settings",
+        headers=auth,
+        json={"key_job_globs": ["prometheus", "blackbox*"]},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["grafana_url"] is None
+    with app.state.session_factory() as db:
+        stored = db.get(ApplicationSetting, "monitoring")
+        assert stored is not None
+        assert stored.grafana_url is None
+        assert stored.key_job_globs == ["prometheus", "blackbox*"]
+        audit = db.scalars(
+            select(AuditLog).where(AuditLog.action == "application_settings_updated")
+        ).one()
+        assert audit.details_json["fields"] == ["grafana_url", "key_job_globs"]
 
 
 def test_reachability_merges_actual_labels_and_reports_partial_failures(

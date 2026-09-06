@@ -1,5 +1,14 @@
-import { describe, expect, it } from "vitest";
-import { mergeIncidentSummariesWithHistory } from "../../app/incidents";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  createRefreshBurstCoalescer,
+  incidentListPath,
+  mergeIncidentSummariesWithHistory,
+  normalizeIncidentSearch,
+} from "../../app/incidents";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("incident snapshot merging", () => {
   it("preserves a loaded timeline when a background list refresh returns summaries", () => {
@@ -76,5 +85,107 @@ describe("incident snapshot merging", () => {
     );
 
     expect(merged).toMatchObject({ checkIds: [], checksRelationState: "disabled" });
+  });
+
+  it("keeps detail-only fields when a compact summary refreshes mutable list fields", () => {
+    const [merged] = mergeIncidentSummariesWithHistory(
+      [
+        {
+          id: "incident-1",
+          title: "Fresh title",
+          status: "resolved",
+          summaryOnly: true,
+          description: "",
+          labels: {},
+          annotations: {},
+          events: [],
+        },
+      ],
+      [
+        {
+          id: "incident-1",
+          title: "Old title",
+          status: "open",
+          summaryOnly: false,
+          description: "Detailed description",
+          labels: { service: "api" },
+          annotations: { runbook: "safe" },
+          events: [{ id: "event-1" }],
+        },
+      ],
+    );
+
+    expect(merged).toMatchObject({
+      title: "Fresh title",
+      status: "resolved",
+      summaryOnly: false,
+      description: "Detailed description",
+      labels: { service: "api" },
+      annotations: { runbook: "safe" },
+      events: [{ id: "event-1" }],
+    });
+  });
+});
+
+describe("incident list request", () => {
+  it("treats whitespace-only and trailing-whitespace edits as the same search", () => {
+    expect(normalizeIncidentSearch("   ")).toBe("");
+    expect(normalizeIncidentSearch(" active api ")).toBe("active api");
+    expect(normalizeIncidentSearch("active api   ")).toBe(normalizeIncidentSearch("active api"));
+  });
+
+  it("encodes server-side filters and keeps wildcard input literal at the HTTP boundary", () => {
+    const path = incidentListPath({
+      status: "active",
+      severity: "critical",
+      query: " api % ",
+      limit: 50,
+      offset: 100,
+    });
+
+    expect(path).toBe(
+      "/incidents?limit=50&offset=100&view=compact&status=active&severity=critical&q=api+%25",
+    );
+  });
+});
+
+describe("SSE refresh burst coalescing", () => {
+  it("turns a burst into one refresh", async () => {
+    vi.useFakeTimers();
+    const run = vi.fn(async () => undefined);
+    const coalescer = createRefreshBurstCoalescer(run, 250);
+
+    coalescer.request();
+    coalescer.request();
+    coalescer.request();
+    await vi.advanceTimersByTimeAsync(249);
+    expect(run).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps exactly one trailing refresh when events arrive during an active refresh", async () => {
+    vi.useFakeTimers();
+    let finishFirst: (() => void) | undefined;
+    const run = vi
+      .fn<() => Promise<void>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishFirst = resolve;
+          }),
+      )
+      .mockResolvedValue(undefined);
+    const coalescer = createRefreshBurstCoalescer(run, 250);
+
+    coalescer.request();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(run).toHaveBeenCalledTimes(1);
+    coalescer.request();
+    coalescer.request();
+    finishFirst?.();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(run).toHaveBeenCalledTimes(2);
   });
 });

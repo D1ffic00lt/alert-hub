@@ -33,6 +33,8 @@ UI refreshes this runtime view every 30 seconds even while its cluster-event str
 Administrators set the optional Grafana HTTPS dashboard link and the bounded `job` glob lists under
 **Settings → Grafana and job selection**. The values are audited and replicated as append-only
 cluster configuration. `GRAFANA_URL` remains the initial fallback until a cluster setting is saved.
+New values must identify a concrete `/d/<uid>[/slug]` or `d-solo` view; a legacy origin/home value
+is hidden rather than presented as a misleading deep link.
 The link is navigation metadata, not a Grafana credential or a way to submit PromQL; Prometheus
 remains the time-series source of truth.
 
@@ -47,6 +49,38 @@ Alert on at least:
   `unknown` or stale results when Checks is enabled;
 - backup age/checksum/restore-test failure;
 - release digest/config checksum drift across nodes.
+
+## Incident list and bulk actions
+
+`GET /api/v1/incidents` performs filtering and pagination on the serving node. It accepts
+`status` (`active`, `open`, `acknowledged`, `resolved`, or `silenced`), `severity`, `source_id`,
+`q`, `limit`, and `offset`. The response `total` applies the complete filter, while `counts`
+applies the severity/source/search filters and reports every status so the UI can change status
+tabs without downloading the journal. `status=active` means open, acknowledged, or silenced.
+
+Use `view=compact` for list screens. Compact rows retain identity, status, timestamps, source,
+region/target hints, and bounded Check relations, set `summary_only: true`, and omit the potentially
+large description, fingerprint, labels, and annotations. Fetch `GET /api/v1/incidents/{id}` before
+showing an incident detail; a compact top-N snapshot is not proof that an older incident does not
+exist. The live UI owns one filtered page request while on `/incidents`, publishes that SQLite
+response independently of Prometheus latency, and coalesces short SSE bursts into at most one
+in-flight refresh plus one trailing refresh.
+
+`POST /api/v1/incidents/bulk-action` supports one of two explicit selection modes:
+
+- `ids`: up to 500 unique `incident_ids` selected across visible pages;
+- `filter`: the same status/severity/source/search filter as the list, plus up to 500 explicit
+  `excluded_incident_ids`. The server rejects a matching population above 500 instead of silently
+  truncating it.
+
+The actions are `acknowledge`, `resolve`, and `silence`. Every changed incident produces the same
+append-only replicated incident event and audit record as its single-item operation. Repeating an
+already-applied action returns `unchanged` and does not append another event. Missing IDs and
+invalid transitions such as acknowledging a resolved incident are reported per item as
+`not_found` or `conflict`; successful selections return `200`, and mixed results return `207` with
+`updated`, `unchanged`, and `failed` totals. A `207` is an operation result, not a transport failure,
+so clients must display its per-item failures. The UI keeps that result visible after clearing the
+successful selection and asks for confirmation before bulk resolve.
 
 ## Checks
 
@@ -80,20 +114,27 @@ absent.
 
 The two required gauges describe the same latest completed run:
 
-| Metric                                         | Meaning                                                                            |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `synthetic_check_status`                       | `1` for success or `0` for failure of the latest completed run                     |
-| `synthetic_check_last_run_timestamp_seconds`   | Unix timestamp at which that same run completed                                    |
-| `synthetic_check_info`                         | Optional expected-inventory/metadata series; publish value `1`                     |
-| `synthetic_check_duration_seconds`             | Optional non-negative total run duration                                           |
-| `synthetic_check_ttfb_seconds`                 | Optional non-negative time to first byte when meaningful                           |
-| `synthetic_check_canary_success{canary="..."}` | Optional named nested result, `0` or `1`                                           |
-| `synthetic_check_egress_match`                 | Optional assertion result, exposed as assertion key `egress_match` without IP data |
+| Metric                                             | Meaning                                                                                   |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `synthetic_check_status`                           | `1` for success or `0` for failure of the latest completed run                            |
+| `synthetic_check_state{state="..."}`               | Optional one-hot `unknown/success/failure/error/stale/disabled` state                     |
+| `synthetic_check_last_run_timestamp_seconds`       | Unix timestamp at which that same run completed                                           |
+| `synthetic_check_info`                             | Optional expected-inventory/metadata series; publish value `1`                            |
+| `synthetic_check_target_success{target_id="..."}`  | Optional confirmed target result, `0` or `1`                                              |
+| `synthetic_check_target_state{target_id,state}`    | Optional one-hot state of each target                                                     |
+| `synthetic_check_duration_seconds{target_id}`      | Optional non-negative duration; distinct targets remain distinct                          |
+| `synthetic_check_ttfb_seconds{target_id}`          | Optional non-negative TTFB; distinct targets remain distinct                              |
+| `synthetic_check_canary_success{canary="..."}`     | Optional named nested result, `0` or `1`                                                  |
+| `synthetic_check_egress_match{assertion_id}`       | Optional confirmed assertion result without observed/expected IP data                     |
+| `synthetic_check_egress_state{assertion_id,state}` | Optional one-hot state; each assertion remains a separate universal Assertion             |
+| `synthetic_check_errors_total{reason="..."}`       | Optional cumulative diagnostic counter with an allowlist of structured reason identifiers |
 
 `check_id` is the only required label. It must be a stable public identifier, unique across the
 enabled datasources visible to the user. The allowlisted optional labels are `check_name`, `group`,
-`source`, `target`, `scenario`, and `variant`; `canary` is additionally read only on the canary
-metric. Do not put hostnames, URLs, IP addresses, protocol UUIDs, account names, tokens,
+`source`, `target`, `scenario`, and `variant`; `canary` is read only on the canary family. Compatible
+richer families also use `entry_name`, `instance_id`, `source_id`, `mode`, `target_set_id`,
+`target_id`, `assertion_id`, `state`, and `reason`. Do not put hostnames, URLs, IP addresses,
+protocol UUIDs, account names, tokens,
 credentials, subscription data, or other secrets into any of them. Unknown and service labels
 such as `job` and `instance` are not returned to the client.
 
@@ -127,6 +168,20 @@ synthetic_check_canary_success{check_id="checkout-flow",source="edge-a",scenario
 synthetic_check_egress_match{check_id="checkout-flow",source="edge-a",scenario="purchase",variant="standard"} 1
 ```
 
+The current `xray-e2e-prober` projection is joined safely before result keys are built. Its
+`synthetic_check_info{check_id,instance_id,source_id,entry_name,mode,target_set_id}` metadata enriches
+the status/state/last-run/target/assertion families that carry only `check_id` and `instance_id`.
+The join never matches on the complete raw label set. Source identity uses declared `source` first,
+then `instance_id`, then `source_id`; consequently two prober instances with the same configuration
+source do not collapse. Scenario uses `scenario` then `mode`, and Variant uses `variant` then
+`target_set_id`. Conflicting info metadata fails closed instead of creating a favourable result.
+
+`check_name` is the preferred display name, followed by the prober's safe `entry_name`. If neither
+is exported, Alert Hub humanizes safe exported identifiers; it keeps `check_id` separately and does
+not synthesize a hostname, region, endpoint, or other operational fact. Target and assertion IDs
+are likewise humanized only for display. Actual/expected egress addresses and free-form executor
+errors are never queried or returned.
+
 Expose these metrics to the existing Prometheus scrape topology, then confirm an enabled Alert Hub
 datasource can query them through its configured network and credentials. If an executor emits
 different names, normalize them with executor-side output or reviewed Prometheus recording rules;
@@ -137,9 +192,11 @@ fail the Check.
 
 `source` is the executor-declared logical observation point, not proof of physical independence.
 Give genuinely independent points different stable values, and give replicas of one logical point
-the same value. When omitted, Alert Hub treats the result as one private default source; it never
-substitutes `instance`, `job`, a scrape address, or a random ID. Scenario, variant, and canary are
-also optional and never create extra failure-quorum votes.
+the same value. For the richer compatible contract, a missing `source` deliberately falls back to
+the stable exported `instance_id`, then `source_id`; the unrelated Prometheus scrape `instance` and
+`job` labels are still ignored. If none of those declared identities exists, Alert Hub uses one
+private default source. Scenario, variant, target, assertion, and canary identities never create
+extra failure-quorum votes.
 
 Publish `synthetic_check_info` for every expected `(check_id, source, scenario, variant)`, including
 before its first run. Without `info`, Alert Hub can discover only tuples present in the required
@@ -163,6 +220,16 @@ optional metadata becomes `null`, and a diagnostic code records the reason. Malf
 non-`0`/`1` status values, NaN/infinite values, negative durations, missing timestamps, and
 timestamps more than `CHECKS_FUTURE_TOLERANCE_SECONDS` ahead are not allowed to confirm success or
 failure.
+
+A valid one-hot state explains why the binary status is absent for `error`, `unknown`, `stale`, or
+`disabled`; it is not reported as `missing_status`. A zero last-run timestamp in a non-result state
+means “no completed run”, not Unix epoch. Binary status and one-hot state must agree when both are
+present. Target and egress state are informational nested results: the executor's main check
+status/state remains authoritative. Error counters are cumulative structured diagnostics, not the
+current error message, and never change status by themselves. Accepted `reason` values are
+`connect`, `proxy`, `dns`, `timeout`, `tls`, `http_status`, `body_mismatch`, `egress_mismatch`,
+`response_invalid`, `config_invalid`, `unsupported`, `runtime_start`, `runtime_exit`, `scheduler`,
+`source_fetch`, `source_parse`, `identity_conflict`, and `internal`; every other value is discarded.
 
 Age comes from `synthetic_check_last_run_timestamp_seconds`, never scrape or HTTP time. A result is
 fresh through the exact `CHECKS_STALE_AFTER_SECONDS` boundary; it becomes stale only when its age is
@@ -188,6 +255,11 @@ Summary applies the same filters and counts Checks, not samples; its five status
 `total`. Results use stable ordering with `check_id` as the final key. The default list page is 50
 Checks and the maximum is 200.
 
+The Checks screen uses the summary as a status facet: it applies the current group, source,
+target, scenario, and search filters but deliberately omits the selected status. This keeps the
+`total` and all five status choices stable while an operator switches between status tabs; the
+paginated list still applies the selected status.
+
 An active alert relates to a Check only by exact `check_id` inside the same authorization scope.
 This relationship does not change the Check status or create an incident. If alert lookup fails,
 `active_alerts` is `null`, not zero; an unavailable Prometheus refresh cannot turn into a false
@@ -195,7 +267,7 @@ detail `404`.
 
 ### Cache, errors, and limits
 
-All seven fixed metric queries across all enabled datasources use one evaluation time and one
+All twelve fixed metric queries across all enabled datasources use one evaluation time and one
 coalesced process-local refresh. The default cache TTL is five seconds and cannot be configured
 above five seconds. Measurement age is recalculated on every response, including cache hits. A
 refresh never combines required status from one snapshot with a timestamp from another.
@@ -209,19 +281,29 @@ removes that capability without invalidating the required results. Client respon
 codes such as `prometheus_unavailable` or `checks_limit_exceeded`, never upstream bodies, URLs, or
 raw error text.
 
-| Limit                                           | Default / bound                                                     |
-| ----------------------------------------------- | ------------------------------------------------------------------- |
-| Checks samples across all 7 queries/datasources | 5,000 total (`CHECKS_MAX_SERIES`, allowed range 1–100,000)          |
-| Samples in one Prometheus vector response       | 10,000 (`PROMETHEUS_MAX_SAMPLES`)                                   |
-| One Prometheus HTTP response                    | 2 MiB (`PROMETHEUS_MAX_RESPONSE_BYTES`)                             |
-| Prometheus query timeout                        | 8 seconds (`PROMETHEUS_QUERY_TIMEOUT_SECONDS`)                      |
-| Checks cache TTL                                | 5 seconds (`CHECKS_CACHE_TTL_SECONDS`, allowed range 0.1–5)         |
-| Future timestamp tolerance                      | 30 seconds (`CHECKS_FUTURE_TOLERANCE_SECONDS`, allowed range 0–300) |
-| List page                                       | 50 by default, 200 maximum                                          |
-| Results within one Check                        | 1,000 maximum; excess fails the refresh                             |
-| Canary entries within one result                | 100 maximum; excess fails the refresh                               |
-| Encoded Checks API response                     | 2 MiB maximum; excess returns `checks_limit_exceeded`               |
-| Related alerts/incidents or reverse Check links | 200 items per detail response; totals and truncation are explicit   |
+If the optional `check_info` query fails, a cached authoritative inventory may supply Scenario,
+Variant, and Target only when those dimensions are unique for the same `(check_id, source)`. Its
+previously validated display name and group remain visible when current primary samples provide
+neither. Alert Hub never chooses among conflicting prior declarations or masks invalid current
+metadata. When current authoritative `info` returns, it replaces any provisional default-dimension
+tuple created during a cold failed refresh.
+
+| Limit                                             | Default / bound                                                     |
+| ------------------------------------------------- | ------------------------------------------------------------------- |
+| Checks samples across all 12 queries/datasources  | 5,000 total (`CHECKS_MAX_SERIES`, allowed range 1–100,000)          |
+| Samples in one Prometheus vector response         | 10,000 (`PROMETHEUS_MAX_SAMPLES`)                                   |
+| One Prometheus HTTP response                      | 2 MiB (`PROMETHEUS_MAX_RESPONSE_BYTES`)                             |
+| Prometheus query timeout                          | 8 seconds (`PROMETHEUS_QUERY_TIMEOUT_SECONDS`)                      |
+| Concurrent Prometheus requests per Checks refresh | 16 (internal shared cap across all queries and datasources)         |
+| Checks cache TTL                                  | 5 seconds (`CHECKS_CACHE_TTL_SECONDS`, allowed range 0.1–5)         |
+| Future timestamp tolerance                        | 30 seconds (`CHECKS_FUTURE_TOLERANCE_SECONDS`, allowed range 0–300) |
+| List page                                         | 50 by default, 200 maximum                                          |
+| Results within one Check                          | 1,000 maximum; excess fails the refresh                             |
+| Canary entries within one result                  | 100 maximum; excess fails the refresh                               |
+| Target entries within one result                  | 100 maximum; excess fails the refresh                               |
+| Assertion entries within one result               | 100 maximum; excess fails the refresh                               |
+| Encoded Checks API response                       | 2 MiB maximum; excess returns `checks_limit_exceeded`               |
+| Related alerts/incidents or reverse Check links   | 200 items per detail response; totals and truncation are explicit   |
 
 `CHECKS_MAX_SERIES` also bounds the retained in-memory registry. Exceeding the Checks total or an
 upstream sample/body, per-Check nesting, or final API body limit returns
@@ -243,7 +325,8 @@ CHECKS_MAX_SERIES=5000
 
 `CHECKS_STALE_AFTER_SECONDS` accepts 1–86,400 seconds and
 `CHECKS_MIN_FAILURE_SOURCES` accepts 1–1,000. `CHECKS_GRAFANA_BASE_URL` is an optional
-administrator-defined absolute HTTP(S) dashboard URL without userinfo. HTTPS is the default;
+administrator-defined absolute HTTP(S) URL to a concrete `/d/<uid>[/slug]` (or `d-solo`)
+dashboard view without userinfo; an origin/home URL is not a deep link and is discarded. HTTPS is the default;
 internal HTTP works only with the separately reviewed `ALLOW_HTTP_MONITORING_URLS=true` setting.
 Invalid or disallowed values disable only the link and produce a safe diagnostic. The backend
 constructs the deep link with an encoded `var-check_id`; labels and browser parameters cannot

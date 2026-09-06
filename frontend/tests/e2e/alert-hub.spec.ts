@@ -25,6 +25,14 @@ async function fulfill(route: Route, body: unknown, status = 200) {
   });
 }
 
+function deferredGate() {
+  let release: () => void = () => undefined;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
 type MockState = {
   applicationSettingsRequest?: Record<string, unknown> | null;
   auditPageGate?: Promise<void> | null;
@@ -36,9 +44,17 @@ type MockState = {
   clusterUnavailable?: boolean;
   clusterStatus?: unknown;
   checksDetails?: Record<string, Record<string, unknown>>;
+  checksGate?: Promise<void> | null;
   checksItems?: Array<Record<string, unknown>>;
   checksMode?: "disabled" | "ready" | "unavailable";
+  checksSummarySearches?: string[];
   checksWarningCodes?: string[];
+  incidentBulkRequests?: Array<Record<string, unknown>>;
+  incidentDetails?: Record<string, Record<string, unknown>>;
+  incidentDetailRequests?: string[];
+  incidentListGate?: Promise<void> | null;
+  incidentListRequests?: string[];
+  incidentListStarted?: (() => void) | null;
   incidents?: Array<Record<string, unknown>>;
   lateTokenRequests: string[];
   logoutRequests: number;
@@ -51,6 +67,8 @@ type MockState = {
   sourceRequest: Record<string, unknown> | null;
   liveEventSource?: boolean;
   loginRequest?: Record<string, unknown> | null;
+  metricsSummaryGate?: Promise<void> | null;
+  metricsSummaryStarted?: (() => void) | null;
   pushPublicKeyStatus?: number;
   pushSubscriptionRequest?: Record<string, unknown> | null;
 };
@@ -64,10 +82,19 @@ async function installApi(page: Page, state: MockState) {
         onerror: (() => void) | null = null;
 
         constructor() {
+          Object.assign(window, {
+            __alertHubStreamReady: () => true,
+            __emitAlertHubStreamMessage: () => this.onmessage?.(),
+          });
           queueMicrotask(() => this.onopen?.());
         }
 
-        close() {}
+        close() {
+          Object.assign(window, {
+            __alertHubStreamReady: () => false,
+            __emitAlertHubStreamMessage: () => undefined,
+          });
+        }
       }
       Object.defineProperty(window, "EventSource", {
         configurable: true,
@@ -239,6 +266,10 @@ async function installApi(page: Page, state: MockState) {
       await fulfill(route, { detail: "temporarily unavailable" }, 503);
       return;
     }
+    if (method === "GET" && (path === "/checks" || path.startsWith("/checks/"))) {
+      const gate = state.checksGate;
+      if (gate) await gate;
+    }
     if (method === "GET" && (path === "/checks" || path === "/checks/summary")) {
       const checksMode = state.checksMode ?? "disabled";
       const common = {
@@ -302,6 +333,7 @@ async function installApi(page: Page, state: MockState) {
         });
         return;
       }
+      state.checksSummarySearches?.push(url.search);
       const counts = Object.fromEntries(
         ["up", "degraded", "down", "stale", "unknown"].map((status) => [
           status,
@@ -360,13 +392,156 @@ async function installApi(page: Page, state: MockState) {
       }
       return;
     }
+    if (method === "POST" && path === "/incidents/bulk-action") {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      state.incidentBulkRequests?.push(body);
+      const action = String(body.action ?? "");
+      const filters = (body.filters ?? {}) as Record<string, unknown>;
+      const excluded = new Set(
+        Array.isArray(body.excluded_incident_ids)
+          ? body.excluded_incident_ids.map((value) => String(value))
+          : [],
+      );
+      const matchesFilters = (incident: Record<string, unknown>) => {
+        const filterStatus = String(filters.status ?? "");
+        if (
+          filterStatus &&
+          (filterStatus === "active"
+            ? incident.status === "resolved"
+            : incident.status !== filterStatus)
+        )
+          return false;
+        if (filters.severity && incident.severity !== filters.severity) return false;
+        const query = String(filters.q ?? "")
+          .trim()
+          .toLowerCase();
+        return (
+          !query ||
+          `${incident.title ?? ""} ${incident.description ?? ""} ${incident.source_name ?? ""}`
+            .toLowerCase()
+            .includes(query)
+        );
+      };
+      const selected: Array<Record<string, unknown> | null> =
+        body.selection_mode === "filter"
+          ? (state.incidents ?? []).filter(
+              (incident) => !excluded.has(String(incident.id)) && matchesFilters(incident),
+            )
+          : (Array.isArray(body.incident_ids) ? body.incident_ids : []).map(
+              (incidentId) =>
+                state.incidents?.find((incident) => incident.id === incidentId) ?? null,
+            );
+      let updated = 0;
+      let unchanged = 0;
+      let failed = 0;
+      const nextStatus = {
+        acknowledge: "acknowledged",
+        resolve: "resolved",
+        silence: "silenced",
+      }[action];
+      const requestedIds = Array.isArray(body.incident_ids) ? body.incident_ids : [];
+      const results = selected.map((incident, index) => {
+        if (!incident) {
+          failed += 1;
+          return {
+            incident_id: String(requestedIds[index] ?? ""),
+            outcome: "not_found",
+            status: null,
+            detail: "Incident not found",
+          };
+        }
+        if (incident.status === "resolved" && nextStatus !== "resolved") {
+          failed += 1;
+          return {
+            incident_id: incident.id,
+            outcome: "conflict",
+            status: "resolved",
+            detail: `Resolved incident cannot be ${nextStatus}`,
+          };
+        }
+        if (incident.status === nextStatus) {
+          unchanged += 1;
+          return {
+            incident_id: incident.id,
+            outcome: "unchanged",
+            status: incident.status,
+            detail: null,
+          };
+        }
+        incident.status = nextStatus;
+        updated += 1;
+        return {
+          incident_id: incident.id,
+          outcome: "updated",
+          status: nextStatus,
+          detail: null,
+        };
+      });
+      await fulfill(
+        route,
+        {
+          action,
+          selection_mode: body.selection_mode,
+          matched: selected.length,
+          updated,
+          unchanged,
+          failed,
+          results,
+        },
+        failed ? 207 : 200,
+      );
+      return;
+    }
     if (method === "GET" && path === "/incidents") {
-      await fulfill(route, { incidents: state.incidents ?? [] });
+      state.incidentListRequests?.push(url.search);
+      state.incidentListStarted?.();
+      if (state.incidentListGate) await state.incidentListGate;
+      const search = String(url.searchParams.get("q") ?? "")
+        .trim()
+        .toLowerCase();
+      const severity = url.searchParams.get("severity");
+      const status = url.searchParams.get("status");
+      const matchingBase = (state.incidents ?? []).filter((incident) => {
+        if (severity && incident.severity !== severity) return false;
+        return (
+          !search ||
+          `${incident.title ?? ""} ${incident.description ?? ""} ${incident.source_name ?? ""}`
+            .toLowerCase()
+            .includes(search)
+        );
+      });
+      const items = matchingBase.filter((incident) =>
+        status === "active"
+          ? incident.status !== "resolved"
+          : !status || incident.status === status,
+      );
+      const limit = Number(url.searchParams.get("limit") ?? 50);
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      const count = (incidentStatus: string) =>
+        matchingBase.filter((incident) => incident.status === incidentStatus).length;
+      await fulfill(route, {
+        items: items.slice(offset, offset + limit),
+        total: items.length,
+        limit,
+        offset,
+        counts: {
+          active: matchingBase.filter((incident) => incident.status !== "resolved").length,
+          open: count("open"),
+          acknowledged: count("acknowledged"),
+          resolved: count("resolved"),
+          silenced: count("silenced"),
+          all: matchingBase.length,
+        },
+        bulk_limit: 500,
+      });
       return;
     }
     if (method === "GET" && path.startsWith("/incidents/")) {
       const incidentId = decodeURIComponent(path.slice("/incidents/".length));
-      const incident = state.incidents?.find((item) => item.id === incidentId);
+      state.incidentDetailRequests?.push(incidentId);
+      const incident =
+        state.incidentDetails?.[incidentId] ??
+        state.incidents?.find((item) => item.id === incidentId);
       await fulfill(route, incident ?? { detail: "incident not found" }, incident ? 200 : 404);
       return;
     }
@@ -587,6 +762,10 @@ async function installApi(page: Page, state: MockState) {
       return;
     }
     if (method === "GET" && path === "/metrics/summary") {
+      if (state.metricsSummaryGate) {
+        state.metricsSummaryStarted?.();
+        await state.metricsSummaryGate;
+      }
       const monitoring = state.applicationSettingsRequest ?? {};
       await fulfill(route, {
         open: 0,
@@ -735,6 +914,7 @@ async function signIn(page: Page) {
 }
 
 function checksFixtures() {
+  const longCheckId = `simple-check-${"very-long-segment-".repeat(6)}`;
   const common = {
     last_checked_at: "2026-09-05T12:00:00Z",
     oldest_checked_at: "2026-09-05T11:59:58Z",
@@ -750,7 +930,7 @@ function checksFixtures() {
   const items = [
     {
       ...common,
-      check_id: "simple-check",
+      check_id: longCheckId,
       name: "Simple check",
       group: "basics",
       target: null,
@@ -769,6 +949,7 @@ function checksFixtures() {
       status: "degraded",
       status_reason: "mixed_results",
       active_alerts: 1,
+      diagnostic_codes: ["conflicting_ttfb"],
     },
     {
       ...common,
@@ -807,9 +988,10 @@ function checksFixtures() {
     },
   ];
   return {
+    longCheckId,
     items,
     details: {
-      "simple-check": {
+      [longCheckId]: {
         ...items[0],
         results: [
           {
@@ -819,15 +1001,18 @@ function checksFixtures() {
             target: null,
             status: "up",
             status_reason: null,
+            state: "success",
             success: true,
             last_run_at: "2026-09-05T12:00:00Z",
             duration_seconds: null,
             ttfb_seconds: null,
             stale: false,
             data_incomplete: false,
-            diagnostic_codes: [],
+            diagnostic_codes: ["conflicting_ttfb", "future_executor_signal"],
             canaries: [],
+            targets: [],
             assertions: [],
+            error_reasons: [],
           },
         ],
         parts: [],
@@ -850,6 +1035,7 @@ function checksFixtures() {
             target: "Checkout",
             status: "up",
             status_reason: null,
+            state: "success",
             success: true,
             last_run_at: "2026-09-05T12:00:00Z",
             duration_seconds: 0.31,
@@ -858,7 +1044,9 @@ function checksFixtures() {
             data_incomplete: false,
             diagnostic_codes: [],
             canaries: [],
+            targets: [],
             assertions: [],
+            error_reasons: [],
           },
           {
             source: "us-east",
@@ -867,6 +1055,7 @@ function checksFixtures() {
             target: "Checkout",
             status: "down",
             status_reason: "invalid_data",
+            state: "failure",
             success: false,
             last_run_at: "2026-09-05T12:00:00Z",
             duration_seconds: 0.42,
@@ -875,7 +1064,39 @@ function checksFixtures() {
             data_incomplete: false,
             diagnostic_codes: [],
             canaries: [{ canary: "control", success: true, status_reason: null }],
-            assertions: [{ key: "egress_match", success: false, status_reason: "mismatch" }],
+            targets: [
+              {
+                target_id: "checkout-primary",
+                name: "Checkout primary",
+                state: "success",
+                success: true,
+                duration_seconds: 0.22,
+                ttfb_seconds: 0.1,
+                status_reason: null,
+              },
+              {
+                target_id: "checkout-backup",
+                name: "Checkout backup",
+                state: "error",
+                success: null,
+                duration_seconds: null,
+                ttfb_seconds: null,
+                status_reason: "executor_error",
+              },
+            ],
+            assertions: [
+              {
+                key: "egress_match",
+                name: "Expected egress",
+                state: "mismatch",
+                success: false,
+                status_reason: null,
+              },
+            ],
+            error_reasons: [
+              { reason: "timeout", count: 3 },
+              { reason: "future_reason", count: 2 },
+            ],
           },
           {
             source: "eu-west",
@@ -884,6 +1105,7 @@ function checksFixtures() {
             target: "Checkout",
             status: "up",
             status_reason: null,
+            state: "success",
             success: true,
             last_run_at: "2026-09-05T12:00:00Z",
             duration_seconds: 0,
@@ -892,7 +1114,9 @@ function checksFixtures() {
             data_incomplete: false,
             diagnostic_codes: [],
             canaries: [],
+            targets: [],
             assertions: [],
+            error_reasons: [],
           },
         ],
         parts: [],
@@ -920,15 +1144,504 @@ function checksFixtures() {
   };
 }
 
+test("incidents load once without waiting for metrics and report partial bulk results", async ({
+  page,
+}) => {
+  const metricsGate = deferredGate();
+  const metricsStarted = deferredGate();
+  const incidents = [
+    {
+      id: "incident-active-one",
+      title: "Active one",
+      description: "First active incident",
+      severity: "critical",
+      status: "open",
+      source_name: "Prometheus",
+      region: "RU",
+      target: "api-one",
+      starts_at: "2026-09-05T11:58:00Z",
+      last_event_at: "2026-09-05T12:00:00Z",
+      labels: {},
+      annotations: {},
+    },
+    {
+      id: "incident-resolved",
+      title: "Already resolved",
+      description: "Resolved incident",
+      severity: "warning",
+      status: "resolved",
+      source_name: "Prometheus",
+      region: "NL",
+      target: "api-two",
+      starts_at: "2026-09-05T11:30:00Z",
+      last_event_at: "2026-09-05T11:50:00Z",
+      labels: {},
+      annotations: {},
+    },
+    {
+      id: "incident-active-two",
+      title: "Active two",
+      description: "Second active incident",
+      severity: "info",
+      status: "open",
+      source_name: "Heartbeat",
+      region: "DE",
+      target: "api-three",
+      starts_at: "2026-09-05T10:00:00Z",
+      last_event_at: "2026-09-05T10:05:00Z",
+      labels: {},
+      annotations: {},
+    },
+    ...Array.from({ length: 49 }, (_, index) => ({
+      id: `incident-extra-${index}`,
+      title: `Extra incident ${index}`,
+      description: "Additional active incident",
+      severity: "info",
+      status: "open",
+      source_name: "Heartbeat",
+      region: "DE",
+      target: `extra-${index}`,
+      starts_at: "2026-09-05T09:00:00Z",
+      last_event_at: "2026-09-05T09:05:00Z",
+      labels: {},
+      annotations: {},
+    })),
+  ];
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    incidentBulkRequests: [],
+    incidentListRequests: [],
+    incidents,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+
+  const requestsBeforeRoute = state.incidentListRequests?.length ?? 0;
+  state.metricsSummaryGate = metricsGate.promise;
+  state.metricsSummaryStarted = metricsStarted.release;
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
+  await metricsStarted.promise;
+
+  // The route owns one filtered list request and publishes it while the global
+  // monitoring refresh is still blocked.
+  await expect(page.getByText("Active one", { exact: true })).toBeVisible();
+  expect((state.incidentListRequests?.length ?? 0) - requestsBeforeRoute).toBe(1);
+  await page.waitForTimeout(100);
+  expect((state.incidentListRequests?.length ?? 0) - requestsBeforeRoute).toBe(1);
+  metricsGate.release();
+  state.metricsSummaryGate = null;
+
+  await page.locator(".incident-tabs").getByRole("button", { name: /^Все/ }).click();
+  await expect(page.getByText("Already resolved", { exact: true })).toBeVisible();
+  await page.getByLabel("Выбрать текущую страницу").check();
+  await page.getByRole("button", { name: "Выбрать все 52 результатов" }).click();
+  await page.getByRole("combobox", { name: "Действие", exact: true }).selectOption("acknowledge");
+  await page.getByRole("button", { name: "Применить", exact: true }).click();
+
+  await expect(page.getByRole("alert")).toContainText(
+    "Изменено: 51 · без изменений: 0 · ошибок: 1",
+  );
+  await expect(page.getByRole("alert")).toContainText("Resolved incident cannot be acknowledged");
+  expect(state.incidentBulkRequests?.[0]).toMatchObject({
+    action: "acknowledge",
+    selection_mode: "filter",
+    filters: {},
+  });
+
+  await page.getByLabel("Выбрать Active two").check();
+  await page.getByRole("combobox", { name: "Действие", exact: true }).selectOption("resolve");
+  let resolveConfirmation = "";
+  page.once("dialog", async (dialog) => {
+    resolveConfirmation = dialog.message();
+    await dialog.dismiss();
+  });
+  await page.getByRole("button", { name: "Применить", exact: true }).click();
+  await expect.poll(() => resolveConfirmation).toContain("нового firing-события");
+  expect(state.incidentBulkRequests).toHaveLength(1);
+
+  page.once("dialog", (dialog) => void dialog.accept());
+  await page.getByRole("button", { name: "Применить", exact: true }).click();
+  await expect.poll(() => state.incidentBulkRequests?.length ?? 0).toBe(2);
+  await expect(page.getByRole("status")).toContainText("Изменено: 1");
+
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Кластер" }).click();
+  await expect(page.getByRole("link", { name: "Открыть дашборд приложения" })).toHaveAttribute(
+    "href",
+    "https://grafana.example.test/d/alert-hub",
+  );
+  await expect(page.locator('a[href="/metrics"], a[href$="/metrics"]')).toHaveCount(0);
+});
+
+test("peer incident snapshots allow explicit IDs but never filter-wide bulk mutations", async ({
+  page,
+}) => {
+  const peerBase = "https://trusted-peer.example.test";
+  const incidents = Array.from({ length: 52 }, (_, index) => ({
+    id: `incident-peer-${index}`,
+    title: `Peer incident ${index}`,
+    description: "Visible through the trusted read peer.",
+    severity: index === 0 ? "critical" : "warning",
+    status: "open",
+    source_name: "Prometheus",
+    region: "EU",
+    target: `peer-target-${index}`,
+    starts_at: "2026-09-05T11:58:00Z",
+    last_event_at: "2026-09-05T12:00:00Z",
+    labels: {},
+    annotations: {},
+  }));
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    clusterStatus: {
+      cluster_event_count: 1,
+      cursor: { peer: 1 },
+      nodes: [
+        {
+          id: "peer",
+          name: "Trusted peer",
+          region: "EU",
+          health: "healthy",
+          public_api_url: peerBase,
+        },
+      ],
+    },
+    incidentBulkRequests: [],
+    incidentListRequests: [],
+    incidents,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await page.route(
+    /^https:\/\/trusted-peer\.example\.test\/api\/v1\/incidents(?:\?.*)?$/,
+    async (route) => {
+      const request = route.request();
+      const origin = request.headers().origin ?? "*";
+      const corsHeaders = {
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Alert-Hub-Cache-Partition",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Origin": origin,
+      };
+      if (request.method() === "OPTIONS") {
+        await route.fulfill({ status: 204, headers: corsHeaders });
+        return;
+      }
+      const url = new URL(request.url());
+      const limit = Number(url.searchParams.get("limit") ?? 50);
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: corsHeaders,
+        body: JSON.stringify({
+          items: incidents.slice(offset, offset + limit),
+          total: incidents.length,
+          limit,
+          offset,
+          counts: {
+            active: incidents.length,
+            open: incidents.filter((incident) => incident.status === "open").length,
+            acknowledged: incidents.filter((incident) => incident.status === "acknowledged").length,
+            resolved: 0,
+            silenced: 0,
+            all: incidents.length,
+          },
+          bulk_limit: 500,
+        }),
+      });
+    },
+  );
+  await signIn(page);
+  await expect
+    .poll(() =>
+      page.evaluate((peer) => {
+        const saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
+        return Array.isArray(saved) && saved.includes(peer);
+      }, peerBase),
+    )
+    .toBe(true);
+
+  state.primaryUnavailable = true;
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
+  await expect(page.getByText("Peer incident 0", { exact: true })).toBeVisible();
+  await page.getByLabel("Выбрать текущую страницу").check();
+  await expect(
+    page.getByText(/Выбор всех результатов доступен после свежего ответа/),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Выбрать все 52 результатов" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Применить", exact: true }).click();
+  await expect.poll(() => state.incidentBulkRequests?.length ?? 0).toBe(1);
+  expect(state.incidentBulkRequests?.[0]).toMatchObject({
+    action: "acknowledge",
+    selection_mode: "ids",
+  });
+  expect(state.incidentBulkRequests?.[0]?.incident_ids).toHaveLength(50);
+  expect(state.incidentBulkRequests?.some((request) => request.selection_mode === "filter")).toBe(
+    false,
+  );
+
+  await expect(page.getByText(/Изменено: 50/)).toBeVisible();
+  await expect(page.locator(".incidents-page")).toHaveAttribute("aria-busy", "false");
+  await expect(page.getByText("Peer incident 0", { exact: true })).toBeVisible();
+  await page.getByLabel("Выбрать текущую страницу").check();
+  await expect(
+    page.getByText(/Выбор всех результатов доступен после свежего ответа/),
+  ).toBeVisible();
+  state.primaryUnavailable = false;
+  await page.getByRole("button", { name: "Обновить список" }).click();
+  await expect(page.getByRole("button", { name: "Выбрать все 52 результатов" })).toBeVisible();
+  await page.getByRole("button", { name: "Выбрать все 52 результатов" }).click();
+  await expect(page.getByText(/Выбраны все результаты фильтра/)).toBeVisible();
+  expect(state.incidentBulkRequests?.some((request) => request.selection_mode === "filter")).toBe(
+    false,
+  );
+});
+
+test("incident filters and SSE refresh keep bulk actions aligned with the visible snapshot", async ({
+  page,
+}) => {
+  const incidents = [
+    {
+      id: "incident-filter-one",
+      title: "Filter one",
+      description: "First filter incident",
+      severity: "critical",
+      status: "open",
+      source_name: "Prometheus",
+      region: "RU",
+      target: "api-one",
+      starts_at: "2026-09-05T11:58:00Z",
+      last_event_at: "2026-09-05T12:00:00Z",
+      labels: {},
+      annotations: {},
+    },
+    {
+      id: "incident-filter-two",
+      title: "Filter two",
+      description: "Second filter incident",
+      severity: "warning",
+      status: "open",
+      source_name: "Heartbeat",
+      region: "DE",
+      target: "api-two",
+      starts_at: "2026-09-05T11:57:00Z",
+      last_event_at: "2026-09-05T11:59:00Z",
+      labels: {},
+      annotations: {},
+    },
+  ];
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    incidentBulkRequests: [],
+    incidentListRequests: [],
+    incidents,
+    lateTokenRequests: [],
+    liveEventSource: true,
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
+  await expect(page.getByText("Filter one", { exact: true })).toBeVisible();
+
+  const search = page.getByPlaceholder("Название, описание, источник или метка…");
+  const requestsBeforeEquivalentSearch = state.incidentListRequests?.length ?? 0;
+  await search.fill("   ");
+  await page.waitForTimeout(350);
+  await expect(page.locator(".incidents-page")).toHaveAttribute("aria-busy", "false");
+  await expect(page.getByLabel("Выбрать Filter one")).toBeEnabled();
+  expect(state.incidentListRequests).toHaveLength(requestsBeforeEquivalentSearch);
+
+  state.primaryUnavailable = true;
+  await search.fill("missing incident");
+  await expect(page.getByRole("alert")).toContainText("503");
+  await expect(page.getByText("Filter one", { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("Выбрать текущую страницу")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Применить", exact: true })).toHaveCount(0);
+  expect(state.incidentBulkRequests).toHaveLength(0);
+
+  state.primaryUnavailable = false;
+  await page.getByRole("button", { name: "Повторить", exact: true }).first().click();
+  await expect(page.getByRole("heading", { name: "Ничего не найдено" })).toBeVisible();
+  await page.getByLabel("Очистить поиск").click();
+  await expect(page.getByText("Filter one", { exact: true })).toBeVisible();
+
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Boolean(
+          (
+            window as unknown as {
+              __alertHubStreamReady?: () => boolean;
+            }
+          ).__alertHubStreamReady?.(),
+        ),
+      ),
+    )
+    .toBe(true);
+  await page.getByLabel("Выбрать Filter one").check();
+  const listGate = deferredGate();
+  const listStarted = deferredGate();
+  const requestsBeforeStream = state.incidentListRequests?.length ?? 0;
+  state.incidentListGate = listGate.promise;
+  state.incidentListStarted = listStarted.release;
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __emitAlertHubStreamMessage: () => void;
+      }
+    ).__emitAlertHubStreamMessage(),
+  );
+  await listStarted.promise;
+
+  expect((state.incidentListRequests?.length ?? 0) - requestsBeforeStream).toBe(1);
+  await expect(page.locator(".incidents-page")).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByLabel("Выбрать Filter one")).toBeDisabled();
+  await expect(page.getByRole("combobox", { name: "Действие", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Применить", exact: true })).toBeDisabled();
+
+  listGate.release();
+  state.incidentListGate = null;
+  state.incidentListStarted = null;
+  await expect(page.getByLabel("Выбрать Filter one")).not.toBeChecked();
+  await expect(page.getByRole("button", { name: "Применить", exact: true })).toHaveCount(0);
+  await expect(page.locator(".incidents-page")).toHaveAttribute("aria-busy", "false");
+});
+
+test("SSE refreshes an incident detail that is absent from the global top-100 snapshot", async ({
+  page,
+}) => {
+  const outsideIncident: Record<string, unknown> = {
+    id: "incident-outside-top-100",
+    title: "Outside top 100",
+    description: "Loaded only through the exact detail endpoint.",
+    severity: "critical",
+    status: "open",
+    source_name: "Prometheus",
+    region: "RU",
+    target: "outside",
+    starts_at: "2026-09-05T11:58:00Z",
+    last_event_at: "2026-09-05T12:00:00Z",
+    labels: {},
+    annotations: {},
+    timeline: [
+      {
+        id: "outside-event-1",
+        event_type: "firing",
+        label: "Outside incident fired",
+        detail: "Initial event",
+        occurred_at: "2026-09-05T12:00:00Z",
+        origin_node_id: "ru",
+      },
+    ],
+  };
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    incidentDetailRequests: [],
+    incidentDetails: { "incident-outside-top-100": outsideIncident },
+    incidentListRequests: [],
+    incidents: Array.from({ length: 100 }, (_, index) => ({
+      id: `incident-filler-${index}`,
+      title: `Filler ${index}`,
+      severity: "info",
+      status: "open",
+      source_name: "Heartbeat",
+      starts_at: "2026-09-05T10:00:00Z",
+      last_event_at: "2026-09-05T10:00:00Z",
+    })),
+    lateTokenRequests: [],
+    liveEventSource: true,
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+  await page.evaluate(() => {
+    window.history.pushState({}, "", "/incidents/incident-outside-top-100");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  });
+  await expect(page.getByRole("heading", { name: "Outside top 100" })).toBeVisible();
+  await expect(page.getByText("Outside incident fired")).toBeVisible();
+  const detailRequestsBeforeStream = state.incidentDetailRequests?.length ?? 0;
+  const listRequestsBeforeStream = state.incidentListRequests?.length ?? 0;
+  Object.assign(outsideIncident, {
+    title: "Outside top 100 refreshed",
+    status: "resolved",
+    last_event_at: "2026-09-05T12:01:00Z",
+    timeline: [
+      ...((outsideIncident.timeline as unknown[]) ?? []),
+      {
+        id: "outside-event-2",
+        event_type: "resolved",
+        label: "Outside incident resolved",
+        detail: "Fresh detail response",
+        occurred_at: "2026-09-05T12:01:00Z",
+        origin_node_id: "ru",
+      },
+    ],
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Boolean(
+          (
+            window as unknown as {
+              __alertHubStreamReady?: () => boolean;
+            }
+          ).__alertHubStreamReady?.(),
+        ),
+      ),
+    )
+    .toBe(true);
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __emitAlertHubStreamMessage: () => void;
+      }
+    ).__emitAlertHubStreamMessage(),
+  );
+
+  await expect(page.getByRole("heading", { name: "Outside top 100 refreshed" })).toBeVisible();
+  await expect(page.getByText("Outside incident resolved")).toBeVisible();
+  expect((state.incidentDetailRequests?.length ?? 0) - detailRequestsBeforeStream).toBe(1);
+  expect(state.incidentListRequests).toHaveLength(listRequestsBeforeStream);
+});
+
 test("Checks dashboard, filters, grouping, matrix details, links, and mobile accessibility", async ({
   page,
 }) => {
   const fixtures = checksFixtures();
+  const dashboardGate = deferredGate();
   const state: MockState = {
     authoritativeUnauthorized: false,
     checksDetails: fixtures.details,
+    checksGate: dashboardGate.promise,
     checksItems: fixtures.items,
     checksMode: "ready",
+    checksSummarySearches: [],
     checksWarningCodes: ["check_ttfb_unavailable"],
     incidents: [
       {
@@ -962,20 +1675,69 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
 
   const widget = page.locator(".checks-widget");
   await expect(widget.getByRole("heading", { name: "Автоматизированные проверки" })).toBeVisible();
+  await expect(widget.locator(".checks-widget-skeleton")).toBeVisible();
+  await expect(
+    widget.locator(".checks-problem-row:not(.checks-problem-row--skeleton)"),
+  ).toHaveCount(0);
+  dashboardGate.release();
+  state.checksGate = null;
   await expect(widget.locator(".checks-problem-row").first()).toContainText("Down check");
   await expect(widget.locator(".checks-summary__item--up strong")).toHaveText("1");
-  await expect(widget.getByText("check_ttfb_unavailable")).toBeVisible();
+  await expect(widget.getByText("Метрика TTFB временно недоступна")).toBeVisible();
+
+  const listGate = deferredGate();
+  state.checksGate = listGate.promise;
   await page.locator(".sidebar__nav").getByRole("button", { name: "Checks" }).click();
 
   await expect(page.getByRole("heading", { name: "Checks", level: 1 })).toBeVisible();
+  await expect(page.locator(".checks-summary-loading")).toBeVisible();
+  await expect(page.locator(".checks-list-skeleton")).toBeVisible();
+  await expect(page.locator(".checks-table tbody tr")).toHaveCount(0);
+  listGate.release();
+  state.checksGate = null;
   await expect(page.getByRole("heading", { name: "customer-paths" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Без группы" })).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const longIdRow = page.getByRole("link", { name: "Открыть Check Simple check" });
+  await expect(longIdRow.locator(".check-identity__id")).toHaveText(fixtures.longCheckId);
+  await expect(longIdRow.locator("button, a")).toHaveCount(0);
+  await longIdRow.focus();
+  await expect(longIdRow).toBeFocused();
+  const detailGate = deferredGate();
+  state.checksGate = detailGate.promise;
+  await longIdRow.press("Enter");
+  await expect(page.locator(".check-detail-skeleton")).toBeVisible();
+  await expect(page.getByText("Simple check", { exact: true })).toHaveCount(0);
+  detailGate.release();
+  state.checksGate = null;
+  await expect(page.getByRole("heading", { name: "Simple check" })).toBeVisible();
+  await expect(page.locator(".check-detail-hero .check-identity__id")).toHaveText(
+    fixtures.longCheckId,
+  );
+  await expect(page.getByText("Источники вернули разные значения TTFB")).toBeVisible();
+  await expect(page.getByText("Неизвестный диагностический сигнал")).toBeVisible();
+  await expect(page.getByText("synthetic_check_ttfb_seconds").first()).toBeVisible();
+  await expect(page.getByText("Что делать").first()).toBeVisible();
+  await expect(page.locator(".check-detail-summary > div").first().locator("small")).toHaveCount(0);
+  await expect(page.getByRole("link", { name: /Grafana/ })).toHaveCount(0);
+  const longIdOverflow = await page.evaluate(() => ({
+    documentWidth: document.documentElement.scrollWidth,
+    viewportWidth: window.innerWidth,
+  }));
+  expect(longIdOverflow.documentWidth).toBe(longIdOverflow.viewportWidth);
+  await page.locator(".breadcrumb-button").click();
+  await expect(page.getByRole("link", { name: "Открыть Check Simple check" })).toBeVisible();
+  await page.setViewportSize({ width: 1280, height: 900 });
+
   await page
     .locator(".checks-summary")
     .getByRole("button", { name: /Не работает/ })
     .click();
   await expect(page.locator(".checks-table tbody tr")).toHaveCount(1);
   await expect(page.locator(".checks-table tbody tr")).toContainText("Down check");
+  await expect(page.locator(".checks-summary__item--all strong")).toHaveText("5");
+  await expect(page.locator(".checks-summary__item--up strong")).toHaveText("1");
   await page.locator(".checks-summary").getByRole("button", { name: /Всего/ }).click();
   await page.getByRole("search").getByPlaceholder("ID, название или Target…").fill("No match");
   await page.getByRole("search").getByRole("button", { name: "Найти" }).click();
@@ -986,7 +1748,10 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
   await page.getByRole("search").getByPlaceholder("ID, название или Target…").fill("Complex");
   await page.getByRole("search").getByRole("button", { name: "Найти" }).click();
   await expect(page.locator(".checks-table tbody tr")).toHaveCount(1);
-  await page.getByRole("button", { name: "Открыть Check Complex customer path" }).click();
+  await expect(page.getByText("Источники вернули разные значения TTFB")).toBeVisible();
+  expect(state.checksSummarySearches?.some((search) => search.includes("status="))).toBe(false);
+  expect(state.checksSummarySearches?.at(-1)).toBe("?search=Complex");
+  await page.getByRole("link", { name: "Открыть Check Complex customer path" }).click();
 
   await expect(page.getByRole("heading", { name: "Complex customer path" })).toBeVisible();
   await expect(page.getByRole("region", { name: "Матрица Source × Scenario" })).toBeVisible();
@@ -998,11 +1763,25 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
     await variantSummary.evaluate((element) => getComputedStyle(element).outlineStyle),
   ).not.toBe("none");
   await expect(page.getByText("control")).toBeVisible();
+  await expect(page.getByText("Checkout primary")).toBeVisible();
+  await expect(page.getByText("checkout-primary")).toBeVisible();
+  await expect(page.getByText("Checkout backup")).toBeVisible();
+  await expect(page.getByText("Ошибка выполнения")).toBeVisible();
+  await expect(page.getByText("Expected egress")).toBeVisible();
   await expect(page.getByText("egress_match")).toBeVisible();
-  await expect(page.getByRole("link", { name: /Grafana/ })).toHaveAttribute(
+  await expect(page.getByText("Не совпадает")).toBeVisible();
+  await expect(page.getByText("Накопительные счётчики ошибок")).toBeVisible();
+  await expect(page.getByText(/это не текст текущей ошибки/)).toBeVisible();
+  await expect(page.getByText("Тайм-аут")).toBeVisible();
+  await expect(page.getByText("future_reason")).toBeVisible();
+  await expect(page.getByLabel("Тайм-аут: 3")).toHaveText("×3");
+  const grafanaLink = page.getByRole("link", { name: /Grafana/ });
+  await expect(grafanaLink).toHaveAttribute(
     "href",
-    /var-check_id=complex-check/,
+    "https://grafana.example.test/d/checks?var-check_id=complex-check",
   );
+  await expect(grafanaLink).toHaveAttribute("target", "_blank");
+  await expect(grafanaLink).toHaveAttribute("rel", "noopener noreferrer");
   await expect(page.getByText("Checkout path failed")).toBeVisible();
   await expect(page.getByText(/Получено активных алертов/)).toContainText("1/2");
   await expect(page.getByText("related_alerts_truncated")).toBeVisible();
@@ -1061,11 +1840,17 @@ test("Checks disabled route is explicit and a refresh failure clears the previou
   state.checksWarningCodes = ["check_ttfb_unavailable"];
   await page.getByRole("button", { name: "Обновить", exact: true }).click();
   await expect(page.getByText("Simple check")).toBeVisible();
-  await page.getByRole("button", { name: "Открыть Check Simple check" }).click();
+  await page.getByRole("link", { name: "Открыть Check Simple check" }).click();
   await expect(page.locator(".check-detail-hero")).toContainText("Работает");
 
+  const failureGate = deferredGate();
+  state.checksGate = failureGate.promise;
   state.checksMode = "unavailable";
   await page.locator(".check-detail-actions").getByRole("button", { name: "Обновить" }).click();
+  await expect(page.locator(".check-detail-skeleton")).toBeVisible();
+  await expect(page.getByText("Simple check", { exact: true })).toHaveCount(0);
+  failureGate.release();
+  state.checksGate = null;
   await expect(page.getByText("Результаты Checks недоступны")).toBeVisible();
   await expect(page.locator(".check-detail-hero")).toHaveCount(0);
   await expect(page.getByText(/Прежний успешный результат скрыт/)).toBeVisible();
@@ -1482,6 +2267,11 @@ test("updates the Grafana link and safe job patterns from settings", async ({ pa
   await signIn(page);
 
   await page.getByRole("button", { name: "Настройки", exact: true }).click();
+  await page.getByLabel("Ссылка на Grafana").fill("https://grafana.example.test/");
+  await page.getByRole("button", { name: "Сохранить мониторинг" }).click();
+  await expect(page.getByRole("alert")).toContainText("HTTPS-ссылку на конкретный дашборд Grafana");
+  expect(state.applicationSettingsRequest).toBeNull();
+
   await page.getByLabel("Ссылка на Grafana").fill("https://grafana.example.test/d/new-operations");
   await page.getByLabel("Ключевые сервисы · job").fill("vless_blackbox_*, vps_nodes");
   await page.getByLabel("Сервисы Alert Hub · job").fill("alert-hub-api-*");
@@ -2089,6 +2879,68 @@ test.describe("service-worker offline lifecycle", () => {
     await context.route("**/api/v1/auth/bootstrap/status", (route) =>
       fulfill(route, { bootstrap_required: false }),
     );
+    await context.route("**/api/v1/incidents?*", (route) =>
+      refreshNetworkFailure
+        ? route.abort("failed")
+        : fulfill(route, {
+            items: [
+              {
+                id: "offline-list-live",
+                title: "Recovered live list incident",
+                description: "Fresh list loaded after session recovery.",
+                severity: "warning",
+                status: "acknowledged",
+                source_name: "Prometheus",
+                region: "EU",
+                target: "offline-list-target",
+                starts_at: "2026-09-02T11:00:00Z",
+                last_event_at: "2026-09-02T12:05:00Z",
+                labels: {},
+                annotations: {},
+              },
+            ],
+            total: 1,
+            limit: 50,
+            offset: 0,
+            counts: {
+              active: 1,
+              open: 0,
+              acknowledged: 1,
+              resolved: 0,
+              silenced: 0,
+              all: 1,
+            },
+            bulk_limit: 500,
+          }),
+    );
+    await context.route("**/api/v1/incidents/offline-detail", (route) =>
+      refreshNetworkFailure
+        ? route.abort("failed")
+        : fulfill(route, {
+            id: "offline-detail",
+            title: "Recovered live incident",
+            description: "Fresh detail loaded after session recovery.",
+            severity: "warning",
+            status: "acknowledged",
+            source_name: "Prometheus",
+            region: "EU",
+            target: "offline-target",
+            starts_at: "2026-09-02T11:00:00Z",
+            last_event_at: "2026-09-02T12:05:00Z",
+            labels: {},
+            annotations: {},
+            timeline: [
+              {
+                id: "offline-event-live",
+                event_type: "acknowledged",
+                label: "Recovered detail refreshed",
+                detail: "Live response",
+                occurred_at: "2026-09-02T12:05:00Z",
+                origin_node_id: "eu",
+              },
+            ],
+          }),
+    );
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "Вход в систему" })).toBeVisible();
     await page.evaluate(async () => {
@@ -2122,7 +2974,61 @@ test.describe("service-worker offline lifecycle", () => {
       await Promise.all([...new Set(shellUrls)].map((url) => shell.add(url)));
       const readCache = await caches.open(`alert-hub-v2-read-model-${partition}`);
       const entries: Record<string, unknown> = {
-        "/api/v1/incidents?limit=100": { incidents: [] },
+        "/api/v1/incidents?limit=100&view=compact": { incidents: [] },
+        "/api/v1/incidents?limit=50&offset=0&view=compact&status=active": {
+          items: [
+            {
+              id: "offline-list-cached",
+              title: "Offline cached list incident",
+              description: "Loaded from the dedicated partitioned incident-list cache.",
+              severity: "critical",
+              status: "open",
+              source_name: "Prometheus",
+              region: "EU",
+              target: "offline-list-target",
+              starts_at: "2026-09-02T11:00:00Z",
+              last_event_at: "2026-09-02T12:00:00Z",
+              labels: {},
+              annotations: {},
+            },
+          ],
+          total: 1,
+          limit: 50,
+          offset: 0,
+          counts: {
+            active: 1,
+            open: 1,
+            acknowledged: 0,
+            resolved: 0,
+            silenced: 0,
+            all: 1,
+          },
+          bulk_limit: 500,
+        },
+        "/api/v1/incidents/offline-detail": {
+          id: "offline-detail",
+          title: "Offline cached incident",
+          description: "Loaded from the partitioned authenticated read cache.",
+          severity: "critical",
+          status: "open",
+          source_name: "Prometheus",
+          region: "EU",
+          target: "offline-target",
+          starts_at: "2026-09-02T11:00:00Z",
+          last_event_at: "2026-09-02T12:00:00Z",
+          labels: {},
+          annotations: {},
+          timeline: [
+            {
+              id: "offline-event-cached",
+              event_type: "firing",
+              label: "Cached detail event",
+              detail: "Partition-bound cached response",
+              occurred_at: "2026-09-02T12:00:00Z",
+              origin_node_id: "eu",
+            },
+          ],
+        },
         "/api/v1/cluster/status": { cluster_event_count: 0, cursor: {}, nodes: [] },
         "/api/v1/sources": {
           sources: [
@@ -2217,7 +3123,20 @@ test.describe("service-worker offline lifecycle", () => {
     refreshNetworkFailure = true;
     await context.setOffline(true);
     const offlinePage = await context.newPage();
-    await offlinePage.goto("/sources");
+    await offlinePage.goto("/incidents");
+    await expect(
+      offlinePage.getByRole("heading", { name: "Инциденты", exact: true }),
+    ).toBeVisible();
+    await expect(
+      offlinePage.getByText("Offline cached list incident", { exact: true }),
+    ).toBeVisible();
+    await expect(offlinePage.getByLabel("Выбрать Offline cached list incident")).toBeDisabled();
+    await expect(offlinePage.getByRole("button", { name: "Применить", exact: true })).toHaveCount(
+      0,
+    );
+    await expect(offlinePage.locator(".connection-banner")).toContainText("Нет подключения");
+
+    await offlinePage.locator(".sidebar__nav").getByRole("button", { name: "Источники" }).click();
     await expect(
       offlinePage.getByRole("heading", { name: "Источники", exact: true }),
     ).toBeVisible();
@@ -2229,11 +3148,28 @@ test.describe("service-worker offline lifecycle", () => {
       .poll(() => offlinePage.evaluate(() => Boolean(navigator.serviceWorker.controller)))
       .toBe(true);
 
+    await offlinePage.goto("/incidents/offline-detail");
+    await expect(
+      offlinePage.getByRole("heading", { name: "Offline cached incident" }),
+    ).toBeVisible();
+    await expect(offlinePage.getByText("Cached detail event")).toBeVisible();
+    await expect(offlinePage.getByRole("button", { name: "Принять в работу" })).toBeDisabled();
+
     recoverSession = true;
     refreshNetworkFailure = false;
     await context.setOffline(false);
     await offlinePage.getByRole("button", { name: "Обновить данные кластера" }).click();
     await expect(offlinePage.getByLabel("Текущая учётная запись")).toContainText("recovered-admin");
+    await expect(
+      offlinePage.getByRole("heading", { name: "Recovered live incident" }),
+    ).toBeVisible();
+    await expect(offlinePage.getByText("Recovered detail refreshed")).toBeVisible();
+    await offlinePage.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
+    await expect(
+      offlinePage.getByText("Recovered live list incident", { exact: true }),
+    ).toBeVisible();
+    await expect(offlinePage.getByLabel("Выбрать Recovered live list incident")).toBeEnabled();
+    await offlinePage.locator(".sidebar__nav").getByRole("button", { name: "Источники" }).click();
     await expect(offlinePage.getByRole("button", { name: "Добавить источник" })).toBeEnabled();
     await context.setOffline(true);
 

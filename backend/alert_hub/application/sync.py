@@ -567,7 +567,14 @@ def _project_application_setting(db: Session, entity_id: str) -> None:
         return
     payload = event.payload_json
     try:
-        grafana_url = normalize_grafana_url(payload.get("grafana_url"), https_only=True)
+        grafana_url = normalize_grafana_url(
+            payload.get("grafana_url"),
+            https_only=True,
+            require_dashboard=True,
+        )
+    except ValueError:
+        grafana_url = None
+    try:
         key_job_globs = normalize_job_globs(
             payload.get("key_job_globs"), field_name="key_job_globs"
         )

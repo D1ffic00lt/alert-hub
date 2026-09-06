@@ -18,6 +18,7 @@
     "/api/v1/cluster/nodes": ["get"],
     "/api/v1/cluster/status": ["get"],
     "/api/v1/incidents": ["get"],
+    "/api/v1/incidents/bulk-action": ["post"],
     "/api/v1/incidents/{incident_id}": ["get"],
     "/api/v1/incidents/{incident_id}/acknowledge": ["post"],
     "/api/v1/incidents/{incident_id}/comments": ["post"],

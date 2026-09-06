@@ -25,12 +25,17 @@ type PublicQueryName = Literal[
 ]
 type CheckQueryName = Literal[
     "check_info",
+    "check_state",
     "check_status",
     "check_last_run",
     "check_canary_success",
+    "check_target_success",
+    "check_target_state",
     "check_duration",
     "check_ttfb",
+    "check_egress_state",
     "check_egress_match",
+    "check_errors_total",
 ]
 type FixedQueryName = PublicQueryName | CheckQueryName
 
@@ -41,12 +46,17 @@ FIXED_PROMQL: dict[FixedQueryName, str] = {
     "key_jobs_up": 'up{job=~"prometheus|alertmanager|blackbox.*"}',
     "alert_hub_health": 'up{job=~"alert[-_]?hub.*"}',
     "check_info": "synthetic_check_info",
+    "check_state": "synthetic_check_state",
     "check_status": "synthetic_check_status",
     "check_last_run": "synthetic_check_last_run_timestamp_seconds",
     "check_canary_success": "synthetic_check_canary_success",
+    "check_target_success": "synthetic_check_target_success",
+    "check_target_state": "synthetic_check_target_state",
     "check_duration": "synthetic_check_duration_seconds",
     "check_ttfb": "synthetic_check_ttfb_seconds",
+    "check_egress_state": "synthetic_check_egress_state",
     "check_egress_match": "synthetic_check_egress_match",
+    "check_errors_total": "synthetic_check_errors_total",
 }
 
 

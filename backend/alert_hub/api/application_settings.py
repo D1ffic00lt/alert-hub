@@ -32,7 +32,7 @@ class ApplicationSettingsPatch(BaseModel):
     @field_validator("grafana_url")
     @classmethod
     def validate_grafana_url(cls, value: str | None) -> str | None:
-        return normalize_grafana_url(value, https_only=True)
+        return normalize_grafana_url(value, https_only=True, require_dashboard=True)
 
     @field_validator("key_job_globs", "alert_hub_job_globs")
     @classmethod
@@ -87,6 +87,7 @@ def update_application_settings(
     current = monitoring_settings_snapshot(db, settings)
     stored = db.get(ApplicationSetting, MONITORING_SETTINGS_ID)
     now = utc_now()
+    changed_fields = set(payload.model_fields_set)
     if stored is None:
         stored = ApplicationSetting(
             id=MONITORING_SETTINGS_ID,
@@ -97,8 +98,13 @@ def update_application_settings(
             updated_at=now,
         )
         db.add(stored)
-    changed_fields = payload.model_fields_set
-    if "grafana_url" in changed_fields:
+    else:
+        # Canonicalize an older stored origin/home value to the fail-closed snapshot before an
+        # unrelated patch is replicated to peers.
+        if stored.grafana_url != current.grafana_url:
+            changed_fields.add("grafana_url")
+        stored.grafana_url = current.grafana_url
+    if "grafana_url" in payload.model_fields_set:
         stored.grafana_url = payload.grafana_url
     if "key_job_globs" in changed_fields:
         assert payload.key_job_globs is not None
