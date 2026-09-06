@@ -31,6 +31,17 @@ class Node(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
     last_seen_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     software_version: Mapped[str] = mapped_column(String(64), default="unknown")
+    api_down_alert_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+
+
+class PeerEndpointIdentity(Base):
+    """Locally verified peer identity used across worker restarts."""
+
+    __tablename__ = "peer_endpoint_identities"
+
+    base_url: Mapped[str] = mapped_column(String(2048), primary_key=True)
+    node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    verified_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class User(Base):

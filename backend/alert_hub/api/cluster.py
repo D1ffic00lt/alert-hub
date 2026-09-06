@@ -2,13 +2,25 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from alert_hub.api.dependencies import current_user, get_db, get_settings, require_cluster_auth
+from alert_hub.api.dependencies import (
+    admin_user,
+    current_user,
+    get_db,
+    get_settings,
+    require_cluster_auth,
+)
 from alert_hub.api.schemas import SyncQueryRequest
+from alert_hub.application.auth import add_audit
+from alert_hub.application.cluster_health import (
+    PEER_OFFLINE_FAILURE_THRESHOLD,
+    record_node_api_down,
+    set_node_api_down_alert,
+)
 from alert_hub.application.sync import (
     IncomingClusterEvent,
     apply_cluster_events,
@@ -128,9 +140,6 @@ def internal_node_health(
     }
 
 
-PEER_OFFLINE_FAILURE_THRESHOLD = 3
-
-
 def _node_response(
     node: Node,
     *,
@@ -171,6 +180,7 @@ def _node_response(
         "created_at": node.created_at,
         "last_seen_at": node.last_seen_at,
         "software_version": node.software_version,
+        "api_down_alert_enabled": node.api_down_alert_enabled,
         "health": health,
         "sync_lag_seconds": sync_lag_seconds,
         "last_sync_success_at": last_sync_success_at,
@@ -216,3 +226,94 @@ def cluster_status(
         "cursor": _cursor_map(db),
         "cluster_event_count": int(db.scalar(select(func.count(ClusterEvent.event_id))) or 0),
     }
+
+
+class NodeApiDownAlertsPatch(BaseModel):
+    node_ids: list[str] = Field(min_length=1, max_length=500)
+    enabled: bool
+
+
+class NodeApiDownAlertResult(BaseModel):
+    id: str
+    api_down_alert_enabled: bool
+
+
+class NodeApiDownAlertsResponse(BaseModel):
+    updated: int
+    unchanged: int
+    alerts_opened: int
+    nodes: list[NodeApiDownAlertResult]
+
+
+@public_router.patch(
+    "/nodes/api-down-alerts",
+    response_model=NodeApiDownAlertsResponse,
+)
+def update_node_api_down_alerts(
+    payload: NodeApiDownAlertsPatch,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(admin_user),
+    settings: Settings = Depends(get_settings),
+) -> NodeApiDownAlertsResponse:
+    node_ids = list(dict.fromkeys(payload.node_ids))
+    nodes = db.scalars(select(Node).where(Node.id.in_(node_ids))).all()
+    nodes_by_id = {node.id: node for node in nodes}
+    missing = [node_id for node_id in node_ids if node_id not in nodes_by_id]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail={"message": "Cluster node not found", "node_ids": missing},
+        )
+
+    peer_worker = getattr(request.app.state, "peer_sync_worker", None)
+    peer_snapshot = peer_worker.status_snapshot() if peer_worker is not None else {}
+    updated = 0
+    alerts_opened = 0
+    ordered_nodes = [nodes_by_id[node_id] for node_id in node_ids]
+    for node in ordered_nodes:
+        if set_node_api_down_alert(db, node, payload.enabled, settings):
+            updated += 1
+        runtime = peer_snapshot.get(node.id)
+        if (
+            payload.enabled
+            and runtime is not None
+            and not bool(runtime.get("up"))
+            and int(runtime.get("failures") or 0) >= PEER_OFFLINE_FAILURE_THRESHOLD
+        ):
+            alerts_opened += int(
+                record_node_api_down(
+                    db,
+                    node,
+                    settings,
+                    failure_count=int(runtime.get("failures") or 0),
+                )
+            )
+
+    add_audit(
+        db,
+        settings,
+        "node_api_down_alerts_updated",
+        actor_user_id=user.id,
+        entity_type="node_api_alert_setting",
+        request_id=getattr(request.state, "request_id", None),
+        details={
+            "node_ids": node_ids,
+            "enabled": payload.enabled,
+            "updated": updated,
+            "alerts_opened": alerts_opened,
+        },
+    )
+    db.commit()
+    return NodeApiDownAlertsResponse(
+        updated=updated,
+        unchanged=len(ordered_nodes) - updated,
+        alerts_opened=alerts_opened,
+        nodes=[
+            NodeApiDownAlertResult(
+                id=node.id,
+                api_down_alert_enabled=node.api_down_alert_enabled,
+            )
+            for node in ordered_nodes
+        ],
+    )

@@ -152,6 +152,7 @@ type ClusterNode = {
   lastSeen: string;
   roles: string[];
   publicApiUrl: string | null;
+  apiDownAlertEnabled: boolean;
 };
 
 type Source = {
@@ -637,6 +638,7 @@ function createDemoData(): HubData {
         lastSeen: "2026-09-01T12:45:20Z",
         roles: ["ingest", "notify", "sync", "ui"],
         publicApiUrl: "https://ru.demo.invalid",
+        apiDownAlertEnabled: true,
       },
       {
         id: "node-nl-01",
@@ -650,6 +652,7 @@ function createDemoData(): HubData {
         lastSeen: "2026-09-01T12:45:20Z",
         roles: ["ingest", "notify", "sync", "ui"],
         publicApiUrl: "https://nl.demo.invalid",
+        apiDownAlertEnabled: true,
       },
       {
         id: "node-de-01",
@@ -663,6 +666,7 @@ function createDemoData(): HubData {
         lastSeen: "2026-09-01T12:45:08Z",
         roles: ["ingest", "notify", "sync", "ui"],
         publicApiUrl: "https://de.demo.invalid",
+        apiDownAlertEnabled: false,
       },
     ],
     sources: [
@@ -1260,6 +1264,10 @@ const AUDIT_ACTION_LABELS: Record<string, readonly [string, string]> = {
   ],
   cluster_peer_denied: ["Подключение узла отклонено", "Cluster Peer Denied"],
   cluster_auth_failed: ["Ошибка авторизации узла", "Cluster Auth Failed"],
+  node_api_down_alerts_updated: [
+    "Настройки алертов API обновлены",
+    "API-down Alert Settings Updated",
+  ],
   push_subscription_created: ["Push-подписка создана", "Push Subscription Created"],
   push_subscription_updated: ["Push-подписка обновлена", "Push Subscription Updated"],
   push_subscription_disabled: ["Push-подписка отключена", "Push Subscription Disabled"],
@@ -1530,6 +1538,7 @@ function normalizeNode(item: unknown, index: number): ClusterNode {
     lastSeen: String(row.last_seen_at ?? row.last_seen ?? ""),
     roles: asStringList(row.enabled_roles),
     publicApiUrl: typeof row.public_api_url === "string" ? row.public_api_url : null,
+    apiDownAlertEnabled: row.api_down_alert_enabled === true,
   };
 }
 
@@ -4212,7 +4221,12 @@ export function AlertHubApp({ appName = "Alert Hub" }: { appName?: string }) {
 
 function HubPageSkeleton({ label }: { label: string }) {
   return (
-    <div className="page-stack" aria-busy="true" aria-live="polite">
+    <div
+      className="page-stack hub-page-skeleton"
+      role="status"
+      aria-busy="true"
+      aria-label={tr(`Загружаем ${label}`, `Loading ${label}`)}
+    >
       <PageHeading
         eyebrow={tr("Подтверждённые данные", "Verified data")}
         title={label}
@@ -4221,37 +4235,30 @@ function HubPageSkeleton({ label }: { label: string }) {
           "Waiting for the first verified response in this session…",
         )}
       />
-      <Panel className="incident-table-panel">
-        <div className="filter-bar">
-          <span className="filter-result">{tr("Загрузка…", "Loading…")}</span>
+      <Panel className="hub-skeleton-panel">
+        <span className="sr-only">{tr("Загрузка…", "Loading…")}</span>
+        <div className="hub-skeleton-toolbar" aria-hidden="true">
+          <span className="hub-skeleton-field hub-skeleton-field--wide" />
+          <span className="hub-skeleton-field" />
+          <span className="hub-skeleton-button" />
         </div>
-        <div className="incidents-table-wrap" aria-hidden="true">
-          <table className="incidents-table">
-            <thead>
-              <tr>
-                <th>{tr("Данные", "Data")}</th>
-                <th>{tr("Состояние", "State")}</th>
-                <th>{tr("Источник", "Source")}</th>
-                <th>{tr("Обновление", "Update")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {Array.from({ length: 5 }, (_, index) => (
-                <tr key={index}>
-                  <td>
-                    <span className="table-severity table-severity--unknown" />
-                    <span>
-                      <b>••••••••••••••••••</b>
-                      <small>••••••••</small>
-                    </span>
-                  </td>
-                  <td>••••••</td>
-                  <td>••••••••••</td>
-                  <td>••••••••</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="hub-skeleton-table" aria-hidden="true">
+          <div className="hub-skeleton-table__head">
+            {Array.from({ length: 4 }, (_, index) => (
+              <span className="hub-skeleton-line hub-skeleton-line--short" key={index} />
+            ))}
+          </div>
+          {Array.from({ length: 5 }, (_, index) => (
+            <div className="hub-skeleton-table__row" key={index}>
+              <span className="hub-skeleton-primary">
+                <span className="hub-skeleton-line hub-skeleton-line--long" />
+                <span className="hub-skeleton-line hub-skeleton-line--short" />
+              </span>
+              <span className="hub-skeleton-pill" />
+              <span className="hub-skeleton-line" />
+              <span className="hub-skeleton-line hub-skeleton-line--short" />
+            </div>
+          ))}
         </div>
       </Panel>
     </div>
@@ -4506,6 +4513,8 @@ function AlertHubRuntime() {
               outboxPending={data.summary.outboxPending}
               grafanaUrl={data.summary.grafanaUrl}
               onRefresh={() => void refresh()}
+              readOnly={readOnly}
+              setData={setData}
             />
           );
         case "audit":
@@ -5234,6 +5243,82 @@ function incidentCounts(value: unknown): IncidentStatusCounts {
   ) as IncidentStatusCounts;
 }
 
+function IncidentsTableSkeleton({ rows = 5 }: { rows?: number }) {
+  return (
+    <div
+      className="incidents-table-wrap incident-table-skeleton"
+      role="status"
+      aria-label={tr("Загружаем список инцидентов", "Loading incidents list")}
+    >
+      <span className="sr-only">{tr("Загружаем инциденты", "Loading incidents")}</span>
+      <div className="incident-skeleton-table" aria-hidden="true">
+        <div className="incident-skeleton-table__head">
+          {Array.from({ length: 6 }, (_, index) => (
+            <span className="hub-skeleton-line hub-skeleton-line--short" key={index} />
+          ))}
+        </div>
+        {Array.from({ length: rows }, (_, index) => (
+          <div className="incident-skeleton-table__row" key={index}>
+            <span className="incident-skeleton-table__incident">
+              <span className="hub-skeleton-rail" />
+              <span>
+                <span className="hub-skeleton-line hub-skeleton-line--long" />
+                <span className="hub-skeleton-line hub-skeleton-line--short" />
+              </span>
+            </span>
+            <span className="hub-skeleton-pill" />
+            <span className="incident-skeleton-table__stack">
+              <span className="hub-skeleton-line hub-skeleton-line--long" />
+              <span className="hub-skeleton-line hub-skeleton-line--short" />
+            </span>
+            <span className="hub-skeleton-code" />
+            <span className="incident-skeleton-table__stack">
+              <span className="hub-skeleton-line" />
+              <span className="hub-skeleton-line hub-skeleton-line--short" />
+            </span>
+            <span className="hub-skeleton-circle" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function IncidentsPageSkeleton() {
+  return (
+    <div className="page-stack incidents-page incidents-page-skeleton" aria-busy="true">
+      <PageHeading
+        eyebrow={tr("Единый журнал", "Unified journal")}
+        title={tr("Инциденты", "Incidents")}
+        description={tr(
+          "Вся история тревог, действий операторов и доставки уведомлений с каждого узла.",
+          "Alert history, operator actions, and delivery evidence from every node.",
+        )}
+      />
+      <div className="incident-tabs incident-tabs--skeleton" aria-hidden="true">
+        {[
+          tr("Активные", "Active"),
+          tr("В работе", "Acknowledged"),
+          tr("Решённые", "Resolved"),
+          tr("Все", "All"),
+        ].map((label, index) => (
+          <button type="button" className={index === 0 ? "active" : ""} disabled key={label}>
+            {label} <span className="hub-skeleton-count" />
+          </button>
+        ))}
+      </div>
+      <Panel className="incident-table-panel">
+        <div className="filter-bar incident-filter-skeleton" aria-hidden="true">
+          <span className="hub-skeleton-field hub-skeleton-field--wide" />
+          <span className="hub-skeleton-field" />
+          <span className="hub-skeleton-line hub-skeleton-line--short" />
+        </div>
+        <IncidentsTableSkeleton />
+      </Panel>
+    </div>
+  );
+}
+
 function IncidentsPage({
   incidents,
   navigate,
@@ -5292,6 +5377,8 @@ function IncidentsPage({
   const requestKey = `${externalRefreshVersion}:${reloadVersion}:${requestPath}`;
   const loading =
     requestList && (normalizedQuery !== debouncedQuery || settledRequestKey !== requestKey);
+  const filterTransitioning =
+    requestList && (normalizedQuery !== debouncedQuery || remote.requestPath !== requestPath);
   const loadError =
     requestList && loadFailure?.requestKey === requestKey ? loadFailure.message : null;
   const actionsBlocked = loading || loadError !== null;
@@ -5597,10 +5684,14 @@ function IncidentsPage({
   };
 
   if (requestList && !hasLoaded) {
-    return <HubPageSkeleton label={tr("Инциденты", "Incidents")} />;
+    return <IncidentsPageSkeleton />;
   }
 
-  const counts = snapshot.counts;
+  // Status counts describe the whole filtered result set. Keep the last
+  // verified values visible as the stable loading state until the next filter
+  // response replaces them; this avoids the zero-count flash caused by the
+  // intentionally empty snapshot for a request that has not settled yet.
+  const counts = requestList && remote.requestPath !== null ? remote.counts : snapshot.counts;
   const canSelectAllResults = snapshot.total <= snapshot.bulkLimit && filterBulkAuthoritative;
   const pageNumber = Math.floor(offset / INCIDENT_PAGE_SIZE) + 1;
   const pageCount = Math.max(1, Math.ceil(snapshot.total / INCIDENT_PAGE_SIZE));
@@ -5827,7 +5918,9 @@ function IncidentsPage({
           </div>
         )}
 
-        {snapshot.items.length ? (
+        {filterTransitioning && !loadError ? (
+          <IncidentsTableSkeleton />
+        ) : snapshot.items.length ? (
           <>
             <div className="incidents-table-wrap">
               <table className="incidents-table">
@@ -8030,15 +8123,23 @@ function ClusterPage({
   outboxPending,
   grafanaUrl,
   onRefresh,
+  readOnly,
+  setData,
 }: {
   nodes: ClusterNode[];
   meta: ClusterMeta;
   outboxPending: number | null;
   grafanaUrl: string | null;
   onRefresh: () => void;
+  readOnly: boolean;
+  setData: React.Dispatch<React.SetStateAction<HubData>>;
 }) {
-  const [selected, setSelected] = useState(nodes[0]?.id ?? "");
-  const current = nodes.find((node) => node.id === selected) ?? nodes[0];
+  const [focusedNodeId, setFocusedNodeId] = useState(nodes[0]?.id ?? "");
+  const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(() => new Set());
+  const [alertBusy, setAlertBusy] = useState(false);
+  const [alertOutcome, setAlertOutcome] = useState<string | null>(null);
+  const [alertError, setAlertError] = useState<string | null>(null);
+  const current = nodes.find((node) => node.id === focusedNodeId) ?? nodes[0];
   const cursorEntries = Object.entries(meta.cursor).sort(([left], [right]) =>
     left.localeCompare(right),
   );
@@ -8047,6 +8148,57 @@ function ClusterPage({
     ["degraded", "offline"].includes(node.health),
   ).length;
   const reportedLags = nodes.flatMap((node) => node.syncLag ?? []);
+  const selectedNodes = nodes.filter((node) => selectedNodeIds.has(node.id));
+  const allNodesSelected = nodes.length > 0 && selectedNodes.length === nodes.length;
+  const updateApiDownAlerts = async (nodeIds: string[], enabled: boolean) => {
+    if (readOnly || alertBusy || !nodeIds.length) return;
+    setAlertBusy(true);
+    setAlertError(null);
+    setAlertOutcome(null);
+    try {
+      const payload = asRecord(
+        await mutationJson("/cluster/nodes/api-down-alerts", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ node_ids: nodeIds, enabled }),
+        }),
+      );
+      const changed = new Set(
+        listFrom(payload, "nodes")
+          .map((item) => String(asRecord(item).id ?? ""))
+          .filter(Boolean),
+      );
+      setData((data) => ({
+        ...data,
+        nodes: data.nodes.map((node) =>
+          changed.has(node.id) ? { ...node, apiDownAlertEnabled: enabled } : node,
+        ),
+      }));
+      const updated = Number(payload.updated ?? 0);
+      const alertsOpened = Number(payload.alerts_opened ?? 0);
+      setAlertOutcome(
+        currentUiLanguage() === "ru"
+          ? `${enabled ? "Алерты включены" : "Алерты выключены"}: ${updated}. Инцидентов открыто сразу: ${alertsOpened}.`
+          : `${enabled ? "Alerts enabled" : "Alerts disabled"}: ${updated}. Incidents opened immediately: ${alertsOpened}.`,
+      );
+    } catch (reason) {
+      setAlertError(
+        reason instanceof Error
+          ? reason.message
+          : tr("Не удалось изменить настройки алертов.", "Unable to update alert settings."),
+      );
+    } finally {
+      setAlertBusy(false);
+    }
+  };
+  const toggleNodeSelection = (nodeId: string) => {
+    setSelectedNodeIds((currentSelection) => {
+      const next = new Set(currentSelection);
+      if (next.has(nodeId)) next.delete(nodeId);
+      else next.add(nodeId);
+      return next;
+    });
+  };
   return (
     <div className="page-stack cluster-page">
       <PageHeading
@@ -8089,15 +8241,91 @@ function ClusterPage({
           <b>{outboxPending == null ? tr("нет данных", "no data") : outboxPending}</b>
         </span>
       </div>
+      <Panel
+        className="cluster-api-alerts"
+        eyebrow={tr("Контроль доступности", "Availability monitoring")}
+        title={tr("Алерты о падении API", "API-down alerts")}
+        action={
+          <span className="cluster-api-alerts__count">
+            {tr("Включено", "Enabled")}: {nodes.filter((node) => node.apiDownAlertEnabled).length}/
+            {nodes.length}
+          </span>
+        }
+      >
+        <div className="cluster-api-alerts__body">
+          <p>
+            {tr(
+              "После трёх подряд ошибок живой peer создаст critical-инцидент и отправит его по обычным маршрутам уведомлений. Для мониторинга нужен хотя бы один другой настроенный узел.",
+              "After three consecutive failures, a live peer creates a critical incident and sends it through the normal notification routes. Monitoring requires at least one other configured node.",
+            )}
+          </p>
+          <div className="cluster-api-alerts__actions">
+            <button
+              className="button button--quiet button--small"
+              type="button"
+              disabled={!nodes.length || alertBusy}
+              onClick={() =>
+                setSelectedNodeIds(
+                  allNodesSelected ? new Set() : new Set(nodes.map((node) => node.id)),
+                )
+              }
+            >
+              <Icon symbol={allNodesSelected ? "☑" : "☐"} />
+              {allNodesSelected
+                ? tr("Снять выбор", "Clear selection")
+                : tr("Выбрать все", "Select all")}
+            </button>
+            <span>
+              {tr("Выбрано", "Selected")}: <b>{selectedNodes.length}</b>
+            </span>
+            <button
+              className="button button--primary button--small"
+              type="button"
+              disabled={readOnly || alertBusy || !selectedNodes.length}
+              onClick={() =>
+                void updateApiDownAlerts(
+                  selectedNodes.map((node) => node.id),
+                  true,
+                )
+              }
+            >
+              {alertBusy
+                ? tr("Сохраняем…", "Saving…")
+                : tr("Включить выбранным", "Enable selected")}
+            </button>
+            <button
+              className="button button--quiet button--small"
+              type="button"
+              disabled={readOnly || alertBusy || !selectedNodes.length}
+              onClick={() =>
+                void updateApiDownAlerts(
+                  selectedNodes.map((node) => node.id),
+                  false,
+                )
+              }
+            >
+              {tr("Выключить выбранным", "Disable selected")}
+            </button>
+          </div>
+        </div>
+      </Panel>
+      {(alertOutcome || alertError) && (
+        <div
+          className={`permission-message ${alertError ? "permission-message--warning" : "permission-message--success"}`}
+          role={alertError ? "alert" : "status"}
+        >
+          <Icon symbol={alertError ? "!" : "✓"} /> {alertError ?? alertOutcome}
+        </div>
+      )}
       <div className="node-card-grid">
         {nodes.map((node) => (
           <Panel
             key={node.id}
-            className={`node-card ${selected === node.id ? "node-card--selected" : ""}`}
+            className={`node-card ${focusedNodeId === node.id ? "node-card--selected" : ""}`}
           >
             <button
               className="node-card__select"
-              onClick={() => setSelected(node.id)}
+              onClick={() => setFocusedNodeId(node.id)}
               aria-label={`${tr("Открыть сведения об узле", "Open details for node")} ${node.name}`}
             />
             <div className="node-card__head">
@@ -8137,7 +8365,37 @@ function ClusterPage({
               ))}
             </div>
             <div className="node-card__foot">
+              <label className="node-card__check">
+                <input
+                  type="checkbox"
+                  checked={selectedNodeIds.has(node.id)}
+                  onChange={() => toggleNodeSelection(node.id)}
+                  aria-label={`${tr("Выбрать узел", "Select node")} ${node.name}`}
+                />
+                {tr("Выбрать", "Select")}
+              </label>
               <code>{node.version}</code>
+              <span className="node-api-alert-control">
+                <span>
+                  <b>{tr("Алерт API", "API alert")}</b>
+                  <small>
+                    {node.apiDownAlertEnabled
+                      ? tr("включён", "enabled")
+                      : tr("выключен", "disabled")}
+                  </small>
+                </span>
+                <button
+                  className={`toggle ${node.apiDownAlertEnabled ? "toggle--on" : ""}`}
+                  type="button"
+                  role="switch"
+                  aria-checked={node.apiDownAlertEnabled}
+                  aria-label={`${tr("Алерт о падении API для", "API-down alert for")} ${node.name}`}
+                  disabled={readOnly || alertBusy}
+                  onClick={() => void updateApiDownAlerts([node.id], !node.apiDownAlertEnabled)}
+                >
+                  <span />
+                </button>
+              </span>
             </div>
           </Panel>
         ))}

@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#0a0a0b" />
+    <meta http-equiv="refresh" content="10" />
+    <title>Сервис временно недоступен</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family:
+          Inter,
+          ui-sans-serif,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        background: #0a0a0b;
+        color: #f2f6f4;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        min-width: 320px;
+        min-height: 100vh;
+        margin: 0;
+        background:
+          radial-gradient(circle at 50% 12%, rgba(248, 91, 108, 0.1), transparent 34rem), #0a0a0b;
+      }
+
+      main {
+        display: grid;
+        min-height: 100vh;
+        place-items: center;
+        padding: 32px 20px;
+      }
+
+      article {
+        width: min(560px, 100%);
+        padding: clamp(28px, 7vw, 48px);
+        background: rgba(20, 22, 23, 0.94);
+        border: 1px solid #292d2e;
+        border-radius: 20px;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+      }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        margin-bottom: 26px;
+        padding: 7px 11px;
+        background: rgba(248, 91, 108, 0.1);
+        border: 1px solid rgba(248, 91, 108, 0.24);
+        border-radius: 999px;
+        color: #ff8d99;
+        font:
+          700 12px/1 ui-monospace,
+          SFMono-Regular,
+          Consolas,
+          monospace;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status::before {
+        width: 8px;
+        height: 8px;
+        background: #f85b6c;
+        border-radius: 50%;
+        box-shadow: 0 0 0 5px rgba(248, 91, 108, 0.1);
+        content: "";
+        animation: pulse 1.7s ease-in-out infinite;
+      }
+
+      .mark {
+        display: grid;
+        width: 54px;
+        height: 54px;
+        margin-bottom: 22px;
+        place-items: center;
+        background: rgba(248, 91, 108, 0.08);
+        border: 1px solid rgba(248, 91, 108, 0.2);
+        border-radius: 15px;
+        color: #ff8d99;
+        font:
+          700 27px/1 ui-monospace,
+          SFMono-Regular,
+          Consolas,
+          monospace;
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-size: clamp(28px, 6vw, 40px);
+        line-height: 1.08;
+        letter-spacing: -0.035em;
+      }
+
+      p {
+        margin: 0;
+        color: #aeb8b4;
+        font-size: 16px;
+        line-height: 1.65;
+      }
+
+      .english {
+        margin-top: 8px;
+        color: #77817d;
+        font-size: 13px;
+      }
+
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        margin-top: 30px;
+      }
+
+      a {
+        display: inline-flex;
+        min-height: 42px;
+        align-items: center;
+        justify-content: center;
+        padding: 0 17px;
+        background: #f2f6f4;
+        border-radius: 9px;
+        color: #101312;
+        font-size: 14px;
+        font-weight: 700;
+        text-decoration: none;
+      }
+
+      a:focus-visible {
+        outline: 3px solid rgba(98, 230, 179, 0.45);
+        outline-offset: 3px;
+      }
+
+      small {
+        color: #69736f;
+        font:
+          12px/1.45 ui-monospace,
+          SFMono-Regular,
+          Consolas,
+          monospace;
+      }
+
+      @keyframes pulse {
+        50% {
+          opacity: 0.45;
+        }
+      }
+
+      @media (prefers-color-scheme: light) {
+        :root {
+          color-scheme: light;
+          background: #f5f7f6;
+          color: #101312;
+        }
+
+        body {
+          background:
+            radial-gradient(circle at 50% 12%, rgba(216, 45, 65, 0.08), transparent 34rem), #f5f7f6;
+        }
+
+        article {
+          background: rgba(255, 255, 255, 0.96);
+          border-color: #dfe5e2;
+          box-shadow: 0 24px 80px rgba(27, 39, 34, 0.1);
+        }
+
+        .status,
+        .mark {
+          color: #c22e40;
+        }
+
+        p {
+          color: #55605c;
+        }
+
+        .english,
+        small {
+          color: #77817d;
+        }
+
+        a {
+          background: #111816;
+          color: #fff;
+        }
+      }
+
+      @media (max-width: 480px) {
+        .actions {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .status::before {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <article data-service-unavailable role="alert" aria-labelledby="outage-title">
+        <span class="status">API offline · HTTP 503</span>
+        <div class="mark" aria-hidden="true">!</div>
+        <h1 id="outage-title">Интерфейс временно недоступен</h1>
+        <p>
+          API этого узла не отвечает. Web-контейнер продолжает работать и автоматически проверит
+          соединение снова.
+        </p>
+        <p class="english">This node's API is unavailable. The page will retry automatically.</p>
+        <div class="actions">
+          <a href="/">Повторить сейчас</a>
+          <small>Автопроверка каждые 10 секунд</small>
+        </div>
+      </article>
+    </main>
+  </body>
+</html>

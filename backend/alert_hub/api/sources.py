@@ -15,6 +15,7 @@ from alert_hub.api.schemas import (
     SourceResponse,
 )
 from alert_hub.application.auth import add_audit
+from alert_hub.application.cluster_health import CLUSTER_API_HEALTH_SOURCE_ID
 from alert_hub.application.incidents import append_cluster_event, ingest_normalized_events
 from alert_hub.domain.events import NormalizedEvent, utc_now
 from alert_hub.domain.heartbeats import heartbeat_window
@@ -128,7 +129,12 @@ def list_sources(
 ) -> list[SourceResponse]:
     del user
     sources = db.scalars(
-        select(Source).where(Source.deleted_at.is_(None)).order_by(Source.name, Source.id)
+        select(Source)
+        .where(
+            Source.deleted_at.is_(None),
+            Source.id != CLUSTER_API_HEALTH_SOURCE_ID,
+        )
+        .order_by(Source.name, Source.id)
     ).all()
     return [source_response(item) for item in sources]
 
@@ -184,6 +190,8 @@ def create_source(
 
 
 def _active_source(db: Session, source_id: str) -> Source:
+    if source_id == CLUSTER_API_HEALTH_SOURCE_ID:
+        raise HTTPException(status_code=404, detail="Source not found")
     source = db.get(Source, source_id)
     if source is None or source.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Source not found")

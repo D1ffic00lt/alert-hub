@@ -16,6 +16,7 @@
     "/api/v1/checks/summary": ["get"],
     "/api/v1/checks/{check_id}": ["get"],
     "/api/v1/cluster/nodes": ["get"],
+    "/api/v1/cluster/nodes/api-down-alerts": ["patch"],
     "/api/v1/cluster/status": ["get"],
     "/api/v1/incidents": ["get"],
     "/api/v1/incidents/bulk-action": ["post"],
