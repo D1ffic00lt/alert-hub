@@ -31,6 +31,21 @@ Alert Hub node can do so through the peer watcher described below; Prometheus or
 watcher is still required when no configured peer remains alive, before an endpoint has ever
 proved its node identity, or when the entire cluster is unavailable.
 
+When the RU development preview is enabled, inspect it independently without treating it as a
+second application node:
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:18083/health/ready
+sudo docker inspect alert-hub-web-preview \
+  --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.Config.Image}}'
+sudo docker logs --tail=200 alert-hub-web-preview
+```
+
+The preview has no database or worker health of its own; its readiness proves that the dev web
+container can reach the current RU API. A compatibility rejection is intentional when `dev`
+changes the OpenAPI contract before production. Do not work around it by mounting production
+SQLite or weakening the digest/compatibility checks.
+
 The authenticated UI uses `/api/v1/cluster/status`. It combines durable node inventory with the
 serving process's current peer result: the local node is healthy when it serves the request, a peer
 is healthy after a successful pull, degraded during the first two consecutive failures, offline

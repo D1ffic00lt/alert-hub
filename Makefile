@@ -15,6 +15,7 @@ BASH_SCRIPTS := \
 	deploy/scripts/host-readiness.sh \
 	.github/deploy/scripts/docker-provision-node.sh \
 	.github/deploy/scripts/docker-deploy-node.sh \
+	.github/deploy/scripts/docker-deploy-preview-node.sh \
 	.github/deploy/scripts/docker-rollback-node.sh \
 	.github/deploy/scripts/docker-status-node.sh
 SH_SCRIPTS := \
@@ -156,6 +157,9 @@ operations-check:
 			-f .github/deploy/docker-compose.production.yml \
 			-f .github/deploy/docker-compose.production-monitoring.yml \
 			config --quiet
+	ALERT_HUB_PREVIEW_WEB_IMAGE=ghcr.io/example/alert-hub-web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+		ALERT_HUB_PREVIEW_HOST_PORT=18083 \
+		docker compose -f .github/deploy/docker-compose.preview.yml config --quiet
 	ALERT_HUB_API_IMAGE=alert-hub-api:ci \
 		ALERT_HUB_CI_ROOT=/tmp/alert-hub-ci-compose-validation \
 		ALERT_HUB_CI_SUBNET=10.253.250.0/28 \
