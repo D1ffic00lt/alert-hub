@@ -67,6 +67,15 @@ Keep dependencies pointing inward. Do not invent repository classes for trivial 
 ## Frontend and PWA changes
 
 - Target accessible React/TypeScript: semantic controls, keyboard operation, visible focus, useful labels, responsive layouts, and `prefers-reduced-motion` support.
+- Keep the visual language flat, restrained, and operational. Do not add gradients, blurred color washes, glowing icons/status dots, ornamental charts, or heavy shadows; use a shadow only when it communicates real layering such as a modal above a page.
+- Use the shared semantic color tokens instead of page-specific hardcoded colors. Color should primarily communicate status, focus, or a primary action. Dark and light themes must both meet WCAG AA contrast and must not leak surfaces or form styles from the other theme.
+- Keep typography quiet: prefer regular or medium weight, reserve bold text for page titles and key values, avoid italics as decoration, and remove copy or labels that do not help an operator make a decision.
+- Use recognizable, consistent stroke icons for navigation and actions. Uncommon actions need visible text or an accessible label; an icon must not depend on glow, color, or visual novelty to be understood.
+- Treat alignment and overflow as acceptance criteria. Related controls must share baselines and edge insets; cards, topology nodes, labels, inputs, and values from `0%` through `100%` must not overlap, clip, wrap character-by-character, or cross their borders.
+- Check every changed screen at desktop, tablet, and phone widths in both themes. Authentication and overview layouts should not scroll when their content fits the viewport, and responsive navigation must not introduce horizontal overflow.
+- Operational diagrams and summary graphics must describe the real product state when authenticated. Demo fixtures are allowed only in explicit demo mode, must be clearly labelled, and must not be presented as vague examples when a real node, percentage, queue, or health value is available.
+- Theme choices are `light`, `dark`, and `system`, live in Settings, and persist without a flash of the wrong theme; a fresh browser defaults to dark. Language selection lives in Settings and remains available before sign-in and on Overview; a fresh browser defaults to English and saved choices take precedence.
+- Keep product subtitle casing calm and consistent: render the monitoring-center subtitle in sentence/lower case next to `APP_NAME` and in browser metadata unless grammar requires otherwise.
 - Do not fabricate operational data after authentication. An explicit demo mode may use fixtures; live and cached modes display only data verified from the API/session partition.
 - Reads may fail over to trusted HTTPS peers. Mutations remain on the authenticated origin unless a separately authenticated mutation-failover design is implemented.
 - Preserve runtime `APP_NAME` propagation through page metadata, manifest, visible brand, and default notification title.

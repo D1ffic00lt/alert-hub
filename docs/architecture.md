@@ -108,11 +108,13 @@ separate immutable digests. Updating one Compose service does not recreate the o
 mode publishes the backend directly on loopback and does not require the web image.
 
 The optional RU development preview reuses this web image boundary without creating another API
-or SQLite owner. A push to `dev` builds an immutable web digest and deploys one separate read-only
-web container on the existing edge/ingress networks. That container proxies to the healthy RU
-production API, mounts no data or secrets, and is accepted only when its OpenAPI compatibility
-label matches the recorded and running API. Its loopback port and later HTTPS hostname are distinct
-from production, while all state access still passes through the single RU API process.
+or SQLite owner. A frontend-changing push to `dev`, or an input-free manual dispatch selected from
+`dev`, builds an immutable web digest and deploys one separate read-only web container on the
+existing edge/ingress networks. Backend-only pushes skip this frontend pipeline. The preview
+container proxies to the healthy RU production API, mounts no data or secrets, and is accepted only
+when its OpenAPI compatibility label matches the recorded and running API. Its loopback port and
+later HTTPS hostname are distinct from production, while all state access still passes through the
+single RU API process.
 
 ## Application layers
 

@@ -3,6 +3,9 @@ name: Dev frontend preview
 on:
   push:
     branches: [dev]
+    paths:
+      - "frontend/**"
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -14,6 +17,7 @@ concurrency:
 jobs:
   build:
     name: Build and publish frontend preview
+    if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
