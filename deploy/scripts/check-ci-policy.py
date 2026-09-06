@@ -395,13 +395,31 @@ def _production_workflow_errors(path: Path, workflow: Mapping[str, Any]) -> list
     else:
         push = triggers.get("push", {}) if isinstance(triggers, Mapping) else {}
         branches = push.get("branches") if isinstance(push, Mapping) else None
+        paths = push.get("paths") if isinstance(push, Mapping) else None
         normalized = [str(branch) for branch in branches] if isinstance(branches, list) else []
-        if not isinstance(triggers, Mapping) or set(triggers) != {"push"} or normalized != ["dev"]:
-            failures.append(f"{path}: preview workflow must run only on pushes to dev")
+        normalized_paths = [str(item) for item in paths] if isinstance(paths, list) else []
+        dispatch = triggers.get("workflow_dispatch") if isinstance(triggers, Mapping) else None
+        if (
+            not isinstance(triggers, Mapping)
+            or set(triggers) != {"push", "workflow_dispatch"}
+            or normalized != ["dev"]
+            or normalized_paths != ["frontend/**"]
+            or not isinstance(dispatch, Mapping)
+            or dispatch
+        ):
+            failures.append(
+                f"{path}: preview workflow must use frontend-only pushes to dev "
+                "plus an input-free manual dispatch"
+            )
 
     jobs = workflow.get("jobs", {})
     if not isinstance(jobs, Mapping):
         return [*failures, f"{path}: jobs must be a mapping"]
+    if path.name == PREVIEW_WORKFLOW:
+        build = jobs.get(PREVIEW_PUBLISH_JOB)
+        build_condition = build.get("if") if isinstance(build, Mapping) else None
+        if str(build_condition).strip() != "github.ref == 'refs/heads/dev'":
+            failures.append(f"{path}: manual preview runs must be restricted to refs/heads/dev")
     has_self_hosted_job = any(
         isinstance(job, Mapping) and _is_approved_self_hosted_job(path, job)
         for job in jobs.values()

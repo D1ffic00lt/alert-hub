@@ -683,10 +683,13 @@ name: Dev frontend preview
 on:
   push:
     branches: [dev]
+    paths: [frontend/**]
+  workflow_dispatch: {{}}
 permissions:
   contents: read
 jobs:
   build:
+    if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -751,9 +754,54 @@ jobs:
 
     failures = _checker().check_repository(repository)
 
-    assert any("preview workflow must run only on pushes to dev" in failure for failure in failures)
+    assert any(
+        "preview workflow must use frontend-only pushes to dev" in failure for failure in failures
+    )
     assert any("may request packages: write" in failure for failure in failures)
     assert any("may execute docker push" in failure for failure in failures)
+
+
+def test_ci_policy_rejects_manual_preview_from_arbitrary_ref(tmp_path: Path) -> None:
+    repository = _write_ci(
+        tmp_path,
+        """\
+name: CI
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs: {}
+""",
+    )
+    (repository / ".github" / "workflows" / "dev-preview.yml").write_text(
+        """\
+name: Unsafe manual preview
+on:
+  push:
+    branches: [dev]
+    paths: [frontend/**]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - run: docker buildx build --push --file frontend/Dockerfile frontend
+""",
+        encoding="utf-8",
+    )
+
+    failures = _checker().check_repository(repository)
+
+    assert any(
+        "manual preview runs must be restricted to refs/heads/dev" in failure
+        for failure in failures
+    )
 
 
 def test_ci_policy_fails_closed_on_ambiguous_pr_job_conditions(tmp_path: Path) -> None:
@@ -1281,7 +1329,10 @@ def test_dev_preview_is_one_dev_only_frontend_pipeline() -> None:
     source = path.read_text(encoding="utf-8")
     document = yaml.load(source, Loader=yaml.BaseLoader)
     assert isinstance(document, dict)
-    assert document["on"] == {"push": {"branches": ["dev"]}}
+    assert document["on"] == {
+        "push": {"branches": ["dev"], "paths": ["frontend/**"]},
+        "workflow_dispatch": {},
+    }
 
     workflow = _workflow("dev-preview.yml")
     assert workflow["concurrency"] == {
@@ -1292,6 +1343,7 @@ def test_dev_preview_is_one_dev_only_frontend_pipeline() -> None:
 
     build = workflow["jobs"]["build"]
     build_run = _job_run(build)
+    assert build["if"] == "github.ref == 'refs/heads/dev'"
     assert build["runs-on"] == "ubuntu-24.04"
     assert build["permissions"] == {"contents": "read", "packages": "write"}
     assert sum("docker buildx build" in str(step.get("run", "")) for step in build["steps"]) == 1

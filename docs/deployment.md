@@ -448,12 +448,15 @@ sudo /usr/local/sbin/docker-status-node.sh
 ## RU development frontend preview
 
 `.github/workflows/dev-preview.yml` is the single lightweight preview pipeline.
-It runs only after a push to `dev`, checks out that exact commit, builds only
+It runs automatically only when a push to `dev` changes `frontend/**`, and it can
+also be dispatched manually from the `dev` branch. Manual runs selected from any
+other ref are skipped. The workflow checks out that exact commit, builds only
 `frontend/Dockerfile`, publishes the web image, resolves its immutable digest,
-and asks only the `alert-hub-ru` runner to deploy it. The Docker build already
-runs `npm ci` and the Vite production build; the preview workflow does not
-repeat the full lint, backend, browser, migration, or recovery suites. Those
-remain required on the normal PR to `main`.
+and asks only the `alert-hub-ru` runner to deploy it. Backend-only pushes do not
+build or deploy a preview. The Docker build already runs `npm ci` and the Vite
+production build; the preview workflow does not repeat the full lint, backend,
+browser, migration, or recovery suites. Those remain required on the normal PR
+to `main`.
 
 Before enabling the workflow, re-run the node provisioner once on RU from the
 reviewed commit containing the preview files. This installs the root-owned
