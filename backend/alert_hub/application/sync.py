@@ -217,6 +217,16 @@ def _project_node(db: Session, entity_id: str) -> None:
     node.enabled_roles = [str(role) for role in roles] if isinstance(roles, list) else []
     node.software_version = str(payload.get("software_version") or "unknown")[:64]
     node.last_seen_at = max(node.last_seen_at or event.occurred_at, event.occurred_at)
+    db.flush()
+    _project_node_api_alert_setting(db, entity_id)
+
+
+def _project_node_api_alert_setting(db: Session, entity_id: str) -> None:
+    event = _latest_entity_event(db, "node_api_alert_setting", entity_id)
+    node = db.get(Node, entity_id)
+    if event is None or node is None:
+        return
+    node.api_down_alert_enabled = bool(event.payload_json.get("enabled", False))
 
 
 def _record_bootstrap_conflict(
@@ -928,6 +938,8 @@ def _replay_user_dependencies(db: Session, user_id: str, settings: Settings) -> 
 def _project_event(db: Session, event: ClusterEvent, settings: Settings) -> None:
     if event.entity_type == "node":
         _project_node(db, event.entity_id)
+    elif event.entity_type == "node_api_alert_setting":
+        _project_node_api_alert_setting(db, event.entity_id)
     elif event.entity_type == "user":
         _project_user(db, event.entity_id, settings)
     elif event.entity_type == "session":
@@ -990,6 +1002,7 @@ def apply_cluster_events(
 
     priorities = {
         "node": 0,
+        "node_api_alert_setting": 1,
         "user": 1,
         "source": 2,
         "session": 3,

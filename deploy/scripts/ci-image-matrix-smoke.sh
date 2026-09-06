@@ -203,6 +203,19 @@ done
   exit 1
 }
 [[ $(docker container inspect "${web_container}" --format '{{.State.Running}}') == true ]]
+curl --silent --show-error --max-time 3 --dump-header "${smoke_root}/api-down.headers" \
+  --output "${smoke_root}/api-down.html" "${base_url}/" || true
+grep -F '503 Service Temporarily Unavailable' "${smoke_root}/api-down.headers" >/dev/null
+grep -Fi 'Content-Type: text/html' "${smoke_root}/api-down.headers" >/dev/null
+grep -F 'data-service-unavailable' "${smoke_root}/api-down.html" >/dev/null
+grep -F 'API offline · HTTP 503' "${smoke_root}/api-down.html" >/dev/null
+
+# API clients retain the small JSON fallback and never receive an HTML shell.
+curl --silent --show-error --max-time 3 --dump-header "${smoke_root}/api-down-api.headers" \
+  --output "${smoke_root}/api-down-api.json" "${base_url}/api/v1/incidents" || true
+grep -F '503 Service Temporarily Unavailable' "${smoke_root}/api-down-api.headers" >/dev/null
+grep -Fi 'Content-Type: application/json' "${smoke_root}/api-down-api.headers" >/dev/null
+grep -F '"detail":"API unavailable"' "${smoke_root}/api-down-api.json" >/dev/null
 
 compose start alert-hub
 recovered=false

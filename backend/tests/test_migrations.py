@@ -35,6 +35,7 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
         "notification_channels",
         "notification_routes",
         "outbox",
+        "peer_endpoint_identities",
         "prometheus_datasources",
         "push_subscriptions",
         "sessions",
@@ -72,6 +73,15 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
     assert application_settings_columns["grafana_url"]["nullable"] is True
     assert application_settings_columns["key_job_globs"]["nullable"] is False
     assert application_settings_columns["alert_hub_job_globs"]["nullable"] is False
+    node_columns = {column["name"]: column for column in inspect(engine).get_columns("nodes")}
+    assert node_columns["api_down_alert_enabled"]["nullable"] is False
+    peer_identity_foreign_keys = {
+        foreign_key["name"]: foreign_key
+        for foreign_key in inspect(engine).get_foreign_keys("peer_endpoint_identities")
+    }
+    peer_node_foreign_key = peer_identity_foreign_keys["fk_peer_endpoint_identities_node_id_nodes"]
+    assert peer_node_foreign_key["referred_table"] == "nodes"
+    assert peer_node_foreign_key["options"].get("ondelete") == "CASCADE"
     incident_indexes = {index["name"]: index for index in inspect(engine).get_indexes("incidents")}
     assert incident_indexes["ix_incidents_status_severity"]["column_names"] == [
         "status",
@@ -119,6 +129,10 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
     assert "ix_incident_events_incident_time" in downgraded_incident_indexes
     assert "ix_incidents_status_severity" not in downgraded_projection_indexes
     assert "ix_cluster_events_type_operation_time" not in downgraded_cluster_indexes
+    assert "peer_endpoint_identities" not in inspect(engine).get_table_names()
+    assert "api_down_alert_enabled" not in {
+        column["name"] for column in inspect(engine).get_columns("nodes")
+    }
     command.upgrade(config, "head")
 
     command.downgrade(config, "base")

@@ -14,8 +14,14 @@ from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from alert_hub.application.cluster_health import (
+    PEER_OFFLINE_FAILURE_THRESHOLD,
+    record_node_api_down,
+    resolve_node_api_alert,
+)
 from alert_hub.application.sync import (
     IncomingClusterEvent,
     advance_peer_cursor,
@@ -24,7 +30,7 @@ from alert_hub.application.sync import (
 )
 from alert_hub.domain.events import as_utc
 from alert_hub.infrastructure.db.base import utc_now
-from alert_hub.infrastructure.db.models import Node
+from alert_hub.infrastructure.db.models import Node, PeerEndpointIdentity
 from alert_hub.metrics import CLOCK_SKEW_SUSPECTED, PEER_UP, SYNC_EVENTS, SYNC_LAG
 from alert_hub.settings import Settings
 
@@ -122,6 +128,7 @@ class PeerSyncWorker:
         self._monotonic = monotonic
         self._random_value = random_value
         self.states = {url: PeerState(base_url=url) for url in settings.peer_urls}
+        self._verified_identities_loaded = False
         # FastAPI executes synchronous status handlers in a worker thread while
         # this worker updates peer state on the application event loop. Keep each
         # externally visible snapshot coherent across the related fields.
@@ -195,6 +202,7 @@ class PeerSyncWorker:
         await self._sync_ready_peers()
 
     async def _sync_ready_peers(self) -> None:
+        self._restore_verified_peer_identities()
         now = self._monotonic()
         for state in self.states.values():
             if state.next_attempt_at > now:
@@ -288,7 +296,7 @@ class PeerSyncWorker:
         with self._state_lock:
             state.node_id = health.node_id
         with self.session_factory.begin() as db:
-            self._touch_peer_node(db, health)
+            self._touch_peer_node(db, health, state.base_url)
             cursor = peer_cursor(db, health.node_id)
 
         oldest_observed: datetime | None = None
@@ -317,7 +325,7 @@ class PeerSyncWorker:
             with self.session_factory.begin() as db:
                 result = apply_cluster_events(db, page.events, self.settings)
                 next_cursor = advance_peer_cursor(db, health.node_id, page.cursor)
-                self._touch_peer_node(db, health)
+                self._touch_peer_node(db, health, state.base_url)
             SYNC_EVENTS.labels(direction="inbound", result="applied").inc(result.applied)
             SYNC_EVENTS.labels(direction="inbound", result="duplicate").inc(result.duplicates)
             if page.has_more and next_cursor == cursor:
@@ -333,7 +341,26 @@ class PeerSyncWorker:
             state.lag_seconds = lag_seconds
         SYNC_LAG.labels(peer_node_id=health.node_id).set(lag_seconds)
 
-    def _touch_peer_node(self, db: Session, health: PeerHealthResponse) -> None:
+    def _restore_verified_peer_identities(self) -> None:
+        if self._verified_identities_loaded or not self.states:
+            return
+        with self.session_factory() as db:
+            identities = {
+                row.base_url: row.node_id for row in db.scalars(select(PeerEndpointIdentity)).all()
+            }
+        with self._state_lock:
+            for base_url, node_id in identities.items():
+                state = self.states.get(base_url)
+                if state is not None and state.node_id is None:
+                    state.node_id = node_id
+            self._verified_identities_loaded = True
+
+    def _touch_peer_node(
+        self,
+        db: Session,
+        health: PeerHealthResponse,
+        base_url: str,
+    ) -> None:
         node = db.get(Node, health.node_id)
         if node is None:
             node = Node(
@@ -347,6 +374,18 @@ class PeerSyncWorker:
         node.region = health.region
         node.software_version = health.software_version
         node.last_seen_at = utc_now()
+        identity = db.get(PeerEndpointIdentity, base_url)
+        if identity is None:
+            db.add(
+                PeerEndpointIdentity(
+                    base_url=base_url,
+                    node_id=health.node_id,
+                    verified_at=utc_now(),
+                )
+            )
+        else:
+            identity.node_id = health.node_id
+            identity.verified_at = utc_now()
 
     def _lag_seconds(
         self,
@@ -382,6 +421,27 @@ class PeerSyncWorker:
                 "exception_type": type(exc).__name__,
             },
         )
+        if node_id is not None and failure_count >= PEER_OFFLINE_FAILURE_THRESHOLD:
+            try:
+                with self.session_factory.begin() as db:
+                    node = db.get(Node, node_id)
+                    if node is not None:
+                        record_node_api_down(
+                            db,
+                            node,
+                            self.settings,
+                            failure_count=failure_count,
+                        )
+            except Exception as alert_exc:
+                logger.error(
+                    "peer_api_alert_update_failed",
+                    extra={
+                        "event": "peer_api_alert_update_failed",
+                        "peer_node_id": node_id,
+                        "operation": "firing",
+                        "exception_type": type(alert_exc).__name__,
+                    },
+                )
 
     def _mark_success(self, state: PeerState) -> None:
         with self._state_lock:
@@ -390,8 +450,30 @@ class PeerSyncWorker:
             state.last_success_at = utc_now()
             state.next_attempt_at = self._monotonic() + self.settings.sync_interval_seconds
             metric_id = state.metric_id
+            node_id = state.node_id
         PEER_UP.labels(peer_node_id=metric_id).set(1)
         SYNC_EVENTS.labels(direction="pull", result="success").inc()
+        if node_id is not None:
+            try:
+                with self.session_factory.begin() as db:
+                    node = db.get(Node, node_id)
+                    if node is not None:
+                        resolve_node_api_alert(
+                            db,
+                            node,
+                            self.settings,
+                            reason="Authenticated peer health checks recovered.",
+                        )
+            except Exception as alert_exc:
+                logger.error(
+                    "peer_api_alert_update_failed",
+                    extra={
+                        "event": "peer_api_alert_update_failed",
+                        "peer_node_id": node_id,
+                        "operation": "resolved",
+                        "exception_type": type(alert_exc).__name__,
+                    },
+                )
 
     def status_snapshot(self) -> dict[str, dict[str, Any]]:
         with self._state_lock:
