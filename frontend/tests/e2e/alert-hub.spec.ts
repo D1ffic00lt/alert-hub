@@ -2648,8 +2648,13 @@ test("configures per-node API-down alerts and enables every selected node", asyn
   const offThumbTransform = await deSwitch
     .locator(".toggle__thumb")
     .evaluate((element) => window.getComputedStyle(element).transform);
+  const offThumbColor = await deSwitch
+    .locator(".toggle__thumb")
+    .evaluate((element) => window.getComputedStyle(element).backgroundColor);
   const switchBox = await deSwitch.boundingBox();
-  expect(switchBox?.width).toBeGreaterThanOrEqual(44);
+  expect(switchBox?.width).toBe(42);
+  expect(switchBox?.height).toBe(24);
+  expect(offThumbColor).toBe("rgb(139, 139, 149)");
   await page.getByRole("button", { name: "Выбрать все" }).click();
   await expect(page.getByText("Выбрано: 3")).toBeVisible();
   await page.getByRole("button", { name: "Включить выбранным" }).click();
@@ -2660,14 +2665,17 @@ test("configures per-node API-down alerts and enables every selected node", asyn
     await expect(control).toHaveAttribute("aria-checked", "true");
   }
   await expect(deControl).toContainText("включён");
-  await expect(deSwitch).toHaveCSS("background-color", "rgb(34, 197, 94)");
   const onSwitchColor = await deSwitch.evaluate(
     (element) => window.getComputedStyle(element).backgroundColor,
   );
   const onThumbTransform = await deSwitch
     .locator(".toggle__thumb")
     .evaluate((element) => window.getComputedStyle(element).transform);
-  expect(onSwitchColor).not.toBe(offSwitchColor);
+  expect(onSwitchColor).toBe(offSwitchColor);
+  await expect(deSwitch.locator(".toggle__thumb")).toHaveCSS(
+    "background-color",
+    "rgb(34, 197, 94)",
+  );
   expect(onThumbTransform).not.toBe(offThumbTransform);
   expect(state.clusterApiAlertRequests?.[0]).toEqual({
     node_ids: ["ru", "nl", "de"],
