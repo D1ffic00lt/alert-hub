@@ -23,12 +23,39 @@ public proxy examples deny `/health/deep`, `/metrics`, API documentation, and `/
 `404`. Query or scrape those operator surfaces through loopback/private paths; never publish a
 separate metrics port.
 
+After a previously healthy web container loses its local API, browser navigation returns a
+self-contained outage screen with HTTP `503`; API, ingest, health, and metrics clients continue to
+receive the compact JSON `503`. The screen retries every 10 seconds and requires neither the React
+bundle nor a working API. The failed process cannot report its own complete outage. A different
+Alert Hub node can do so through the peer watcher described below; Prometheus or another external
+watcher is still required when no configured peer remains alive, before an endpoint has ever
+proved its node identity, or when the entire cluster is unavailable.
+
 The authenticated UI uses `/api/v1/cluster/status`. It combines durable node inventory with the
 serving process's current peer result: the local node is healthy when it serves the request, a peer
 is healthy after a successful pull, degraded during the first two consecutive failures, offline
 from the third consecutive failure, and unknown before an attempt has produced evidence. Sync lag
 is the worker's current cursor evidence, not an estimate from the durable `last_seen_at` field. The
 UI refreshes this runtime view every 30 seconds even while its cluster-event stream is connected.
+
+Administrators configure peer-generated API outage incidents under **Cluster → API-down alerts**.
+The setting is per node, can be applied to any selected set or to all known nodes, is audited, and
+replicates as append-only `node_api_alert_setting` history. Enabling it for an already-offline peer
+opens the incident immediately on the serving node. Otherwise, after three consecutive failures
+of the authenticated peer health check, every live observer with that verified peer identity may
+create a critical `AlertHubNodeApiDown` incident. A later successful authenticated check resolves
+it. The worker persists its verified endpoint-to-node association locally so an API outage that
+continues across an observer restart is still attributable; a URL is never treated as identity
+until a successful handshake has proved the node ID.
+
+The managed incident source is not an ingest credential and is omitted from editable Sources.
+Its firing and resolved events use the normal durable notification outbox. They match notification
+routes with an empty source filter ("any source"); severity and label matchers still apply. Keep at
+least one such route to an independent receiver if API-down notifications are required. Multiple
+observers may emit duplicate firing events during a partition by design; preserving the outage is
+preferred to suppressing every duplicate. Disabling monitoring resolves an active API-down
+incident. A node cannot watch itself, so enable the setting on each target and configure at least
+one other peer to observe it.
 
 Administrators set the optional Grafana HTTPS dashboard link and the bounded `job` glob lists under
 **Settings → Grafana and job selection**. The values are audited and replicated as append-only

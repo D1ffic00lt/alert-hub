@@ -43,6 +43,7 @@ type MockState = {
   clusterRequestStarted?: (() => void) | null;
   clusterUnavailable?: boolean;
   clusterStatus?: unknown;
+  clusterApiAlertRequests?: Array<Record<string, unknown>>;
   checksDetails?: Record<string, Record<string, unknown>>;
   checksGate?: Promise<void> | null;
   checksItems?: Array<Record<string, unknown>>;
@@ -556,6 +557,36 @@ async function installApi(page: Page, state: MockState) {
         return;
       }
       await fulfill(route, payload);
+      return;
+    }
+    if (method === "PATCH" && path === "/cluster/nodes/api-down-alerts") {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      state.clusterApiAlertRequests?.push(body);
+      const requestedIds = new Set(
+        Array.isArray(body.node_ids) ? body.node_ids.map((value) => String(value)) : [],
+      );
+      const enabled = body.enabled === true;
+      const cluster = state.clusterStatus as Record<string, unknown>;
+      const nodes = Array.isArray(cluster?.nodes)
+        ? (cluster.nodes as Array<Record<string, unknown>>)
+        : [];
+      let updated = 0;
+      nodes.forEach((node) => {
+        if (!requestedIds.has(String(node.id))) return;
+        if (node.api_down_alert_enabled !== enabled) updated += 1;
+        node.api_down_alert_enabled = enabled;
+      });
+      await fulfill(route, {
+        updated,
+        unchanged: requestedIds.size - updated,
+        alerts_opened: 0,
+        nodes: nodes
+          .filter((node) => requestedIds.has(String(node.id)))
+          .map((node) => ({
+            id: node.id,
+            api_down_alert_enabled: node.api_down_alert_enabled,
+          })),
+      });
       return;
     }
     if (method === "GET" && path === "/sources") {
@@ -1143,6 +1174,97 @@ function checksFixtures() {
     },
   };
 }
+
+test("incidents use stable skeletons and keep tab counts while a filter loads", async ({
+  page,
+}) => {
+  const incidents = [
+    {
+      id: "incident-loading-active",
+      title: "Loading active",
+      description: "Active incident used by the loading-state regression.",
+      severity: "critical",
+      status: "open",
+      source_name: "Prometheus",
+      region: "RU",
+      target: "api-one",
+      starts_at: "2026-09-05T11:58:00Z",
+      last_event_at: "2026-09-05T12:00:00Z",
+      labels: {},
+      annotations: {},
+    },
+    {
+      id: "incident-loading-resolved",
+      title: "Loading resolved",
+      description: "Resolved incident used by the loading-state regression.",
+      severity: "warning",
+      status: "resolved",
+      source_name: "Heartbeat",
+      region: "DE",
+      target: "api-two",
+      starts_at: "2026-09-05T11:30:00Z",
+      last_event_at: "2026-09-05T11:50:00Z",
+      labels: {},
+      annotations: {},
+    },
+  ];
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    incidentListRequests: [],
+    incidents,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+
+  const firstGate = deferredGate();
+  const firstStarted = deferredGate();
+  state.incidentListGate = firstGate.promise;
+  state.incidentListStarted = firstStarted.release;
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
+  await firstStarted.promise;
+
+  await expect(page.locator(".incidents-page-skeleton")).toBeVisible();
+  await expect(page.locator(".incident-table-skeleton")).toBeVisible();
+  await expect(page.locator(".hub-skeleton-count")).toHaveCount(4);
+  await expect(page.getByText(/••••/)).toHaveCount(0);
+
+  firstGate.release();
+  state.incidentListGate = null;
+  state.incidentListStarted = null;
+  await expect(page.getByText("Loading active", { exact: true })).toBeVisible();
+  const activeTab = page.locator(".incident-tabs").getByRole("button", { name: /^Активные/ });
+  const resolvedTab = page.locator(".incident-tabs").getByRole("button", { name: /^Решённые/ });
+  const allTab = page.locator(".incident-tabs").getByRole("button", { name: /^Все/ });
+  await expect(activeTab).toContainText("1");
+  await expect(resolvedTab).toContainText("1");
+  await expect(allTab).toContainText("2");
+
+  const filterGate = deferredGate();
+  const filterStarted = deferredGate();
+  state.incidentListGate = filterGate.promise;
+  state.incidentListStarted = filterStarted.release;
+  await resolvedTab.click();
+  await filterStarted.promise;
+
+  await expect(page.locator(".incident-table-skeleton")).toBeVisible();
+  await expect(activeTab).toContainText("1");
+  await expect(resolvedTab).toContainText("1");
+  await expect(allTab).toContainText("2");
+  await expect(page.getByText("Loading active", { exact: true })).toHaveCount(0);
+
+  filterGate.release();
+  state.incidentListGate = null;
+  state.incidentListStarted = null;
+  await expect(page.getByText("Loading resolved", { exact: true })).toBeVisible();
+  await expect(page.locator(".incident-table-skeleton")).toHaveCount(0);
+});
 
 test("incidents load once without waiting for metrics and report partial bulk results", async ({
   page,
@@ -2468,6 +2590,62 @@ test("renders live cluster telemetry and groups repeated historical audit failur
 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByLabel("Период журнала")).toBeVisible();
+});
+
+test("configures per-node API-down alerts and enables every selected node", async ({ page }) => {
+  const now = new Date().toISOString();
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    clusterApiAlertRequests: [],
+    clusterStatus: {
+      cluster_event_count: 12,
+      cursor: { ru: 4, nl: 4, de: 4 },
+      nodes: ["ru", "nl", "de"].map((id) => ({
+        id,
+        name: id.toUpperCase(),
+        region: id,
+        health: id === "de" ? "offline" : "healthy",
+        sync_lag_seconds: id === "de" ? null : 0,
+        last_seen_at: now,
+        software_version: "v0.1.4",
+        api_down_alert_enabled: false,
+      })),
+    },
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Кластер" }).click();
+
+  await expect(page.getByRole("heading", { name: "Алерты о падении API" })).toBeVisible();
+  await expect(page.getByText("Включено: 0/3")).toBeVisible();
+  await page.getByRole("button", { name: "Выбрать все" }).click();
+  await expect(page.getByText("Выбрано: 3")).toBeVisible();
+  await page.getByRole("button", { name: "Включить выбранным" }).click();
+
+  await expect(page.getByText("Включено: 3/3")).toBeVisible();
+  await expect(page.getByRole("switch")).toHaveCount(3);
+  for (const control of await page.getByRole("switch").all()) {
+    await expect(control).toHaveAttribute("aria-checked", "true");
+  }
+  expect(state.clusterApiAlertRequests?.[0]).toEqual({
+    node_ids: ["ru", "nl", "de"],
+    enabled: true,
+  });
+
+  await page.getByRole("switch", { name: "Алерт о падении API для DE" }).click();
+  await expect(page.getByText("Включено: 2/3")).toBeVisible();
+  await expect(page.getByRole("switch", { name: "Алерт о падении API для DE" })).toHaveAttribute(
+    "aria-checked",
+    "false",
+  );
+  expect(state.clusterApiAlertRequests?.[1]).toEqual({ node_ids: ["de"], enabled: false });
 });
 
 test("rebases pure audit prepends and safely resets for an interior insertion", async ({
