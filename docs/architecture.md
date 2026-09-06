@@ -107,6 +107,13 @@ The two images carry the same release version and OpenAPI-derived compatibility 
 separate immutable digests. Updating one Compose service does not recreate the other. API-only
 mode publishes the backend directly on loopback and does not require the web image.
 
+The optional RU development preview reuses this web image boundary without creating another API
+or SQLite owner. A push to `dev` builds an immutable web digest and deploys one separate read-only
+web container on the existing edge/ingress networks. That container proxies to the healthy RU
+production API, mounts no data or secrets, and is accepted only when its OpenAPI compatibility
+label matches the recorded and running API. Its loopback port and later HTTPS hostname are distinct
+from production, while all state access still passes through the single RU API process.
+
 ## Application layers
 
 The backend follows four simple dependency layers:

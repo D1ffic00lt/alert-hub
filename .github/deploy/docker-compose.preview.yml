@@ -1,0 +1,46 @@
+name: alert-hub-dev-preview
+
+services:
+  alert-hub-web-preview:
+    container_name: alert-hub-web-preview
+    image: ${ALERT_HUB_PREVIEW_WEB_IMAGE:?set an immutable Alert Hub preview web digest}
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      APP_NAME: ${APP_NAME:-Alert Hub Preview}
+    ports:
+      - "127.0.0.1:${ALERT_HUB_PREVIEW_HOST_PORT:-18083}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=101,gid=101,mode=0700
+      - /run/alert-hub:rw,noexec,nosuid,nodev,size=4m,uid=101,gid=101,mode=0755
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -q -T 2 -t 1 -O /dev/null http://127.0.0.1:8080/health/ready &&
+          wget -q -T 2 -t 1 -O /dev/null http://127.0.0.1:8080/ &&
+          wget -q -T 2 -t 1 -O /dev/null http://127.0.0.1:8080/runtime-config.js
+      interval: 10s
+      timeout: 7s
+      start_period: 20s
+      retries: 3
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      edge: {}
+      ingress: {}
+
+networks:
+  edge:
+    external: true
+    name: alert-hub-edge
+  ingress:
+    external: true
+    name: alert-hub-ingress

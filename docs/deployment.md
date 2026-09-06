@@ -170,6 +170,7 @@ and modes:
 /opt/alert-hub/history/*.env            root:root 0600
 /opt/alert-hub/history/configs/         root:root 0700
 /opt/alert-hub/history/configs/*.env    root:root 0600
+/opt/alert-hub/preview/current.env       root:root 0600
 /opt/alert-hub/.deploy.lock             root:root 0600
 /etc/alert-hub/deploy-policy.env         root:root 0600
 /etc/alert-hub/backup.env                root:root 0600
@@ -285,6 +286,11 @@ CHECKS_CACHE_TTL_SECONDS
 CHECKS_FUTURE_TOLERANCE_SECONDS
 CHECKS_MAX_SERIES
 ```
+
+`PREVIEW_PUBLIC_DOMAIN` is an additional optional variable for the
+`production-ru` Environment only. When set, an API or `all` RU deployment adds
+`https://<PREVIEW_PUBLIC_DOMAIN>` to the exact trusted-origin list used for the
+RU development frontend preview. Do not set it on NL or DE.
 
 `APP_NAME` defaults to `Alert Hub`. `PEER_URLS` is a comma-separated list of the
 other nodes' exact HTTPS peer origins; setting it also requires their exact
@@ -438,6 +444,64 @@ Console status is available without exposing secrets:
 ```bash
 sudo /usr/local/sbin/docker-status-node.sh
 ```
+
+## RU development frontend preview
+
+`.github/workflows/dev-preview.yml` is the single lightweight preview pipeline.
+It runs only after a push to `dev`, checks out that exact commit, builds only
+`frontend/Dockerfile`, publishes the web image, resolves its immutable digest,
+and asks only the `alert-hub-ru` runner to deploy it. The Docker build already
+runs `npm ci` and the Vite production build; the preview workflow does not
+repeat the full lint, backend, browser, migration, or recovery suites. Those
+remain required on the normal PR to `main`.
+
+Before enabling the workflow, re-run the node provisioner once on RU from the
+reviewed commit containing the preview files. This installs the root-owned
+`docker-deploy-preview-node.sh`, preview Compose file, and narrow no-argument
+sudoers rule. The self-hosted job never checks out or executes repository code.
+Create an unprotected `preview-ru` GitHub Environment if deployment must follow
+the build immediately; its deployment-branch rule should allow only `dev`.
+`GITHUB_TOKEN` provides package read/write access, so no new registry secret is
+required. An optional `PREVIEW_APP_NAME` Environment or Repository Variable
+overrides the preview brand; otherwise `APP_NAME` is used, falling back to
+`Alert Hub Preview`.
+
+The preview is one additional unprivileged, read-only web container. It mounts
+no database, application env file, secret, or Docker socket. It joins the
+existing `alert-hub-edge` and `alert-hub-ingress` networks, proxies same-origin
+requests to the healthy RU production API, and is published only on
+`127.0.0.1:18083`. Consequently it uses the RU node's existing SQLite state
+through the single API owner rather than opening the SQLite file from a second
+process. Deployment refuses a web image whose OpenAPI compatibility label does
+not exactly match both the recorded and running production API. A failed
+readiness check restores the previous compatible preview when available.
+
+Before DNS exists, an operator can verify the loopback endpoint without making
+it public:
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:18083/health/ready
+curl --fail --silent --show-error http://127.0.0.1:18083/runtime-config.js
+```
+
+Publishing the preview later is a separate, explicit production-network
+operation:
+
+1. Add the preview hostname's DNS `A` record to the RU host.
+2. Set `PREVIEW_PUBLIC_DOMAIN` only in `production-ru`, then perform an `api` or
+   `all` deployment so the existing API accepts that exact HTTPS Origin.
+3. Add a separate ordinary UI HTTPS virtual host. A host proxy targets
+   `127.0.0.1:18083`; a containerized proxy already attached to
+   `alert-hub-ingress` targets `alert-hub-web-preview:8080`.
+4. Preserve the ordinary UI template's unconditional `404` rules for
+   `/internal/*`, metrics, deep health, and API documentation, validate the
+   complete proxy configuration, and reload it explicitly.
+
+Treat the preview hostname as production-data access even though its JavaScript
+comes from `dev`. Restrict it to trusted testers with the existing VPN,
+source-allowlist, or identity-aware proxy control; do not expose it as an
+anonymous public test site. A tester who signs in grants that reviewed dev
+frontend the tester's normal RU API permissions, including mutations.
 
 ## Existing public reverse proxy
 

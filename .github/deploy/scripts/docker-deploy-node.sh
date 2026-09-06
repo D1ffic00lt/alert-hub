@@ -705,7 +705,7 @@ derive_cluster_secret() {
 }
 
 write_runtime_material() {
-  local master_key cluster_bearer deployment_smoke_token sync_enabled temporary
+  local master_key cluster_bearer deployment_smoke_token sync_enabled temporary trusted_origins
 
   secret_is_acceptable CLUSTER_MASTER_KEY "${CLUSTER_MASTER_KEY}"
   secret_is_acceptable SESSION_SIGNING_KEY "${SESSION_SIGNING_KEY}"
@@ -735,6 +735,15 @@ write_runtime_material() {
   validate_single_line "${VAPID_PUBLIC_KEY:-}" || die "VAPID_PUBLIC_KEY must be a single line"
   validate_single_line "${APP_NAME}" || die "APP_NAME must be a single line"
   [[ -n ${APP_NAME} && ${#APP_NAME} -le 80 ]] || die "APP_NAME must contain 1 to 80 characters"
+  trusted_origins=https://${PUBLIC_DOMAIN}
+  if [[ -n ${PREVIEW_PUBLIC_DOMAIN} ]]; then
+    validate_domain "${PREVIEW_PUBLIC_DOMAIN}" ||
+      die "PREVIEW_PUBLIC_DOMAIN must be a DNS host name"
+    PREVIEW_PUBLIC_DOMAIN=$(printf '%s' "${PREVIEW_PUBLIC_DOMAIN}" | tr '[:upper:]' '[:lower:]')
+    [[ ${PREVIEW_PUBLIC_DOMAIN} != "${PUBLIC_DOMAIN}" ]] ||
+      die "PREVIEW_PUBLIC_DOMAIN must differ from PUBLIC_DOMAIN"
+    trusted_origins=${trusted_origins},https://${PREVIEW_PUBLIC_DOMAIN}
+  fi
   validate_boolean "${CHECKS_ENABLED}" || die "CHECKS_ENABLED must be true or false"
   validate_bounded_integer "${CHECKS_STALE_AFTER_SECONDS}" 1 86400 ||
     die "CHECKS_STALE_AFTER_SECONDS must be an integer from 1 through 86400"
@@ -771,7 +780,7 @@ write_runtime_material() {
     'AUTO_CREATE_SCHEMA=false' \
     'MIGRATE_ON_START=true' \
     'BOOTSTRAP_TOKEN_FILE=/data/bootstrap-token' \
-    "TRUSTED_ORIGINS=https://${PUBLIC_DOMAIN}" \
+    "TRUSTED_ORIGINS=${trusted_origins}" \
     'COOKIE_SECURE=true' \
     "TRUSTED_PROXY_CIDRS=127.0.0.0/8,::1/128,${WEB_IP}/32" \
     "SYNC_ENABLED=${sync_enabled}" \
@@ -1366,6 +1375,7 @@ readonly POLICY_GITHUB_REPOSITORY POLICY_NODE_NAME HOST_PORT API_HOST_PORT EDGE_
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 COMPONENT=${ALERT_HUB_COMPONENT:?ALERT_HUB_COMPONENT is required}
 APP_NAME=${APP_NAME:-Alert Hub}
+PREVIEW_PUBLIC_DOMAIN=${PREVIEW_PUBLIC_DOMAIN:-}
 CHECKS_ENABLED=${CHECKS_ENABLED:-false}
 CHECKS_STALE_AFTER_SECONDS=${CHECKS_STALE_AFTER_SECONDS:-180}
 CHECKS_MIN_FAILURE_SOURCES=${CHECKS_MIN_FAILURE_SOURCES:-1}

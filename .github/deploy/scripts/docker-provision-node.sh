@@ -16,6 +16,7 @@ readonly SUDOERS_FILE=${SUDOERS_DIRECTORY}/alert-hub-deploy
 readonly POLICY_FILE=${CONFIG_ROOT}/deploy-policy.env
 readonly COMPOSE_FILE=${CONFIG_ROOT}/docker-compose.production.yml
 readonly MONITORING_COMPOSE_FILE=${CONFIG_ROOT}/docker-compose.production-monitoring.yml
+readonly PREVIEW_COMPOSE_FILE=${CONFIG_ROOT}/docker-compose.preview.yml
 readonly LOCK_FILE=${INSTALL_ROOT}/.deploy.lock
 readonly PROXY_INSTALLER_FILE=${INSTALL_SBIN}/install-proxy-config.sh
 readonly BACKUP_TOOL_FILE=${INSTALL_SBIN}/alert-hub-backup
@@ -390,7 +391,7 @@ prepare_backup_directory() {
 write_sudoers_candidate() {
   local target=$1 runner_user=$2
   local preserved_environment
-  preserved_environment='NODE_NAME NODE_IP PUBLIC_DOMAIN PEER_PUBLIC_URL ALERT_HUB_VERSION ALERT_HUB_COMPONENT ALERT_HUB_API_IMAGE ALERT_HUB_WEB_IMAGE ALERT_HUB_RELEASE_COMPATIBILITY CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY GHCR_TOKEN GITHUB_ACTOR GITHUB_REPOSITORY APP_NAME PEER_URLS PEER_ALLOWED_CIDRS VAPID_PUBLIC_KEY CHECKS_ENABLED CHECKS_STALE_AFTER_SECONDS CHECKS_MIN_FAILURE_SOURCES CHECKS_GRAFANA_BASE_URL CHECKS_CACHE_TTL_SECONDS CHECKS_FUTURE_TOLERANCE_SECONDS CHECKS_MAX_SERIES ALERT_HUB_ROLLBACK_VERSION ALERT_HUB_CONFIRMATION'
+  preserved_environment='NODE_NAME NODE_IP PUBLIC_DOMAIN PREVIEW_PUBLIC_DOMAIN PEER_PUBLIC_URL ALERT_HUB_VERSION ALERT_HUB_COMPONENT ALERT_HUB_API_IMAGE ALERT_HUB_WEB_IMAGE ALERT_HUB_RELEASE_COMPATIBILITY ALERT_HUB_PREVIEW_IMAGE ALERT_HUB_PREVIEW_REVISION ALERT_HUB_PREVIEW_COMPATIBILITY CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY GHCR_TOKEN GITHUB_ACTOR GITHUB_REPOSITORY APP_NAME PEER_URLS PEER_ALLOWED_CIDRS VAPID_PUBLIC_KEY CHECKS_ENABLED CHECKS_STALE_AFTER_SECONDS CHECKS_MIN_FAILURE_SOURCES CHECKS_GRAFANA_BASE_URL CHECKS_CACHE_TTL_SECONDS CHECKS_FUTURE_TOLERANCE_SECONDS CHECKS_MAX_SERIES ALERT_HUB_ROLLBACK_VERSION ALERT_HUB_CONFIRMATION'
   printf '%s\n' \
     '# Managed by Alert Hub. Runner registration is intentionally separate.' \
     "Defaults:${runner_user} !requiretty" \
@@ -398,6 +399,7 @@ write_sudoers_candidate() {
     "Defaults:${runner_user} secure_path=${PATH}" \
     "Defaults:${runner_user} env_keep += \"${preserved_environment}\"" \
     "${runner_user} ALL=(root) NOPASSWD: ${INSTALL_SBIN}/docker-deploy-node.sh \"\"" \
+    "${runner_user} ALL=(root) NOPASSWD: ${INSTALL_SBIN}/docker-deploy-preview-node.sh \"\"" \
     "${runner_user} ALL=(root) NOPASSWD: ${INSTALL_SBIN}/docker-rollback-node.sh \"\"" \
     "${runner_user} ALL=(root) NOPASSWD: ${INSTALL_SBIN}/docker-status-node.sh \"\"" \
     >"${target}"
@@ -410,11 +412,13 @@ validate_compose_sources() {
   local -a compose_environment=(
     ALERT_HUB_API_IMAGE="ghcr.io/invalid/alert-hub-api@${zero_digest}"
     ALERT_HUB_WEB_IMAGE="ghcr.io/invalid/alert-hub-web@${zero_digest}"
+    ALERT_HUB_PREVIEW_WEB_IMAGE="ghcr.io/invalid/alert-hub-web@${zero_digest}"
     ALERT_HUB_ENV_FILE="${temporary_env}"
     ALERT_HUB_DATA_DIR=/tmp
     ALERT_HUB_SECRETS_DIR=/tmp
     ALERT_HUB_HOST_PORT="${HOST_PORT}"
     ALERT_HUB_API_HOST_PORT="${API_HOST_PORT:-${DEFAULT_API_HOST_PORT}}"
+    ALERT_HUB_PREVIEW_HOST_PORT=18083
     ALERT_HUB_API_IP="${API_IP}"
     ALERT_HUB_WEB_IP="${WEB_IP}"
     ALERT_HUB_EDGE_SUBNET="${EDGE_SUBNET}"
@@ -427,6 +431,9 @@ validate_compose_sources() {
   env "${compose_environment[@]}" docker compose \
     --file "${source_root}/.github/deploy/docker-compose.production.yml" \
     --file "${source_root}/.github/deploy/docker-compose.production-monitoring.yml" \
+    config --quiet
+  env "${compose_environment[@]}" docker compose \
+    --file "${source_root}/.github/deploy/docker-compose.preview.yml" \
     config --quiet
 }
 
@@ -617,7 +624,9 @@ done
 for relative_path in \
   .github/deploy/docker-compose.production.yml \
   .github/deploy/docker-compose.production-monitoring.yml \
+  .github/deploy/docker-compose.preview.yml \
   .github/deploy/scripts/docker-deploy-node.sh \
+  .github/deploy/scripts/docker-deploy-preview-node.sh \
   .github/deploy/scripts/docker-rollback-node.sh \
   .github/deploy/scripts/docker-status-node.sh \
   .github/deploy/scripts/docker-provision-node.sh \
@@ -625,7 +634,7 @@ for relative_path in \
   deploy/scripts/install-proxy-config.sh; do
   require_root_controlled_file "${SOURCE_ROOT}/${relative_path}" "reviewed deployment source"
 done
-for script_name in docker-deploy-node.sh docker-rollback-node.sh docker-status-node.sh docker-provision-node.sh; do
+for script_name in docker-deploy-node.sh docker-deploy-preview-node.sh docker-rollback-node.sh docker-status-node.sh docker-provision-node.sh; do
   bash -n "${SOURCE_ROOT}/.github/deploy/scripts/${script_name}" || die "deployment script syntax validation failed: ${script_name}"
 done
 bash -n "${SOURCE_ROOT}/deploy/scripts/install-proxy-config.sh" ||
@@ -683,8 +692,14 @@ stage_boundary_file \
   "${SOURCE_ROOT}/.github/deploy/docker-compose.production-monitoring.yml" \
   "${MONITORING_COMPOSE_FILE}" 644 "production monitoring Compose override"
 stage_boundary_file \
+  "${SOURCE_ROOT}/.github/deploy/docker-compose.preview.yml" \
+  "${PREVIEW_COMPOSE_FILE}" 644 "preview Compose file"
+stage_boundary_file \
   "${SOURCE_ROOT}/.github/deploy/scripts/docker-deploy-node.sh" \
   "${INSTALL_SBIN}/docker-deploy-node.sh" 755 "deployment engine"
+stage_boundary_file \
+  "${SOURCE_ROOT}/.github/deploy/scripts/docker-deploy-preview-node.sh" \
+  "${INSTALL_SBIN}/docker-deploy-preview-node.sh" 755 "preview deployment engine"
 stage_boundary_file \
   "${SOURCE_ROOT}/.github/deploy/scripts/docker-rollback-node.sh" \
   "${INSTALL_SBIN}/docker-rollback-node.sh" 755 "rollback wrapper"
