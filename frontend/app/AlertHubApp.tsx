@@ -8150,6 +8150,7 @@ function ClusterPage({
   const reportedLags = nodes.flatMap((node) => node.syncLag ?? []);
   const selectedNodes = nodes.filter((node) => selectedNodeIds.has(node.id));
   const allNodesSelected = nodes.length > 0 && selectedNodes.length === nodes.length;
+  const enabledApiAlerts = nodes.filter((node) => node.apiDownAlertEnabled).length;
   const updateApiDownAlerts = async (nodeIds: string[], enabled: boolean) => {
     if (readOnly || alertBusy || !nodeIds.length) return;
     setAlertBusy(true);
@@ -8246,19 +8247,29 @@ function ClusterPage({
         eyebrow={tr("Контроль доступности", "Availability monitoring")}
         title={tr("Алерты о падении API", "API-down alerts")}
         action={
-          <span className="cluster-api-alerts__count">
-            {tr("Включено", "Enabled")}: {nodes.filter((node) => node.apiDownAlertEnabled).length}/
-            {nodes.length}
+          <span
+            className={`cluster-api-alerts__count ${nodes.length > 0 && enabledApiAlerts === nodes.length ? "cluster-api-alerts__count--complete" : ""}`}
+          >
+            <span aria-hidden="true" />
+            <b>
+              {enabledApiAlerts}/{nodes.length}
+            </b>{" "}
+            {tr("узлов под защитой", "nodes protected")}
           </span>
         }
       >
         <div className="cluster-api-alerts__body">
-          <p>
-            {tr(
-              "После трёх подряд ошибок живой peer создаст critical-инцидент и отправит его по обычным маршрутам уведомлений. Для мониторинга нужен хотя бы один другой настроенный узел.",
-              "After three consecutive failures, a live peer creates a critical incident and sends it through the normal notification routes. Monitoring requires at least one other configured node.",
-            )}
-          </p>
+          <div className="cluster-api-alerts__intro">
+            <span className="cluster-api-alerts__icon">
+              <Icon symbol="bell" />
+            </span>
+            <p>
+              {tr(
+                "После трёх подряд ошибок живой peer создаст critical-инцидент и отправит его по обычным маршрутам уведомлений. Для мониторинга нужен хотя бы один другой настроенный узел.",
+                "After three consecutive failures, a live peer creates a critical incident and sends it through the normal notification routes. Monitoring requires at least one other configured node.",
+              )}
+            </p>
+          </div>
           <div className="cluster-api-alerts__actions">
             <button
               className="button button--quiet button--small"
@@ -8275,37 +8286,39 @@ function ClusterPage({
                 ? tr("Снять выбор", "Clear selection")
                 : tr("Выбрать все", "Select all")}
             </button>
-            <span>
+            <span className="cluster-api-alerts__selected-count" aria-live="polite">
               {tr("Выбрано", "Selected")}: <b>{selectedNodes.length}</b>
             </span>
-            <button
-              className="button button--primary button--small"
-              type="button"
-              disabled={readOnly || alertBusy || !selectedNodes.length}
-              onClick={() =>
-                void updateApiDownAlerts(
-                  selectedNodes.map((node) => node.id),
-                  true,
-                )
-              }
-            >
-              {alertBusy
-                ? tr("Сохраняем…", "Saving…")
-                : tr("Включить выбранным", "Enable selected")}
-            </button>
-            <button
-              className="button button--quiet button--small"
-              type="button"
-              disabled={readOnly || alertBusy || !selectedNodes.length}
-              onClick={() =>
-                void updateApiDownAlerts(
-                  selectedNodes.map((node) => node.id),
-                  false,
-                )
-              }
-            >
-              {tr("Выключить выбранным", "Disable selected")}
-            </button>
+            <span className="cluster-api-alerts__bulk-actions">
+              <button
+                className="button button--primary button--small"
+                type="button"
+                disabled={readOnly || alertBusy || !selectedNodes.length}
+                onClick={() =>
+                  void updateApiDownAlerts(
+                    selectedNodes.map((node) => node.id),
+                    true,
+                  )
+                }
+              >
+                {alertBusy
+                  ? tr("Сохраняем…", "Saving…")
+                  : tr("Включить выбранным", "Enable selected")}
+              </button>
+              <button
+                className="button button--quiet button--small button--deactivate"
+                type="button"
+                disabled={readOnly || alertBusy || !selectedNodes.length}
+                onClick={() =>
+                  void updateApiDownAlerts(
+                    selectedNodes.map((node) => node.id),
+                    false,
+                  )
+                }
+              >
+                {tr("Выключить выбранным", "Disable selected")}
+              </button>
+            </span>
           </div>
         </div>
       </Panel>
@@ -8321,7 +8334,7 @@ function ClusterPage({
         {nodes.map((node) => (
           <Panel
             key={node.id}
-            className={`node-card ${focusedNodeId === node.id ? "node-card--selected" : ""}`}
+            className={`node-card ${focusedNodeId === node.id ? "node-card--selected" : ""} ${selectedNodeIds.has(node.id) ? "node-card--checked" : ""}`}
           >
             <button
               className="node-card__select"
@@ -8375,7 +8388,9 @@ function ClusterPage({
                 {tr("Выбрать", "Select")}
               </label>
               <code>{node.version}</code>
-              <span className="node-api-alert-control">
+              <span
+                className={`node-api-alert-control ${node.apiDownAlertEnabled ? "node-api-alert-control--enabled" : ""}`}
+              >
                 <span>
                   <b>{tr("Алерт API", "API alert")}</b>
                   <small>
@@ -8384,17 +8399,12 @@ function ClusterPage({
                       : tr("выключен", "disabled")}
                   </small>
                 </span>
-                <button
-                  className={`toggle ${node.apiDownAlertEnabled ? "toggle--on" : ""}`}
-                  type="button"
-                  role="switch"
-                  aria-checked={node.apiDownAlertEnabled}
-                  aria-label={`${tr("Алерт о падении API для", "API-down alert for")} ${node.name}`}
+                <Toggle
+                  checked={node.apiDownAlertEnabled}
+                  label={`${tr("Алерт о падении API для", "API-down alert for")} ${node.name}`}
                   disabled={readOnly || alertBusy}
-                  onClick={() => void updateApiDownAlerts([node.id], !node.apiDownAlertEnabled)}
-                >
-                  <span />
-                </button>
+                  onChange={(checked) => void updateApiDownAlerts([node.id], checked)}
+                />
               </span>
             </div>
           </Panel>
@@ -8733,13 +8743,19 @@ function Toggle({
   return (
     <button
       className={`toggle ${checked ? "toggle--on" : ""}`}
+      type="button"
       role="switch"
       aria-checked={checked}
       aria-label={label}
       onClick={() => onChange(!checked)}
       disabled={disabled}
     >
-      <span />
+      <span className="toggle__state" aria-hidden="true">
+        {checked ? tr("ВКЛ", "ON") : tr("ВЫКЛ", "OFF")}
+      </span>
+      <span className="toggle__thumb" aria-hidden="true">
+        {checked ? "✓" : "–"}
+      </span>
     </button>
   );
 }
