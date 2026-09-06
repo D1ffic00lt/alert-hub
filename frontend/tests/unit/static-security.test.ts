@@ -42,6 +42,7 @@ describe("static SPA security contract", () => {
     expect(nginx).toContain("server alert-hub:8080;");
     expect(nginx).toContain("auth_request /_api_ready;");
     expect(nginx).toContain("return 503");
+    expect(nginx).not.toContain("proxy_connect_timeout 5s;");
     expect(nginx).toContain("error_page 500 502 503 504 =503 /service-unavailable.html;");
     expect(nginx).toContain("location = /service-unavailable.html");
     expect(nginx).toMatch(/location = \/service-unavailable\.html \{\s+internal;/);
