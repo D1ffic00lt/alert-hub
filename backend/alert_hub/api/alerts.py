@@ -260,7 +260,7 @@ async def alert_rules(
     state: AlertRuleFilter | None = None,
     q: str | None = Query(default=None, max_length=200),
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=25, ge=1, le=200),
+    page_size: int = Query(default=200, ge=1, le=200),
     db: Session = Depends(get_db),
     prometheus: PrometheusClient = Depends(get_prometheus_client),
     user: User = Depends(current_user),

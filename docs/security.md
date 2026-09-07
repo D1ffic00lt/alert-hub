@@ -149,9 +149,11 @@ job globs; one invalid navigation convenience never discards the rest of the mon
 Use exact HTTPS origins. Wildcard CORS with credentials is rejected. Refresh and logout require one exact allowed `Origin` plus the matching double-submit CSRF value; a missing Origin is not accepted. Authenticated responses expose `X-Alert-Hub-Cache-Partition`, and CORS permits/exposes that header so the service worker can keep session cache namespaces separate. Permission for browser notifications must be requested only from a direct user gesture in an installed Home Screen PWA; do not attempt silent push.
 
 The SPA revalidates an authenticated session when a backgrounded tab becomes visible or focused.
-An access-token `401` performs a single-flight refresh and retries the pending request. One rejected
-refresh is confirmed once before credentials and session-partitioned caches are cleared, preventing
-a transient response or cross-tab refresh race from displaying the login screen. Network and 5xx
+An access-token `401` performs a single-flight refresh and retries the pending request. Supporting
+browsers also serialize refresh-cookie rotation across same-origin tabs with an exclusive Web Lock;
+access tokens still stay in each tab's memory and are never copied through storage or a broadcast
+channel. One rejected refresh is confirmed once before credentials and session-partitioned caches
+are cleared, which remains the bounded fallback for browsers without Web Locks. Network and 5xx
 refresh failures leave the current identity intact; only two consecutive authentication rejections,
 explicit logout/revocation, or another definitive server rejection ends the frontend session.
 
