@@ -3827,7 +3827,7 @@ summary:focus-visible {
   font-size: 8px;
 }
 .endpoint-list {
-  margin: 0 17px;
+  margin: 0 17px 12px;
   border: 1px solid var(--line);
   border-radius: 9px;
   overflow: hidden;

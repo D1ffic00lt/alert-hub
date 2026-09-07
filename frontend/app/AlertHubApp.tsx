@@ -3318,8 +3318,8 @@ function iconArtwork(name: string): ReactNode | null {
     case "refresh":
       return (
         <>
-          <path d="M20 7v5h-5" />
-          <path d="M18.5 16a8 8 0 1 1 .8-8L20 12" />
+          <path d="M19 6v5h-5" />
+          <path d="M17.7 16.6a7.5 7.5 0 1 1 .8-9L19 11" />
         </>
       );
     case "bell":
@@ -3516,7 +3516,7 @@ function AuthGate({
   const [mode, setMode] = useState<"login" | "bootstrap">(
     bootstrapSuggested ? "bootstrap" : "login",
   );
-  const [username, setUsername] = useState("admin");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [bootstrapToken, setBootstrapToken] = useState("");
@@ -3787,7 +3787,6 @@ function Sidebar({
   incidents,
   nodes,
   operator,
-  checksVisible,
 }: {
   route: RouteId;
   navigate: (path: string) => void;
@@ -3796,7 +3795,6 @@ function Sidebar({
   incidents: Incident[];
   nodes: ClusterNode[];
   operator: string;
-  checksVisible: boolean;
 }) {
   const activeIncidents = incidents.filter((item) => item.status !== "resolved").length;
   const healthyNodes = nodes.filter((item) => item.health === "healthy").length;
@@ -3822,26 +3820,24 @@ function Sidebar({
       </div>
       <nav className="sidebar__nav" aria-label={tr("Основная навигация", "Primary navigation")}>
         <span className="sidebar__section-label">{tr("Мониторинг", "Operations")}</span>
-        {NAV_ITEMS.slice(0, 7)
-          .filter((item) => item.id !== "checks" || checksVisible)
-          .map((item) => (
-            <button
-              key={item.id}
-              className={
-                route === item.id ||
-                (route === "incident" && item.id === "incidents") ||
-                (route === "check" && item.id === "checks")
-                  ? "active"
-                  : ""
-              }
-              onClick={() => navigate(item.path)}
-              title={collapsed ? item.label : undefined}
-            >
-              <Icon symbol={item.icon} />
-              <span>{item.label}</span>
-              {item.id === "incidents" && <em>{activeIncidents}</em>}
-            </button>
-          ))}
+        {NAV_ITEMS.slice(0, 7).map((item) => (
+          <button
+            key={item.id}
+            className={
+              route === item.id ||
+              (route === "incident" && item.id === "incidents") ||
+              (route === "check" && item.id === "checks")
+                ? "active"
+                : ""
+            }
+            onClick={() => navigate(item.path)}
+            title={collapsed ? item.label : undefined}
+          >
+            <Icon symbol={item.icon} />
+            <span>{item.label}</span>
+            {item.id === "incidents" && <em>{activeIncidents}</em>}
+          </button>
+        ))}
         <span className="sidebar__section-label">{tr("Управление", "Manage")}</span>
         {NAV_ITEMS.slice(7).map((item) => (
           <button
@@ -3931,13 +3927,11 @@ function MobileDrawer({
   route,
   navigate,
   onClose,
-  checksVisible,
 }: {
   open: boolean;
   route: RouteId;
   navigate: (path: string) => void;
   onClose: () => void;
-  checksVisible: boolean;
 }) {
   if (!open) return null;
   return (
@@ -3958,7 +3952,7 @@ function MobileDrawer({
           </button>
         </div>
         <nav>
-          {NAV_ITEMS.filter((item) => item.id !== "checks" || checksVisible).map((item) => (
+          {NAV_ITEMS.map((item) => (
             <button
               key={item.id}
               className={
@@ -4572,7 +4566,6 @@ function AlertHubRuntime() {
               ? tr("офлайн · только чтение", "offline · read-only")
               : tr("демо-режим", "demo-preview")
         }
-        checksVisible={checksVisible}
       />
       <div className="app-frame">
         <AppHeader
@@ -4603,7 +4596,6 @@ function AlertHubRuntime() {
         route={route.id}
         navigate={navigate}
         onClose={() => setMobileMenu(false)}
-        checksVisible={checksVisible}
       />
       {sourceWizard && (
         <SourceWizard
