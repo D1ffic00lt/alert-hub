@@ -635,6 +635,33 @@ def test_valid_production_settings_and_unsafe_origin_cookie_shapes(tmp_path: Pat
         Settings(peer_urls=["https://*.peer.example"])
 
 
+def test_client_failover_uses_the_ui_origin_for_cors_and_shared_cookie_scope(
+    tmp_path: Path,
+) -> None:
+    settings = _production_settings(
+        tmp_path,
+        api_ha_mode="client-failover",
+        public_ui_url="https://alerts.example",
+        public_api_url="https://api-ru.alerts.example",
+        public_ingest_url="https://ingest.alerts.example",
+        trusted_origins=["https://alerts.example"],
+        cookie_domain="alerts.example",
+    )
+    _validate_production_settings(settings)
+
+    missing_ui = settings.model_copy(update={"public_ui_url": None})
+    with pytest.raises(RuntimeError, match="PUBLIC_UI_URL is required"):
+        _validate_production_settings(missing_ui)
+
+    missing_cookie_scope = settings.model_copy(update={"cookie_domain": None})
+    with pytest.raises(RuntimeError, match="COOKIE_DOMAIN is required"):
+        _validate_production_settings(missing_cookie_scope)
+
+    wrong_ui_origin = settings.model_copy(update={"trusted_origins": ["https://other.example"]})
+    with pytest.raises(RuntimeError, match="PUBLIC_UI_URL origin"):
+        _validate_production_settings(wrong_ui_origin)
+
+
 def test_peer_public_url_requirement_tracks_sync_participation(tmp_path: Path) -> None:
     standalone = _production_settings(
         tmp_path,

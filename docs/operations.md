@@ -23,10 +23,12 @@ public proxy examples deny `/health/deep`, `/metrics`, API documentation, and `/
 `404`. Query or scrape those operator surfaces through loopback/private paths; never publish a
 separate metrics port.
 
-After a previously healthy web container loses its local API, browser navigation returns a
-self-contained outage screen with HTTP `503`; API, ingest, health, and metrics clients continue to
-receive the compact JSON `503`. The screen retries every 10 seconds and requires neither the React
-bundle nor a working API. The failed process cannot report its own complete outage. A different
+In `single` and `external` mode, after a previously healthy web container loses its local API,
+browser navigation returns a self-contained outage screen with HTTP `503`; API, ingest, health,
+and metrics clients continue to receive the compact JSON `503`. In `client-failover` and
+`proxy-failover`, the web shell remains available and reports endpoint selection while the browser
+or outer proxy selects a reserve API. See [Frontend API high availability](api-ha.md) for the
+failure and no-mutation-replay contract. The failed process cannot report its own complete outage. A different
 Alert Hub node can do so through the peer watcher described below; Prometheus or another external
 watcher is still required when no configured peer remains alive, before an endpoint has ever
 proved its node identity, or when the entire cluster is unavailable.

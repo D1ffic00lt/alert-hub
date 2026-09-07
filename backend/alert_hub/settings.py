@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from alert_hub.domain.monitoring import normalize_grafana_url
@@ -103,7 +103,13 @@ class Settings(BaseSettings):
     node_id: str = "local-node"
     node_name: str = "Local node"
     node_region: str = "local"
-    public_api_url: str | None = None
+    api_ha_mode: Literal["single", "client-failover", "proxy-failover", "external"] = "single"
+    public_ui_url: str | None = None
+    public_api_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("NODE_PUBLIC_API_URL", "PUBLIC_API_URL"),
+    )
+    public_ingest_url: str | None = None
     private_peer_url: str | None = Field(
         default=None,
         validation_alias=AliasChoices("PEER_PUBLIC_URL", "PRIVATE_PEER_URL"),
@@ -335,6 +341,14 @@ class Settings(BaseSettings):
         netloc = host if parsed_port is None else f"{host}:{parsed_port}"
         path = parsed.path.rstrip("/")
         return urlunsplit((parsed.scheme.lower(), netloc.lower(), path, "", ""))
+
+    @field_validator("public_ui_url", "public_ingest_url")
+    @classmethod
+    def validate_public_origins(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        field_name = (info.field_name or "public URL").upper()
+        return _normalize_peer_origin(value, label=field_name)
 
     @field_validator("private_peer_url")
     @classmethod

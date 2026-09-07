@@ -323,6 +323,38 @@ validate_https_origin() {
   validate_domain "${host}"
 }
 
+validate_https_origin_list() {
+  local raw=$1 item
+  local count=0
+  local -A seen=()
+  local -a items=()
+
+  IFS=, read -r -a items <<<"${raw}"
+  for item in "${items[@]}"; do
+    [[ -n ${item} && ${item} != *[[:space:]]* ]] || return 1
+    validate_https_origin "${item}" || return 1
+    [[ -z ${seen[${item}]:-} ]] || return 1
+    seen[${item}]=1
+    count=$((count + 1))
+    ((count <= 8)) || return 1
+  done
+  ((count > 0))
+}
+
+https_origin_host() {
+  local authority=${1#https://}
+
+  printf '%s\n' "${authority%%:*}" | tr '[:upper:]' '[:lower:]'
+}
+
+cookie_domain_contains_origin() {
+  local cookie_domain=$1 origin=$2 host
+
+  cookie_domain=$(printf '%s' "${cookie_domain}" | tr '[:upper:]' '[:lower:]')
+  host=$(https_origin_host "${origin}")
+  [[ ${host} == "${cookie_domain}" || ${host} == *."${cookie_domain}" ]]
+}
+
 validate_single_line() {
   [[ $1 != *$'\n'* && $1 != *$'\r'* ]]
 }
@@ -705,7 +737,8 @@ derive_cluster_secret() {
 }
 
 write_runtime_material() {
-  local master_key cluster_bearer deployment_smoke_token sync_enabled temporary trusted_origins
+  local master_key cluster_bearer deployment_smoke_token sync_enabled temporary trusted_origins candidate
+  local -a browser_cookie_origins=() candidates=()
 
   secret_is_acceptable CLUSTER_MASTER_KEY "${CLUSTER_MASTER_KEY}"
   secret_is_acceptable SESSION_SIGNING_KEY "${SESSION_SIGNING_KEY}"
@@ -735,7 +768,32 @@ write_runtime_material() {
   validate_single_line "${VAPID_PUBLIC_KEY:-}" || die "VAPID_PUBLIC_KEY must be a single line"
   validate_single_line "${APP_NAME}" || die "APP_NAME must be a single line"
   [[ -n ${APP_NAME} && ${#APP_NAME} -le 80 ]] || die "APP_NAME must contain 1 to 80 characters"
-  trusted_origins=https://${PUBLIC_DOMAIN}
+  validate_https_origin "${PUBLIC_UI_URL}" ||
+    die "PUBLIC_UI_URL must be an exact HTTPS origin with a DNS host and no path"
+  validate_https_origin "${NODE_PUBLIC_API_URL}" ||
+    die "NODE_PUBLIC_API_URL must be an exact HTTPS origin with a DNS host and no path"
+  validate_https_origin "${PUBLIC_INGEST_URL}" ||
+    die "PUBLIC_INGEST_URL must be an exact HTTPS origin with a DNS host and no path"
+  case "${API_HA_MODE}" in
+    single | client-failover | proxy-failover | external) ;;
+    *) die "API_HA_MODE is invalid" ;;
+  esac
+  validate_https_origin_list "${PUBLIC_API_CANDIDATES}" ||
+    die "PUBLIC_API_CANDIDATES must contain 1 to 8 comma-separated HTTPS origins"
+  if [[ ${API_HA_MODE} == client-failover ]]; then
+    [[ -n ${COOKIE_DOMAIN} ]] || die "COOKIE_DOMAIN is required for client-failover"
+    [[ ${COOKIE_DOMAIN} != *[/:@[:space:]]* && ${COOKIE_DOMAIN} == *.* ]] ||
+      die "COOKIE_DOMAIN must be a shared parent DNS domain"
+    validate_domain "${COOKIE_DOMAIN}" || die "COOKIE_DOMAIN must be a shared parent DNS domain"
+    browser_cookie_origins=("${PUBLIC_UI_URL}" "${NODE_PUBLIC_API_URL}" "${PUBLIC_INGEST_URL}")
+    IFS=, read -r -a candidates <<<"${PUBLIC_API_CANDIDATES}"
+    browser_cookie_origins+=("${candidates[@]}")
+    for candidate in "${browser_cookie_origins[@]}"; do
+      cookie_domain_contains_origin "${COOKIE_DOMAIN}" "${candidate}" ||
+        die "COOKIE_DOMAIN must contain every browser API, UI, and ingest host"
+    done
+  fi
+  trusted_origins=${PUBLIC_UI_URL}
   if [[ -n ${PREVIEW_PUBLIC_DOMAIN} ]]; then
     validate_domain "${PREVIEW_PUBLIC_DOMAIN}" ||
       die "PREVIEW_PUBLIC_DOMAIN must be a DNS host name"
@@ -774,7 +832,12 @@ write_runtime_material() {
     "NODE_NAME=${NODE_NAME}" \
     "NODE_REGION=${NODE_NAME}" \
     "DEPLOYMENT_NODE_IP=${NODE_IP}" \
-    "PUBLIC_API_URL=https://${PUBLIC_DOMAIN}" \
+    "API_HA_MODE=${API_HA_MODE}" \
+    "PUBLIC_UI_URL=${PUBLIC_UI_URL}" \
+    "NODE_PUBLIC_API_URL=${NODE_PUBLIC_API_URL}" \
+    "PUBLIC_API_URL=${NODE_PUBLIC_API_URL}" \
+    "PUBLIC_INGEST_URL=${PUBLIC_INGEST_URL}" \
+    "PUBLIC_API_CANDIDATES=${PUBLIC_API_CANDIDATES}" \
     "PRIVATE_PEER_URL=${PEER_PUBLIC_URL}" \
     'DATABASE_URL=sqlite:////data/alert-hub.db' \
     'AUTO_CREATE_SCHEMA=false' \
@@ -782,6 +845,7 @@ write_runtime_material() {
     'BOOTSTRAP_TOKEN_FILE=/data/bootstrap-token' \
     "TRUSTED_ORIGINS=${trusted_origins}" \
     'COOKIE_SECURE=true' \
+    "COOKIE_DOMAIN=${COOKIE_DOMAIN}" \
     "TRUSTED_PROXY_CIDRS=127.0.0.0/8,::1/128,${WEB_IP}/32" \
     "SYNC_ENABLED=${sync_enabled}" \
     "PEER_URLS=${PEER_URLS:-}" \
@@ -845,13 +909,22 @@ compose() {
   local api_ref=${1:-}
   local web_ref=${2:-}
   local migrate_on_start=$3
-  local runtime_app_name
+  local runtime_api_candidates runtime_api_ha_mode runtime_app_name runtime_node_public_api_url
   shift 3
 
   require_private_file "${APP_ENV_FILE}" 0 "runtime application config"
   runtime_app_name=$(state_value "${APP_ENV_FILE}" APP_NAME)
   validate_single_line "${runtime_app_name}" || die "runtime APP_NAME must be a single line"
   [[ -n ${runtime_app_name} && ${#runtime_app_name} -le 80 ]] || die "runtime APP_NAME must contain 1 to 80 characters"
+  runtime_api_ha_mode=$(state_value "${APP_ENV_FILE}" API_HA_MODE 2>/dev/null || printf '%s\n' single)
+  runtime_node_public_api_url=$(
+    state_value "${APP_ENV_FILE}" NODE_PUBLIC_API_URL 2>/dev/null ||
+      state_value "${APP_ENV_FILE}" PUBLIC_API_URL
+  )
+  runtime_api_candidates=$(
+    state_value "${APP_ENV_FILE}" PUBLIC_API_CANDIDATES 2>/dev/null ||
+      printf '%s\n' "${runtime_node_public_api_url}"
+  )
   env \
     ALERT_HUB_API_IMAGE="${api_ref:-${PLACEHOLDER_API}}" \
     ALERT_HUB_WEB_IMAGE="${web_ref:-${PLACEHOLDER_WEB}}" \
@@ -864,6 +937,9 @@ compose() {
     ALERT_HUB_WEB_IP="${WEB_IP}" \
     ALERT_HUB_EDGE_SUBNET="${EDGE_SUBNET}" \
     APP_NAME="${runtime_app_name}" \
+    API_HA_MODE="${runtime_api_ha_mode}" \
+    NODE_PUBLIC_API_URL="${runtime_node_public_api_url}" \
+    PUBLIC_API_CANDIDATES="${runtime_api_candidates}" \
     MIGRATE_ON_START="${migrate_on_start}" \
     MONITORING_NETWORK="${MONITORING_NETWORK}" \
     docker compose --project-name alert-hub "${COMPOSE_FILES[@]}" "$@"
@@ -1376,6 +1452,12 @@ readonly POLICY_GITHUB_REPOSITORY POLICY_NODE_NAME HOST_PORT API_HOST_PORT EDGE_
 COMPONENT=${ALERT_HUB_COMPONENT:?ALERT_HUB_COMPONENT is required}
 APP_NAME=${APP_NAME:-Alert Hub}
 PREVIEW_PUBLIC_DOMAIN=${PREVIEW_PUBLIC_DOMAIN:-}
+API_HA_MODE=${API_HA_MODE:-single}
+PUBLIC_UI_URL=${PUBLIC_UI_URL:-https://${PUBLIC_DOMAIN}}
+NODE_PUBLIC_API_URL=${NODE_PUBLIC_API_URL:-https://${PUBLIC_DOMAIN}}
+PUBLIC_INGEST_URL=${PUBLIC_INGEST_URL:-${NODE_PUBLIC_API_URL}}
+PUBLIC_API_CANDIDATES=${PUBLIC_API_CANDIDATES:-${NODE_PUBLIC_API_URL}}
+COOKIE_DOMAIN=${COOKIE_DOMAIN:-}
 CHECKS_ENABLED=${CHECKS_ENABLED:-false}
 CHECKS_STALE_AFTER_SECONDS=${CHECKS_STALE_AFTER_SECONDS:-180}
 CHECKS_MIN_FAILURE_SOURCES=${CHECKS_MIN_FAILURE_SOURCES:-1}

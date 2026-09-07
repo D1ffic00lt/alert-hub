@@ -8,10 +8,17 @@ import { describe, expect, it } from "vitest";
 
 const renderer = fileURLToPath(new URL("../../container/render-ui-runtime.sh", import.meta.url));
 
-function render(appName: string | undefined) {
+function render(appName: string | undefined, env: Record<string, string> = {}) {
   const destination = mkdtempSync(join(tmpdir(), "alert-hub-ui-"));
   execFileSync("/bin/sh", [renderer, destination], {
-    env: { ...process.env, APP_NAME: appName },
+    env: {
+      ...process.env,
+      APP_NAME: appName,
+      API_HA_MODE: "single",
+      NODE_PUBLIC_API_URL: "",
+      PUBLIC_API_CANDIDATES: "",
+      ...env,
+    },
   });
   return destination;
 }
@@ -41,8 +48,16 @@ describe("container UI runtime renderer", () => {
       vm.runInContext(script, context);
       const config = vm.runInContext("globalThis.__ALERT_HUB_CONFIG__", context) as {
         appName: string;
+        apiHaMode: string;
+        nodePublicApiUrl: string | null;
+        publicApiCandidates: string[];
       };
       expect(config.appName).toBe("North<script> Ops Line");
+      expect(config).toMatchObject({
+        apiHaMode: "single",
+        nodePublicApiUrl: null,
+        publicApiCandidates: [],
+      });
       expect(vm.runInContext("Object.isFrozen(globalThis.__ALERT_HUB_CONFIG__)", context)).toBe(
         true,
       );
@@ -70,6 +85,80 @@ describe("container UI runtime renderer", () => {
       expect(manifest.icons.map((icon) => icon.purpose)).toEqual(["any", "maskable"]);
       expect(statSync(scriptPath).mode & 0o777).toBe(0o444);
       expect(statSync(manifestPath).mode & 0o777).toBe(0o444);
+    } finally {
+      rmSync(destination, { recursive: true, force: true });
+    }
+  });
+
+  it("renders an immutable, server-owned client-failover candidate set", () => {
+    const destination = render("Alert Hub", {
+      API_HA_MODE: "client-failover",
+      NODE_PUBLIC_API_URL: "https://api-ru.alerts.example/",
+      PUBLIC_API_CANDIDATES:
+        "https://api-ru.alerts.example,https://api-nl.alerts.example,https://api-de.alerts.example",
+    });
+    try {
+      const script = readFileSync(join(destination, "runtime-config.js"), "utf8");
+      const context = vm.createContext({});
+      vm.runInContext(script, context);
+      const config = vm.runInContext("globalThis.__ALERT_HUB_CONFIG__", context) as {
+        apiHaMode: string;
+        nodePublicApiUrl: string;
+        publicApiCandidates: string[];
+      };
+      expect(config).toMatchObject({
+        apiHaMode: "client-failover",
+        nodePublicApiUrl: "https://api-ru.alerts.example",
+        publicApiCandidates: [
+          "https://api-ru.alerts.example",
+          "https://api-nl.alerts.example",
+          "https://api-de.alerts.example",
+        ],
+      });
+      expect(
+        vm.runInContext("Object.isFrozen(__ALERT_HUB_CONFIG__.publicApiCandidates)", context),
+      ).toBe(true);
+      expect(readFileSync(join(destination, "shell-guard.conf"), "utf8")).not.toContain(
+        "auth_request",
+      );
+    } finally {
+      rmSync(destination, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects unsafe or missing client-failover origins", () => {
+    expect(() =>
+      render("Alert Hub", {
+        API_HA_MODE: "client-failover",
+        PUBLIC_API_CANDIDATES: "https://api.example/path",
+      }),
+    ).toThrow();
+    expect(() =>
+      render("Alert Hub", {
+        API_HA_MODE: "client-failover",
+        PUBLIC_API_CANDIDATES: "https://api.example,https://api.example",
+      }),
+    ).toThrow();
+    expect(() => render("Alert Hub", { API_HA_MODE: "client-failover" })).toThrow();
+  });
+
+  it("can bootstrap client failover from the unique node API origin alone", () => {
+    const destination = render("Alert Hub", {
+      API_HA_MODE: "client-failover",
+      NODE_PUBLIC_API_URL: "https://api-ru.alerts.example",
+    });
+    try {
+      const script = readFileSync(join(destination, "runtime-config.js"), "utf8");
+      const context = vm.createContext({});
+      vm.runInContext(script, context);
+      const config = vm.runInContext("globalThis.__ALERT_HUB_CONFIG__", context) as {
+        nodePublicApiUrl: string;
+        publicApiCandidates: string[];
+      };
+      expect(config).toMatchObject({
+        nodePublicApiUrl: "https://api-ru.alerts.example",
+        publicApiCandidates: [],
+      });
     } finally {
       rmSync(destination, { recursive: true, force: true });
     }

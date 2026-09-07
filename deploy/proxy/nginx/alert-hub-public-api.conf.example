@@ -1,0 +1,83 @@
+# Dedicated browser/API virtual host for client-failover mode. Install one copy
+# on each node and replace the placeholders only after inventorying the existing
+# HTTPS proxy. This host intentionally exposes no UI, metrics, docs, or peer API.
+
+upstream alert_hub_browser_api {
+    server __API_UPSTREAM__;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name __API_SERVER_NAME__;
+
+    ssl_certificate /etc/letsencrypt/live/__API_SERVER_NAME__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__API_SERVER_NAME__/privkey.pem;
+
+    client_max_body_size 1m;
+    client_body_timeout 15s;
+    server_tokens off;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    location = /health/live {
+        proxy_pass http://alert_hub_browser_api;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    location = /health/ready {
+        proxy_pass http://alert_hub_browser_api;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    location = /api/v1/stream {
+        proxy_pass http://alert_hub_browser_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+    }
+
+    location ^~ /api/v1/ {
+        proxy_pass http://alert_hub_browser_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Request-ID $request_id;
+        proxy_connect_timeout 2s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    location ^~ /ingest/v1/ {
+        proxy_pass http://alert_hub_browser_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Request-ID $request_id;
+        proxy_connect_timeout 2s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    location ^~ /internal/ {
+        return 404;
+    }
+
+    location / {
+        return 404;
+    }
+}

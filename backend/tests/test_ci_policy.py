@@ -1476,7 +1476,15 @@ def test_compose_contract_has_only_independent_api_and_web_images() -> None:
         assert services["alert-hub-web"]["image"].startswith("${ALERT_HUB_WEB_IMAGE:")
         assert services["alert-hub"]["environment"]["BACKEND_PORT"] == "8080"
         assert services["alert-hub-web"]["depends_on"]["alert-hub"]["condition"] == (
-            "service_healthy"
+            "service_started"
+        )
+        assert (
+            services["alert-hub-web"]["environment"].items()
+            >= {
+                "API_HA_MODE": "${API_HA_MODE:-single}",
+                "NODE_PUBLIC_API_URL": "${NODE_PUBLIC_API_URL:-}",
+                "PUBLIC_API_CANDIDATES": "${PUBLIC_API_CANDIDATES:-}",
+            }.items()
         )
 
     for model in (default, split):
@@ -1683,7 +1691,7 @@ def test_preview_origin_is_optional_and_reaches_only_the_ru_api_deploy() -> None
     assert "PREVIEW_PUBLIC_DOMAIN" in checker.PRESERVABLE_ROOT_ENVIRONMENT
     assert "PREVIEW_PUBLIC_DOMAIN=${PREVIEW_PUBLIC_DOMAIN:-}" in deploy_engine
     assert 'validate_domain "${PREVIEW_PUBLIC_DOMAIN}"' in runtime
-    assert "trusted_origins=https://${PUBLIC_DOMAIN}" in runtime
+    assert "trusted_origins=${PUBLIC_UI_URL}" in runtime
     assert "trusted_origins=${trusted_origins},https://${PREVIEW_PUBLIC_DOMAIN}" in runtime
     assert '"TRUSTED_ORIGINS=${trusted_origins}"' in runtime
     assert "PREVIEW_PUBLIC_DOMAIN" in provisioner
@@ -1731,6 +1739,58 @@ def test_production_checks_settings_are_allowlisted_validated_and_snapshotted() 
     assert 'validate_bounded_decimal "${CHECKS_CACHE_TTL_SECONDS}" 0.1 5' in runtime
     assert 'validate_bounded_decimal "${CHECKS_FUTURE_TOLERANCE_SECONDS}" 0 300' in runtime
     assert 'validate_bounded_integer "${CHECKS_MAX_SERIES}" 1 100000' in runtime
+
+
+def test_api_ha_settings_and_proxy_surfaces_are_bounded_and_peer_free() -> None:
+    checker = _checker()
+    deploy_workflow = _workflow("deploy.yml")
+    deploy_engine = DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
+    runtime = _shell_function(deploy_engine, "write_runtime_material")
+    candidate_validator = _shell_function(deploy_engine, "validate_https_origin_list")
+    settings = {
+        "API_HA_MODE",
+        "PUBLIC_UI_URL",
+        "NODE_PUBLIC_API_URL",
+        "PUBLIC_INGEST_URL",
+        "PUBLIC_API_CANDIDATES",
+        "COOKIE_DOMAIN",
+    }
+
+    assert settings <= checker.PRESERVABLE_ROOT_ENVIRONMENT
+    assert 'validate_https_origin_list "${PUBLIC_API_CANDIDATES}"' in runtime
+    assert "[[ -z ${seen[${item}]:-} ]] || return 1" in candidate_validator
+    assert "[[ ${API_HA_MODE} == client-failover ]]" in runtime
+    assert 'cookie_domain_contains_origin "${COOKIE_DOMAIN}" "${candidate}"' in runtime
+    assert "COOKIE_DOMAIN must contain every browser API, UI, and ingest host" in runtime
+    assert '"NODE_PUBLIC_API_URL=${NODE_PUBLIC_API_URL}"' in runtime
+    assert '"PUBLIC_UI_URL=${PUBLIC_UI_URL}"' in runtime
+    assert '"PUBLIC_INGEST_URL=${PUBLIC_INGEST_URL}"' in runtime
+    assert '"COOKIE_DOMAIN=${COOKIE_DOMAIN}"' in runtime
+
+    for job_name in ("deploy_ru", "deploy_nl", "deploy_de"):
+        steps = deploy_workflow["jobs"][job_name]["steps"]
+        api_step = next(step for step in steps if step.get("if") == "inputs.component != 'web'")
+        assert settings <= api_step["env"].keys()
+        for setting in settings:
+            assert setting in api_step["run"]
+
+    for relative in (
+        "deploy/proxy/nginx/alert-hub-public-api.conf.example",
+        "deploy/proxy/caddy/Caddyfile.public-api.example",
+    ):
+        source = (REPOSITORY / relative).read_text(encoding="utf-8")
+        assert "/api/v1/" in source
+        assert "/ingest/v1/" in source
+        assert "/health/ready" in source
+        assert "/internal/" in source
+        assert "return 404" in source or "respond 404" in source
+        assert "/internal/v1/nodes/health" not in source
+        assert "/internal/v1/sync/events/query" not in source
+
+    nginx_pool = (REPOSITORY / "deploy/proxy/nginx/alert-hub-api-failover.conf.example").read_text(
+        encoding="utf-8"
+    )
+    assert "proxy_next_upstream non_idempotent" not in nginx_pool
 
 
 @pytest.mark.parametrize(

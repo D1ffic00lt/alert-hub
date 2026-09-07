@@ -88,8 +88,9 @@ stage, while the runtime contains static assets and unprivileged Nginx.
 
 Production deployment may update `api`, `web`, or both. A component-only update
 does not recreate its peer. If the API is unavailable, the web container stays
-running and returns `503` for application requests; it automatically recovers
-when the API becomes ready.
+running. It returns a guarded `503` in single mode or keeps the shell available
+for client/proxy failover when explicitly configured. See
+[Frontend API high availability](docs/api-ha.md).
 
 ## Development
 
