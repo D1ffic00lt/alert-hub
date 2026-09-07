@@ -80,6 +80,12 @@ failure_compose() {
 }
 
 cleanup() {
+  local exit_status=$?
+  if ((exit_status != 0)); then
+    printf '%s\n' 'Image matrix smoke failed; container diagnostics follow.' >&2
+    compose ps --all >&2 || true
+    compose logs --no-color --tail 200 alert-hub alert-hub-web >&2 || true
+  fi
   compose down --volumes --remove-orphans >/dev/null 2>&1 || true
   failure_compose down --volumes --remove-orphans >/dev/null 2>&1 || true
   if [[ ${smoke_root} == /tmp/alert-hub-image-matrix.* ]]; then
@@ -246,7 +252,10 @@ for _attempt in $(seq 1 60); do
   fi
   sleep 1
 done
-[[ ${recovered} == true ]]
+[[ ${recovered} == true ]] || {
+  printf '%s\n' 'Web did not recover after the stopped API restarted' >&2
+  exit 1
+}
 curl --fail --silent --show-error "${base_url}/" >/dev/null
 
 # Each component can be recreated independently when its compatibility label
@@ -268,8 +277,14 @@ for _attempt in $(seq 1 60); do
   fi
   sleep 1
 done
-[[ ${recovered} == true ]]
-[[ $(project_container_id "${project}" alert-hub-web) == "${web_after_web_update}" ]]
+[[ ${recovered} == true ]] || {
+  printf '%s\n' 'Web did not recover after the API container was recreated' >&2
+  exit 1
+}
+[[ $(project_container_id "${project}" alert-hub-web) == "${web_after_web_update}" ]] || {
+  printf '%s\n' 'Recreating API unexpectedly replaced the web container' >&2
+  exit 1
+}
 
 # A failed API entrypoint must never let the dependent web service start.
 failure_compose up --detach --no-build >/dev/null 2>&1 || true
@@ -278,7 +293,10 @@ failure_web=$(docker container ls --all --quiet \
   --filter "label=com.docker.compose.project=${failure_project}" \
   --filter "label=com.docker.compose.service=alert-hub-web")
 if [[ -n ${failure_web} ]]; then
-  [[ $(docker container inspect "${failure_web}" --format '{{.State.Running}}') != true ]]
+  [[ $(docker container inspect "${failure_web}" --format '{{.State.Running}}') != true ]] || {
+    printf '%s\n' 'Web container unexpectedly ran after the API entrypoint failed' >&2
+    exit 1
+  }
 fi
 
 printf '%s\n' \
