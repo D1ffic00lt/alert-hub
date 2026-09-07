@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal, cast
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -43,7 +43,7 @@ def decrypt_credentials(
 class DatasourceQueryResult:
     datasource_id: str
     datasource_name: str
-    reachability_label_mode: str
+    reachability_label_mode: Literal["canonical", "server"]
     samples: list[VectorSample]
 
 
@@ -60,7 +60,7 @@ class DatasourceQueryTarget:
     datasource_id: str
     datasource_name: str
     url: str
-    reachability_label_mode: str
+    reachability_label_mode: Literal["canonical", "server"]
     credentials: dict[str, Any]
 
 
@@ -116,7 +116,10 @@ def prepare_enabled_datasources(
                 datasource.id,
                 datasource.name,
                 datasource.url,
-                datasource.reachability_label_mode,
+                cast(
+                    Literal["canonical", "server"],
+                    datasource.reachability_label_mode,
+                ),
                 credentials,
             )
         )
@@ -137,6 +140,16 @@ async def query_datasource_targets(
         target: DatasourceQueryTarget,
     ) -> DatasourceQueryResult | DatasourceQueryFailure:
         async def execute() -> list[VectorSample]:
+            if query_name == "reachability":
+                return await client.query(
+                    target.url,
+                    target.credentials,
+                    query_name,
+                    job_globs=job_globs,
+                    reachability_label_mode=target.reachability_label_mode,
+                    evaluated_at=evaluated_at,
+                    allow_non_finite_values=allow_non_finite_values,
+                )
             return await client.query(
                 target.url,
                 target.credentials,
