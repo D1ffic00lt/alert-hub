@@ -2059,6 +2059,11 @@ summary:focus-visible {
   border-color: rgba(98, 230, 179, 0.17);
   color: var(--mint);
 }
+.timeline-icon--delivery_attempted {
+  background: var(--amber-dim);
+  border-color: rgba(244, 189, 98, 0.17);
+  color: var(--amber);
+}
 .timeline-icon--acknowledged {
   background: var(--amber-dim);
   border-color: rgba(244, 189, 98, 0.17);
@@ -8101,6 +8106,7 @@ button.checks-summary__item.active {
   color: var(--text-soft);
   cursor: pointer;
   text-align: left;
+  text-decoration: none;
 }
 
 .checks-problem-row:hover,
@@ -8593,6 +8599,22 @@ button.checks-summary__item.active {
   color: var(--muted-2) !important;
   font-size: 19px !important;
   text-align: center;
+}
+
+.checks-table__open a {
+  display: inline-flex;
+  min-width: 28px;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.checks-table__open a:focus-visible {
+  outline: 2px solid var(--mint);
+  outline-offset: 2px;
 }
 
 .checks-inline-warning {

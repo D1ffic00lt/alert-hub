@@ -1012,8 +1012,9 @@ def test_delivery_statistics_converge_from_original_receipts_despite_projection_
                 source_event.event_key = source_event_key
                 db.add(source_event)
 
-        # Node A sees terminal success first, so its mutable receipt projection
-        # intentionally rejects the late retryable failure. Node B sees causal order.
+        # Node A sees terminal success first. Its mutable Delivery projection must
+        # retain success while its immutable timeline still records the late
+        # retryable attempt. Node B sees causal order.
         with app_a.state.session_factory.begin() as db:
             assert apply_cluster_events(db, [succeeded], settings_a).applied == 1
         with app_a.state.session_factory.begin() as db:
@@ -1059,10 +1060,10 @@ def test_delivery_statistics_converge_from_original_receipts_despite_projection_
                     )
                 )
 
-    # The derived IncidentEvent timelines differ, while original append-only receipt
-    # history and therefore the statistics snapshot converge exactly.
+    # Both immutable timelines and the original receipt history converge exactly,
+    # regardless of the order in which the mutable Delivery projection was updated.
     assert delivery_timeline_types == [
-        {"delivery_succeeded"},
+        {"delivery_succeeded", "delivery_failed"},
         {"delivery_succeeded", "delivery_failed"},
     ]
     assert receipt_ids == [

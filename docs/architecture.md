@@ -159,13 +159,18 @@ branding, Web Push/Telegram headings, and SMTP subjects/sender display names.
 
 The target cluster has no write quorum. Every node assigns an immutable `(origin_node_id, origin_seq)` to append-only cluster events. Peers exchange vector cursors and apply events idempotently. Incident history is never overwritten; current state is a deterministic projection, with `event_id` as the final tie-breaker. The statistics read model orders lifecycle history by `(occurred_at, event_key)` so its summaries remain stable across replicas.
 
-The priority is:
+The data-plane priority is:
 
 ```text
 do not lose an alert > avoid a duplicate notification
 ```
 
-Therefore an isolated node may accept writes, and a network partition may produce duplicate deliveries. Reconnection must converge by event key and incident fingerprint without discarding either history. Replication is not a backup: corruption, operator error, or destructive events can replicate.
+Therefore an isolated node may accept writes without discarding history. Notification dispatch is
+more conservative: the deterministic rank-zero owner may call the provider, while every reserve
+keeps its durable work queued until the owner's receipt arrives. A local timeout or peer failure
+never promotes a reserve because it cannot fence the original owner. Reconnection must converge by
+event key and incident fingerprint without discarding either history. Replication is not a backup:
+corruption, operator error, or destructive events can replicate.
 
 The repository implements append-only cluster history, a periodic paginated peer pull worker,
 persisted vector cursors, deterministic application projection, full-history bootstrap from an
@@ -182,10 +187,13 @@ public-readiness observation remains follow-on work; until then, public API avai
 an external observer.
 
 Connected nodes may store the same logical incident event under different local row IDs. Delivery
-ownership and deterministic delivery IDs therefore use the stable incident `event_key`. A receipt
-includes `source_event_key`, allowing the receiving node to map success to its corresponding local
-event before a reserve node becomes eligible. This reduces connected-cluster duplicates without
-claiming exactly-once delivery during a true partition.
+ownership and deterministic delivery IDs therefore use the stable incident `event_key`. Explicit
+channel node eligibility is retained even before the local node inventory projection catches up,
+so peers rank the same configured candidates. A receipt includes `source_event_key`, allowing the
+receiving node to map both the immutable attempt and its result to the corresponding local event.
+Automatic owner failover is deliberately disabled until a real fencing protocol exists. This
+prevents concurrent cross-node provider calls for a converged channel topology; it does not claim
+provider-level exactly-once behavior after an ambiguous transport failure or conflicting topology.
 
 Compact snapshot bootstrap, authenticated operator conflict resolution, and real
 multi-region/provider validation remain follow-on work; see

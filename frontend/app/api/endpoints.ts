@@ -251,7 +251,11 @@ export class ApiEndpointManager {
   async fetchApi(
     path: string,
     init: RequestInit = {},
-    options: { replayRefresh?: boolean; revalidateBeforeMutation?: boolean } = {},
+    options: {
+      replayRefresh?: boolean;
+      revalidateBeforeMutation?: boolean;
+      retryNotFound?: boolean;
+    } = {},
   ): Promise<Response> {
     const method = (init.method ?? "GET").toUpperCase();
     const safeRead = method === "GET" || method === "HEAD";
@@ -265,6 +269,7 @@ export class ApiEndpointManager {
     const timeoutMs =
       safeRead || options.replayRefresh ? this.requestTimeoutMs : this.mutationTimeoutMs;
     let firstRetryableResponse: Response | null = null;
+    let firstNotFoundResponse: Response | null = null;
     let lastError: unknown = null;
     while (attempted.size < maximumAttempts) {
       const origin = (canReplay ? this.orderedCandidates(false) : [this.activeOrigin]).find(
@@ -278,9 +283,16 @@ export class ApiEndpointManager {
           init,
           timeoutMs,
         );
+        if (response.status === 404 && options.retryNotFound && canReplay) {
+          firstNotFoundResponse ??= response;
+          this.markHealthy(origin);
+          continue;
+        }
         if (response.status < 500) {
           this.markHealthy(origin);
-          this.promote(origin, "A request failed over after a network or server error");
+          if (!firstNotFoundResponse) {
+            this.promote(origin, "A request failed over after a network or server error");
+          }
           return response;
         }
         firstRetryableResponse ??= response;
@@ -295,6 +307,7 @@ export class ApiEndpointManager {
       if (attempted.size < maximumAttempts) await this.prepare();
     }
     if (firstRetryableResponse) return firstRetryableResponse;
+    if (firstNotFoundResponse) return firstNotFoundResponse;
     throw lastError instanceof Error ? lastError : new Error("No API endpoint responded");
   }
 

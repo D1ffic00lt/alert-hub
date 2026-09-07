@@ -636,9 +636,12 @@ The current repository runs periodic peer pull with pagination, persisted vector
 exponential backoff, deterministic projection replay, and peer health/lag metrics. Heartbeat
 requests append replicated observation events; the projection uses the newest observation and
 reconciles missed/restored incidents across either arrival order. Notification ownership and
-delivery IDs use the logical incident event key, while replicated receipts map that key to each
-node's local event row before suppressing reserve delivery. These behaviors have separate-database
-regressions, but a true partition can still duplicate delivery by design.
+delivery IDs use the logical incident event key. Only the deterministic rank-zero owner calls the
+provider; reserve work stays queued and polls for replicated attempt and result receipts instead
+of taking over after a local timeout. Explicit channel node eligibility is used even while
+inventory replication is delayed. These behaviors have separate-database partition regressions.
+Automatic notification-owner failover is intentionally unavailable until a fenced ownership
+transition can prevent the previous owner from sending.
 
 Empty-cursor replay can rebuild a node while complete cluster history is retained. This is not a
 compact snapshot protocol: do not prune cluster history until a retention/snapshot design and
