@@ -229,6 +229,28 @@ def _rule_sort_key(item: dict[str, Any]) -> tuple[int, str, str, str]:
     )
 
 
+def _category_pages(rules: list[dict[str, Any]], page_size: int) -> list[list[dict[str, Any]]]:
+    """Pack whole categories into pages without splitting a disclosure group."""
+    grouped: dict[str | None, list[dict[str, Any]]] = {}
+    for rule in rules:
+        category = rule["category"]
+        grouped.setdefault(category if isinstance(category, str) else None, []).append(rule)
+
+    pages: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for category_rules in grouped.values():
+        if current and len(current) + len(category_rules) > page_size:
+            pages.append(current)
+            current = []
+        current.extend(category_rules)
+        if len(current) >= page_size:
+            pages.append(current)
+            current = []
+    if current:
+        pages.append(current)
+    return pages
+
+
 @router.get("/alert-rules")
 async def alert_rules(
     request: Request,
@@ -297,7 +319,7 @@ async def alert_rules(
             continue
         filtered.append(item)
     filtered.sort(key=_rule_sort_key)
-    offset = (page - 1) * page_size
+    pages = _category_pages(filtered, page_size)
     generated_at = utc_now()
     return {
         "data_state": _data_state(
@@ -312,12 +334,12 @@ async def alert_rules(
         "filtered_rules": len(filtered),
         "categories": categories,
         "has_uncategorized": has_uncategorized,
-        "rules": filtered[offset : offset + page_size],
+        "rules": pages[page - 1] if page <= len(pages) else [],
         "pagination": {
             "page": page,
             "page_size": page_size,
             "total_items": len(filtered),
-            "total_pages": math.ceil(len(filtered) / page_size),
+            "total_pages": len(pages),
         },
         "errors": [_failure_response(failure) for failure in failures],
     }

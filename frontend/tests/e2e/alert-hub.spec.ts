@@ -85,6 +85,8 @@ function deferredGate() {
 
 type MockState = {
   applicationSettingsRequest?: Record<string, unknown> | null;
+  alertRulesGate?: Promise<void> | null;
+  alertRulesStarted?: (() => void) | null;
   auditPageGate?: Promise<void> | null;
   auditPageStarted?: (() => void) | null;
   auditItems?: unknown[];
@@ -729,6 +731,8 @@ async function installApi(page: Page, state: MockState) {
       return;
     }
     if (method === "GET" && path === "/alert-rules") {
+      state.alertRulesStarted?.();
+      if (state.alertRulesGate) await state.alertRulesGate;
       await fulfill(route, {
         data_state: "partial",
         generated_at: "2026-09-07T00:00:00Z",
@@ -2257,7 +2261,18 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   await installApi(page, state);
   await signIn(page);
 
+  const initialRulesGate = deferredGate();
+  state.alertRulesGate = initialRulesGate.promise;
+  const initialRulesStarted = new Promise<void>((resolve) => {
+    state.alertRulesStarted = resolve;
+  });
   await page.locator(".sidebar__nav").getByRole("button", { name: "Алерты" }).click();
+  await initialRulesStarted;
+  await expect(page.locator(".alerts-page-skeleton")).toBeVisible();
+  await expect(page.getByText("Загружаем правила…", { exact: true })).toHaveCount(0);
+  initialRulesGate.release();
+  state.alertRulesGate = null;
+  state.alertRulesStarted = null;
   await expect(page).toHaveURL(/\/alerts$/);
   await expect(page.getByRole("heading", { name: "Алерты", exact: true })).toBeVisible();
   const cards = page.locator(".alerts-kpi");
@@ -2297,6 +2312,23 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   const primaryReplica = apiRule
     .locator(".alert-replica")
     .filter({ hasText: "Primary Prometheus" });
+  await expect(primaryReplica.locator(".alert-health--ok")).toHaveCSS("color", "rgb(34, 197, 94)");
+
+  const refreshRulesGate = deferredGate();
+  state.alertRulesGate = refreshRulesGate.promise;
+  const refreshRulesStarted = new Promise<void>((resolve) => {
+    state.alertRulesStarted = resolve;
+  });
+  const refreshesBeforeActivation = state.refreshRequests;
+  state.refreshResponseStatuses = [200];
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect.poll(() => state.refreshRequests).toBe(refreshesBeforeActivation + 1);
+  await refreshRulesStarted;
+  await expect(page.locator(".alert-categories")).toHaveCSS("opacity", "1");
+  refreshRulesGate.release();
+  state.alertRulesGate = null;
+  state.alertRulesStarted = null;
+
   await primaryReplica.locator(".alert-labels > summary").click();
   await expect(primaryReplica.getByText("alert_category", { exact: true })).toBeVisible();
   await primaryReplica.getByRole("button", { name: "Открыть инциденты · 2" }).click();
