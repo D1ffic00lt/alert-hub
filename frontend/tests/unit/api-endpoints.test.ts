@@ -97,7 +97,7 @@ describe("API endpoint manager", () => {
     const fetchImpl = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       calls.push(url);
-      if (url.startsWith(DEAD)) return new Response("{}", { status: 503 });
+      if (new URL(url).origin === DEAD) return new Response("{}", { status: 503 });
       return new Response("{}", { status: 200 });
     }) as typeof fetch;
     const manager = clientManager(fetchImpl);
@@ -121,7 +121,7 @@ describe("API endpoint manager", () => {
       const url = String(input);
       calls.push(url);
       if (url === `${LIVE}/health/ready`) return new Response("{}", { status: 200 });
-      if (url.startsWith(DEAD)) return new Response("{}", { status: 503 });
+      if (new URL(url).origin === DEAD) return new Response("{}", { status: 503 });
       return new Response("{}", { status: 200 });
     }) as typeof fetch;
     const manager = clientManager(fetchImpl);
@@ -199,7 +199,7 @@ describe("API endpoint manager", () => {
       const url = String(input);
       calls.push(url);
       if (url.endsWith("/health/ready")) return new Response("{}", { status: 200 });
-      if (url.startsWith(DEAD)) return new Response("{}", { status: 502 });
+      if (new URL(url).origin === DEAD) return new Response("{}", { status: 502 });
       return new Response('{"access_token":"token"}', { status: 200 });
     }) as typeof fetch;
     const manager = clientManager(fetchImpl);
