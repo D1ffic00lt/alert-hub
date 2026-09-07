@@ -280,6 +280,20 @@ def test_alert_rule_pagination_keeps_categories_on_one_page(
     app.state.prometheus_http_transport = httpx.MockTransport(prometheus)
     _create_datasource(client, auth, name="Primary Prometheus", host="1.1.1.1")
 
+    default_page = client.get("/api/v1/alert-rules", headers=auth).json()
+    assert default_page["pagination"] == {
+        "page": 1,
+        "page_size": 200,
+        "total_items": 33,
+        "total_pages": 1,
+    }
+    assert {item["category"] for item in default_page["rules"]} == {
+        "infrastructure",
+        "tls",
+        "xray",
+    }
+    assert len(default_page["rules"]) == 33
+
     first = client.get(
         "/api/v1/alert-rules", headers=auth, params={"page": 1, "page_size": 25}
     ).json()

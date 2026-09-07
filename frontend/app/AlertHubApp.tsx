@@ -83,7 +83,9 @@ function tr(russian: string, english: string) {
 let memoryAccessToken: string | null = null;
 let memorySessionId: string | null = null;
 let memoryAccessExpiresAt = 0;
-let refreshInFlight: Promise<boolean> | null = null;
+type RefreshAccessTokenResult = "restored" | "rejected" | "unavailable" | "cancelled";
+
+let refreshInFlight: Promise<RefreshAccessTokenResult> | null = null;
 let authGeneration = 0;
 let refreshBlocked = false;
 let bootstrapSuggested = false;
@@ -98,6 +100,11 @@ const AUTH_BROADCAST_CHANNEL = "alert-hub-auth-v1";
 const SESSION_HINT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_REVALIDATE_MIN_INTERVAL_MS = 5000;
 const REFRESH_REJECTION_RETRY_MS = 250;
+const SESSION_REFRESH_LOCK = "alert-hub-session-refresh-v1";
+
+type BrowserLockManager = {
+  request<T>(name: string, options: { mode: "exclusive" }, callback: () => Promise<T>): Promise<T>;
+};
 
 try {
   apiEndpointManager.setFailoverEnabled(
@@ -1898,6 +1905,13 @@ function readCookie(name: string) {
   return pair ? decodeURIComponent(pair.slice(name.length + 1)) : "";
 }
 
+async function withSessionRefreshLock<T>(callback: () => Promise<T>): Promise<T> {
+  if (typeof navigator === "undefined") return callback();
+  const locks = (navigator as Navigator & { locks?: BrowserLockManager }).locks;
+  if (!locks || typeof locks.request !== "function") return callback();
+  return locks.request(SESSION_REFRESH_LOCK, { mode: "exclusive" }, callback);
+}
+
 function postReadCacheMessage(message: Record<string, unknown>) {
   if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
   if (navigator.serviceWorker.controller) {
@@ -2037,11 +2051,12 @@ function rememberAccessToken(payload: unknown) {
   return memoryAccessToken;
 }
 
-async function refreshAccessToken(): Promise<boolean> {
-  if (refreshBlocked) return false;
+async function requestAccessTokenRefresh(): Promise<RefreshAccessTokenResult> {
+  if (refreshBlocked) return "cancelled";
   if (refreshInFlight) return refreshInFlight;
   const generation = authGeneration;
-  const pending = (async () => {
+  const pending = withSessionRefreshLock(async () => {
+    if (refreshBlocked || generation !== authGeneration) return "cancelled" as const;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const headers = new Headers({ Accept: "application/json" });
       const csrf = readCookie("alert_hub_csrf") || readCookie("csrf_token") || readCookie("csrf");
@@ -2059,40 +2074,46 @@ async function refreshAccessToken(): Promise<boolean> {
           },
           { replayRefresh: true },
         );
-        if (refreshBlocked || generation !== authGeneration) return false;
+        if (refreshBlocked || generation !== authGeneration) return "cancelled" as const;
         if (!response.ok) {
           if ((response.status === 401 || response.status === 403) && attempt === 0) {
             await new Promise<void>((resolve) => {
               window.setTimeout(resolve, REFRESH_REJECTION_RETRY_MS);
             });
-            if (refreshBlocked || generation !== authGeneration) return false;
+            if (refreshBlocked || generation !== authGeneration) return "cancelled" as const;
             continue;
           }
-          if (response.status === 401 || response.status === 403) {
-            forgetAccessToken(true);
-            window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
-          }
-          return false;
+          if (response.status === 401 || response.status === 403) return "rejected" as const;
+          return "unavailable" as const;
         }
         const payload = await response.json();
-        if (refreshBlocked || generation !== authGeneration) return false;
+        if (refreshBlocked || generation !== authGeneration) return "cancelled" as const;
         const restored = Boolean(rememberAccessToken(payload));
         if (restored) window.dispatchEvent(new Event(SESSION_RESTORED_EVENT));
-        return restored;
+        return restored ? ("restored" as const) : ("unavailable" as const);
       } catch {
-        return false;
+        return "unavailable" as const;
       } finally {
         window.clearTimeout(timer);
       }
     }
-    return false;
-  })();
+    return "unavailable" as const;
+  });
   refreshInFlight = pending;
   try {
     return await pending;
   } finally {
     if (refreshInFlight === pending) refreshInFlight = null;
   }
+}
+
+async function refreshAccessToken(): Promise<boolean> {
+  const result = await requestAccessTokenRefresh();
+  if (result === "rejected" && !refreshBlocked) {
+    forgetAccessToken(true);
+    window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+  }
+  return result === "restored";
 }
 
 async function apiFetch(
@@ -2264,7 +2285,6 @@ function useAuthSession() {
     let active = true;
     let lastActivationRevalidation = 0;
     const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 4500);
     const sessionExpired = () => {
       refreshBlocked = true;
       authGeneration += 1;
@@ -2345,13 +2365,8 @@ function useAuthSession() {
           return;
         }
         refreshBlocked = false;
-        const refresh = await apiFetch("/auth/refresh", {
-          method: "POST",
-          signal: controller.signal,
-        });
-        if (refresh.ok) {
-          const payload = await refresh.json();
-          rememberAccessToken(payload);
+        const refreshResult = await requestAccessTokenRefresh();
+        if (refreshResult === "restored") {
           const me = await apiFetch("/auth/me", { signal: controller.signal });
           if (!me.ok) {
             if (me.status === 401 || me.status === 403) forgetAccessToken(true);
@@ -2361,28 +2376,36 @@ function useAuthSession() {
           if (active) setState({ status: "authenticated", user: asRecord(await me.json()) });
           return;
         }
-        if (refresh.status === 401 || refresh.status === 403) {
+        if (refreshResult === "cancelled") return;
+        if (refreshResult === "rejected") {
           forgetAccessToken(true);
-          try {
-            const statusResponse = await apiFetch("/auth/bootstrap/status", {
-              signal: controller.signal,
-            });
-            if (statusResponse.ok) {
-              const statusBody = asRecord(await statusResponse.json());
-              bootstrapSuggested = Boolean(
-                statusBody.required ??
-                statusBody.bootstrap_required ??
-                statusBody.needs_bootstrap ??
-                statusBody.enabled,
-              );
-            }
-          } catch {
-            bootstrapSuggested = false;
+        } else {
+          const offlineUser = restoreOfflineSession();
+          if (offlineUser) {
+            if (active) setState({ status: "offline", user: offlineUser });
+            return;
           }
-          if (active) setState({ status: "required", user: null });
+        }
+        if (!active) {
           return;
         }
-        throw new Error(`session refresh unavailable (${refresh.status})`);
+        try {
+          const statusResponse = await apiFetch("/auth/bootstrap/status", {
+            signal: controller.signal,
+          });
+          if (statusResponse.ok) {
+            const statusBody = asRecord(await statusResponse.json());
+            bootstrapSuggested = Boolean(
+              statusBody.required ??
+              statusBody.bootstrap_required ??
+              statusBody.needs_bootstrap ??
+              statusBody.enabled,
+            );
+          }
+        } catch {
+          bootstrapSuggested = false;
+        }
+        if (active) setState({ status: "required", user: null });
       } catch {
         forgetAccessToken(false);
         const offlineUser = restoreOfflineSession();
@@ -2393,15 +2416,12 @@ function useAuthSession() {
               : { status: "required", user: null },
           );
         }
-      } finally {
-        window.clearTimeout(timer);
       }
     };
     void restore();
     return () => {
       active = false;
       controller.abort();
-      window.clearTimeout(timer);
       window.removeEventListener(SESSION_EXPIRED_EVENT, sessionExpired);
       window.removeEventListener(SESSION_RESTORED_EVENT, sessionRestored);
       window.removeEventListener("storage", storageChanged);

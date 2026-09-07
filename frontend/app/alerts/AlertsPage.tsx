@@ -14,7 +14,7 @@ type Language = "ru" | "en";
 type RuntimeMode = "active" | "demo" | "unavailable";
 type Request = (path: string, signal: AbortSignal) => Promise<{ payload: unknown }>;
 
-const PAGE_SIZE = 25;
+const PAGE_SIZE = 200;
 
 function tx(language: Language, russian: string, english: string) {
   return language === "ru" ? russian : english;

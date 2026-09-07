@@ -440,6 +440,16 @@ For each selected node, the engine:
 8. records the successful component references, compatibility, and active
    runtime-config checksum.
 
+### Planned-maintenance alerting
+
+Alert Hub continues to display the state reported by Prometheus during a rollout; the deployment
+workflow does not hide or rewrite firing rules. For a server-down rule that should tolerate the
+short restart window, configure its Prometheus `for` duration to exceed the expected gap by at least
+two scrape intervals. For an exceptional planned maintenance window where paging must be suppressed,
+create a narrowly matched Alertmanager silence with an explicit expiry before the deployment and
+verify that it expires afterward. Keep the rule evaluating so the event remains visible in
+Prometheus and Alert Hub, and do not use a global mute or inhibition rule for routine deployments.
+
 If readiness fails after an API or `all` candidate changed runtime settings, the
 engine first reactivates the config snapshot named by the previously recorded
 checksum and only then starts the selected component's previous exact digest.

@@ -85,6 +85,7 @@ function deferredGate() {
 
 type MockState = {
   applicationSettingsRequest?: Record<string, unknown> | null;
+  alertRuleRequests?: string[];
   alertRulesGate?: Promise<void> | null;
   alertRulesStarted?: (() => void) | null;
   auditPageGate?: Promise<void> | null;
@@ -113,6 +114,8 @@ type MockState = {
   logoutRequests: number;
   primaryUnavailable: boolean;
   refreshGate: Promise<void> | null;
+  refreshActive?: number;
+  refreshMaxConcurrent?: number;
   refreshRequests: number;
   refreshResponseStatuses?: number[];
   refreshStarted: (() => void) | null;
@@ -171,33 +174,39 @@ async function installApi(page: Page, state: MockState) {
 
     if (method === "POST" && path === "/auth/refresh") {
       state.refreshRequests += 1;
-      const scriptedStatus = state.refreshResponseStatuses?.shift();
-      if (scriptedStatus !== undefined) {
-        await fulfill(
-          route,
-          scriptedStatus === 200
-            ? {
-                access_token: token("recovered-session"),
-                expires_in: 900,
-                user: { username: "second-admin" },
-              }
-            : { detail: "Transient session lookup failure" },
-          scriptedStatus,
-        );
+      state.refreshActive = (state.refreshActive ?? 0) + 1;
+      state.refreshMaxConcurrent = Math.max(state.refreshMaxConcurrent ?? 0, state.refreshActive);
+      try {
+        const scriptedStatus = state.refreshResponseStatuses?.shift();
+        if (scriptedStatus !== undefined) {
+          await fulfill(
+            route,
+            scriptedStatus === 200
+              ? {
+                  access_token: token("recovered-session"),
+                  expires_in: 900,
+                  user: { username: "second-admin" },
+                }
+              : { detail: "Transient session lookup failure" },
+            scriptedStatus,
+          );
+          return;
+        }
+        if (state.refreshGate) {
+          state.refreshStarted?.();
+          await state.refreshGate;
+          await fulfill(route, {
+            access_token: token("late-session"),
+            expires_in: 900,
+            user: { username: "late-admin" },
+          });
+          return;
+        }
+        await fulfill(route, { detail: "No active session" }, 401);
         return;
+      } finally {
+        state.refreshActive = Math.max(0, (state.refreshActive ?? 1) - 1);
       }
-      if (state.refreshGate) {
-        state.refreshStarted?.();
-        await state.refreshGate;
-        await fulfill(route, {
-          access_token: token("late-session"),
-          expires_in: 900,
-          user: { username: "late-admin" },
-        });
-        return;
-      }
-      await fulfill(route, { detail: "No active session" }, 401);
-      return;
     }
     if (method === "GET" && path === "/auth/bootstrap/status") {
       await fulfill(route, { bootstrap_required: true });
@@ -218,6 +227,10 @@ async function installApi(page: Page, state: MockState) {
         expires_in: 900,
         user: { username: "second-admin" },
       });
+      return;
+    }
+    if (method === "GET" && path === "/auth/me") {
+      await fulfill(route, { username: "restored-admin" });
       return;
     }
     if (method === "GET" && path === "/push/vapid-public-key") {
@@ -731,6 +744,7 @@ async function installApi(page: Page, state: MockState) {
       return;
     }
     if (method === "GET" && path === "/alert-rules") {
+      state.alertRuleRequests?.push(url.search);
       state.alertRulesStarted?.();
       if (state.alertRulesGate) await state.alertRulesGate;
       await fulfill(route, {
@@ -865,7 +879,7 @@ async function installApi(page: Page, state: MockState) {
             ],
           },
         ],
-        pagination: { page: 1, page_size: 25, total_items: 3, total_pages: 1 },
+        pagination: { page: 1, page_size: 200, total_items: 3, total_pages: 1 },
         errors: [
           {
             datasource_id: "prom-3",
@@ -2248,6 +2262,7 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   page,
 }) => {
   const state: MockState = {
+    alertRuleRequests: [],
     authoritativeUnauthorized: false,
     incidents: [],
     lateTokenRequests: [],
@@ -2275,6 +2290,11 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   state.alertRulesStarted = null;
   await expect(page).toHaveURL(/\/alerts$/);
   await expect(page.getByRole("heading", { name: "Алерты", exact: true })).toBeVisible();
+  expect(
+    (state.alertRuleRequests ?? []).some(
+      (search) => new URLSearchParams(search).get("page_size") === "200",
+    ),
+  ).toBe(true);
   const cards = page.locator(".alerts-kpi");
   await expect(cards).toHaveCount(5);
   await expect(cards.nth(0)).toContainText("3");
@@ -2604,6 +2624,48 @@ test("a backgrounded session revalidates and recovers from a transient 401", asy
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect.poll(() => state.refreshRequests).toBe(refreshesBeforeActivation + 1);
   await expect(page.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
+});
+
+test("new tabs serialize refresh-token rotation instead of falling back to login", async ({
+  context,
+  page,
+}) => {
+  const gate = deferredGate();
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: gate.promise,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  const firstRefreshStarted = new Promise<void>((resolve) => {
+    state.refreshStarted = resolve;
+  });
+  await installApi(page, state);
+  const secondPage = await context.newPage();
+  await secondPage.addInitScript(() => {
+    localStorage.setItem("alert-hub-ui-language", "ru");
+  });
+  await installApi(secondPage, state);
+
+  await Promise.all([page.goto("/"), secondPage.goto("/")]);
+  await firstRefreshStarted;
+  await expect(secondPage.getByText("Подключаемся к ближайшему узлу API…")).toBeVisible();
+  await secondPage.waitForTimeout(150);
+  expect(state.refreshRequests).toBe(1);
+  expect(state.refreshMaxConcurrent).toBe(1);
+
+  gate.release();
+  await expect(page.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
+  await expect(secondPage.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Вход в систему" })).toHaveCount(0);
+  await expect(secondPage.getByRole("heading", { name: "Вход в систему" })).toHaveCount(0);
+  expect(state.refreshRequests).toBe(2);
+  expect(state.refreshMaxConcurrent).toBe(1);
+  await secondPage.close();
 });
 
 test("bootstrap, deep-link navigation, live source creation, failover trust, and logout isolation", async ({
@@ -3377,9 +3439,8 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
     const brand = document.querySelector<HTMLElement>(".auth-story > .brand")!;
     const languageSwitch = document.querySelector<HTMLElement>(".auth-language-switch")!;
     return {
-      brandLanguageTopOffset: Math.abs(
+      brandLanguageTopOffset:
         brand.getBoundingClientRect().top - languageSwitch.getBoundingClientRect().top,
-      ),
       bottomOffset: Math.abs(bottom.x - (left.x + right.x) / 2),
       centerLabelGap:
         bottomNode.getBoundingClientRect().top - centerLabel.getBoundingClientRect().bottom,
@@ -3397,7 +3458,8 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
     submitBackground: "rgb(228, 228, 231)",
   });
   expect(authVisuals.nodeTopOffset).toBeLessThan(1);
-  expect(authVisuals.brandLanguageTopOffset).toBeLessThan(1);
+  expect(authVisuals.brandLanguageTopOffset).toBeGreaterThanOrEqual(17);
+  expect(authVisuals.brandLanguageTopOffset).toBeLessThanOrEqual(19);
   expect(authVisuals.bottomOffset).toBeLessThan(1);
   expect(authVisuals.hubOffset).toBeLessThan(1);
   expect(authVisuals.centerLabelGap).toBeGreaterThan(8);
