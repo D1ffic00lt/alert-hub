@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from alert_hub.infrastructure.prometheus import (
+    FIXED_PROMQL,
+    PrometheusQueryError,
+    parse_alert_rules_response,
+)
+
+
+def _vector(*samples: tuple[dict[str, str], float, float]) -> dict[str, Any]:
+    return {
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [
+                {"metric": labels, "value": [timestamp, str(value)]}
+                for labels, value, timestamp in samples
+            ],
+        },
+    }
+
+
+def _rules(*rules: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": "success",
+        "data": {
+            "groups": [
+                {
+                    "name": "platform",
+                    "file": "/etc/prometheus/rules/platform.yml",
+                    "rules": list(rules),
+                }
+            ]
+        },
+    }
+
+
+def _rule(
+    name: str,
+    *,
+    state: str = "inactive",
+    health: str = "ok",
+    alerts: list[dict[str, str]] | None = None,
+    last_error: str = "",
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "state": state,
+        "health": health,
+        "alerts": alerts or [],
+        "lastEvaluation": "2026-09-07T00:00:00Z",
+        "evaluationTime": 0.012,
+        "lastError": last_error,
+        "labels": {"severity": "critical", "team": "platform"},
+        "annotations": {"summary": f"{name} summary"},
+    }
+
+
+def _create_datasource(
+    client: TestClient,
+    auth: dict[str, str],
+    *,
+    name: str,
+    host: str,
+    label_mode: str = "canonical",
+) -> str:
+    response = client.post(
+        "/api/v1/prometheus-datasources",
+        headers=auth,
+        json={
+            "name": name,
+            "url": f"https://{host}:9090",
+            "reachability_label_mode": label_mode,
+        },
+    )
+    assert response.status_code == 201, response.text
+    return str(response.json()["id"])
+
+
+def test_alert_rule_parser_normalizes_states_bounds_fields_and_redacts_errors() -> None:
+    parsed = parse_alert_rules_response(
+        _rules(
+            _rule(
+                "CheckoutDown",
+                state="pending",
+                health="error",
+                alerts=[{"state": "pending"}, {"state": "firing"}],
+                last_error=(
+                    "query failed at https://admin:secret@prometheus.internal/api "
+                    "Authorization: Bearer super-secret"
+                ),
+            )
+        ),
+        max_rules=10,
+        max_instances=10,
+    )
+
+    assert len(parsed) == 1
+    rule = parsed[0]
+    assert (rule.state, rule.firing_instances, rule.pending_instances) == ("firing", 1, 1)
+    assert rule.last_evaluation == datetime(2026, 9, 7, tzinfo=UTC)
+    assert rule.labels == {"severity": "critical", "team": "platform"}
+    assert rule.last_error is not None
+    assert "prometheus.internal" not in rule.last_error
+    assert "super-secret" not in rule.last_error
+
+    with pytest.raises(PrometheusQueryError, match="rule limit"):
+        parse_alert_rules_response(_rules(_rule("A"), _rule("B")), max_rules=1, max_instances=10)
+    with pytest.raises(PrometheusQueryError, match="instance limit"):
+        parse_alert_rules_response(
+            _rules(_rule("A", alerts=[{"state": "firing"}, {"state": "firing"}])),
+            max_rules=10,
+            max_instances=1,
+        )
+
+
+def test_alert_rules_are_stable_paginated_filterable_and_partial(
+    client: TestClient,
+    auth: dict[str, str],
+    app: Any,
+) -> None:
+    requested_paths: list[str] = []
+
+    def prometheus(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(str(request.url))
+        assert request.url.path == "/api/v1/rules"
+        assert request.url.params["type"] == "alert"
+        if request.url.host == "8.8.8.8":
+            return httpx.Response(503, request=request, text="secret upstream body")
+        return httpx.Response(
+            200,
+            request=request,
+            json=_rules(
+                _rule("ZuluInactive"),
+                _rule(
+                    "ApiDown",
+                    state="firing",
+                    health="error",
+                    alerts=[{"state": "firing"}, {"state": "pending"}],
+                    last_error="failed https://prometheus.private/query token=secret-token",
+                ),
+            ),
+        )
+
+    app.state.prometheus_http_transport = httpx.MockTransport(prometheus)
+    datasource_id = _create_datasource(client, auth, name="Primary Prometheus", host="1.1.1.1")
+    _create_datasource(client, auth, name="Unavailable Prometheus", host="8.8.8.8")
+
+    response = client.get("/api/v1/alert-rules?page_size=1", headers=auth)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["data_state"] == "partial"
+    assert body["totals"] == {
+        "rules": 2,
+        "firing_instances": 1,
+        "pending_instances": 1,
+        "unhealthy_rules": 1,
+        "related_incidents": 0,
+    }
+    assert body["pagination"] == {
+        "page": 1,
+        "page_size": 1,
+        "total_items": 2,
+        "total_pages": 2,
+    }
+    assert body["rules"][0]["name"] == "ApiDown"
+    stable_id = body["rules"][0]["id"]
+    assert body["errors"][0] == {
+        "datasource_id": body["errors"][0]["datasource_id"],
+        "datasource_name": "Unavailable Prometheus",
+        "code": "http_error",
+        "detail": "Prometheus returned an unsuccessful HTTP status",
+    }
+    serialized = response.text
+    assert "secret-token" not in serialized
+    assert "prometheus.private" not in serialized
+    assert "secret upstream body" not in serialized
+
+    filtered = client.get(
+        "/api/v1/alert-rules",
+        headers=auth,
+        params={"datasource_id": datasource_id, "state": "error", "q": "api"},
+    ).json()
+    assert [item["name"] for item in filtered["rules"]] == ["ApiDown"]
+    assert filtered["rules"][0]["id"] == stable_id
+    assert all("/api/v1/rules?type=alert" in value for value in requested_paths)
+
+
+@pytest.mark.parametrize("window", ["24h", "7d", "30d"])
+def test_observed_availability_uses_only_fixed_queries_and_marks_stale_and_unknown(
+    client: TestClient,
+    auth: dict[str, str],
+    app: Any,
+    window: str,
+) -> None:
+    now = datetime.now(UTC)
+    evaluated = now.timestamp()
+    fresh = (now - timedelta(seconds=30)).timestamp()
+    stale = (now - timedelta(minutes=10)).timestamp()
+    requested_queries: list[str] = []
+
+    def prometheus(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/query"
+        query = request.url.params["query"]
+        requested_queries.append(query)
+        labels_fresh = {"source_region": "ru", "target_name": "api"}
+        labels_stale = {"source_region": "de", "target_name": "api"}
+        labels_unknown = {"source_region": "nl", "target_name": "portal"}
+        if query == FIXED_PROMQL[f"availability_average_{window}"]:
+            payload = _vector(
+                (labels_fresh, 0.999, evaluated),
+                (labels_stale, 0.95, evaluated),
+                (labels_unknown, 1, evaluated),
+            )
+        elif query == FIXED_PROMQL[f"availability_samples_{window}"]:
+            payload = _vector(
+                (labels_fresh, 100, evaluated),
+                (labels_stale, 90, evaluated),
+            )
+        elif query == FIXED_PROMQL[f"availability_last_sample_{window}"]:
+            payload = _vector(
+                (labels_fresh, fresh, evaluated),
+                (labels_stale, stale, evaluated),
+            )
+        else:  # pragma: no cover - proves the endpoint owns the query set
+            raise AssertionError(f"Unexpected query: {query}")
+        return httpx.Response(200, request=request, json=payload)
+
+    app.state.prometheus_http_transport = httpx.MockTransport(prometheus)
+    _create_datasource(client, auth, name="Primary Prometheus", host="1.1.1.1")
+
+    response = client.get("/api/v1/availability", headers=auth, params={"window": window})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["data_state"] == "ok"
+    assert body["window"] == window
+    assert [(item["source"], item["data_state"]) for item in body["targets"]] == [
+        ("de", "stale"),
+        ("ru", "ok"),
+        ("nl", "unknown"),
+    ]
+    by_source = {item["source"]: item for item in body["targets"]}
+    assert by_source["ru"]["observed_availability_percent"] == 99.9
+    assert by_source["ru"]["samples_count"] == 100
+    assert by_source["nl"]["observed_availability_percent"] is None
+    assert by_source["nl"]["samples_count"] is None
+    assert set(requested_queries) == {
+        FIXED_PROMQL[f"availability_average_{window}"],
+        FIXED_PROMQL[f"availability_samples_{window}"],
+        FIXED_PROMQL[f"availability_last_sample_{window}"],
+    }
+    assert client.get("/api/v1/availability?window=1h", headers=auth).status_code == 422
+
+
+def test_alert_endpoints_report_not_configured(client: TestClient, auth: dict[str, str]) -> None:
+    rules = client.get("/api/v1/alert-rules", headers=auth).json()
+    availability = client.get("/api/v1/availability?window=24h", headers=auth).json()
+    assert rules["data_state"] == "not_configured"
+    assert rules["rules"] == []
+    assert availability["data_state"] == "not_configured"
+    assert availability["targets"] == []

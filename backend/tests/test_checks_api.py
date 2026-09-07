@@ -132,6 +132,7 @@ def _result(
     *,
     success: bool,
     source: str | None = None,
+    logical_source: str | None = None,
     scenario: str | None = None,
     target: str | None = None,
     duration: float | None = None,
@@ -157,6 +158,7 @@ def _result(
         targets=targets,
         error_reasons=error_reasons,
         diagnostics=diagnostics,
+        logical_source=logical_source,
     )
 
 
@@ -211,6 +213,53 @@ def test_list_and_summary_share_and_filters_without_reaggregating(tmp_path: Path
         ordered = client.get("/api/v1/checks?limit=2", headers=auth).json()
         assert [item["check_id"] for item in ordered["items"]] == ["alpha", "beta"]
         assert client.get("/api/v1/checks?limit=201", headers=auth).status_code == 422
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_list_and_detail_separate_logical_sources_from_prober_instances(tmp_path: Path) -> None:
+    snapshot = _snapshot(
+        (
+            "regional",
+            "Regional check",
+            "edge",
+            (
+                _result(
+                    "regional",
+                    success=True,
+                    source="ru2-test",
+                    logical_source="remnawave-service",
+                ),
+                _result(
+                    "regional",
+                    success=False,
+                    source="nl2-test",
+                    logical_source="remnawave-service",
+                ),
+            ),
+        )
+    )
+    client, auth = _client(tmp_path, _StubCache(snapshot))
+    try:
+        response = client.get(
+            "/api/v1/checks?source=remnawave-service",
+            headers=auth,
+        )
+        assert response.status_code == 200, response.text
+        check = response.json()["items"][0]
+        assert (check["sources_up"], check["sources_total"]) == (0, 1)
+        assert (check["instances_up"], check["instances_total"]) == (1, 2)
+        assert [instance["instance_id"] for instance in check["instances"]] == [
+            "nl2-test",
+            "ru2-test",
+        ]
+        assert [instance["status"] for instance in check["instances"]] == ["down", "up"]
+
+        detail = client.get("/api/v1/checks/regional", headers=auth).json()["check"]
+        assert {(result["source"], result["instance_id"]) for result in detail["results"]} == {
+            ("remnawave-service", "nl2-test"),
+            ("remnawave-service", "ru2-test"),
+        }
     finally:
         client.__exit__(None, None, None)
 
@@ -307,7 +356,13 @@ def test_detail_serializes_defaults_relations_and_safe_grafana_link(tmp_path: Pa
         assert response.status_code == 200, response.text
         check = response.json()["check"]
         result = check["results"][0]
-        assert (result["source"], result["scenario"], result["variant"]) == (
+        assert (
+            result["source"],
+            result["instance_id"],
+            result["scenario"],
+            result["variant"],
+        ) == (
+            None,
             None,
             None,
             None,

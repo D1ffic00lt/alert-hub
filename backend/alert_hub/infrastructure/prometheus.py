@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import math
+import re
 import socket
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -37,7 +38,18 @@ type CheckQueryName = Literal[
     "check_egress_match",
     "check_errors_total",
 ]
-type FixedQueryName = PublicQueryName | CheckQueryName
+type AvailabilityQueryName = Literal[
+    "availability_average_24h",
+    "availability_average_7d",
+    "availability_average_30d",
+    "availability_samples_24h",
+    "availability_samples_7d",
+    "availability_samples_30d",
+    "availability_last_sample_24h",
+    "availability_last_sample_7d",
+    "availability_last_sample_30d",
+]
+type FixedQueryName = PublicQueryName | CheckQueryName | AvailabilityQueryName
 
 FIXED_PROMQL: dict[FixedQueryName, str] = {
     "connection_test": "vector(1)",
@@ -57,6 +69,36 @@ FIXED_PROMQL: dict[FixedQueryName, str] = {
     "check_egress_state": "synthetic_check_egress_state",
     "check_egress_match": "synthetic_check_egress_match",
     "check_errors_total": "synthetic_check_errors_total",
+    "availability_average_24h": "avg_over_time(probe_success[24h])",
+    "availability_average_7d": "avg_over_time(probe_success[7d])",
+    "availability_average_30d": "avg_over_time(probe_success[30d])",
+    "availability_samples_24h": "count_over_time(probe_success[24h])",
+    "availability_samples_7d": "count_over_time(probe_success[7d])",
+    "availability_samples_30d": "count_over_time(probe_success[30d])",
+    "availability_last_sample_24h": "timestamp(last_over_time(probe_success[24h]))",
+    "availability_last_sample_7d": "timestamp(last_over_time(probe_success[7d]))",
+    "availability_last_sample_30d": "timestamp(last_over_time(probe_success[30d]))",
+}
+
+AVAILABILITY_QUERY_NAMES: dict[
+    Literal["24h", "7d", "30d"],
+    tuple[AvailabilityQueryName, AvailabilityQueryName, AvailabilityQueryName],
+] = {
+    "24h": (
+        "availability_average_24h",
+        "availability_samples_24h",
+        "availability_last_sample_24h",
+    ),
+    "7d": (
+        "availability_average_7d",
+        "availability_samples_7d",
+        "availability_last_sample_7d",
+    ),
+    "30d": (
+        "availability_average_30d",
+        "availability_samples_30d",
+        "availability_last_sample_30d",
+    ),
 }
 
 
@@ -74,6 +116,22 @@ class VectorSample:
     labels: dict[str, str]
     value: float
     timestamp: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AlertRule:
+    file: str
+    group: str
+    name: str
+    state: Literal["firing", "pending", "inactive"]
+    health: str
+    firing_instances: int
+    pending_instances: int
+    last_evaluation: datetime | None
+    evaluation_time_seconds: float | None
+    last_error: str | None
+    labels: dict[str, str]
+    annotations: dict[str, str]
 
 
 class PrometheusQueryError(RuntimeError):
@@ -96,6 +154,157 @@ class PrometheusClient(Protocol):
         evaluated_at: datetime | None = None,
         allow_non_finite_values: bool = False,
     ) -> list[VectorSample]: ...
+
+    async def alert_rules(
+        self,
+        url: str,
+        credentials: Mapping[str, Any],
+    ) -> list[AlertRule]: ...
+
+
+_URL_RE = re.compile(r"(?i)\bhttps?://[^\s\]})>,;]+")
+_AUTH_RE = re.compile(
+    r"(?i)\b(authorization|proxy-authorization)\s*[:=]\s*[^\s,;]+(?:\s+[^\s,;]+)?"
+)
+_SECRET_RE = re.compile(
+    r"(?i)\b(bearer|password|token|api[-_ ]?key)"
+    r"\s*[:=]\s*[^\s,;]+"
+)
+
+
+def safe_upstream_text(value: object, *, limit: int = 500) -> str | None:
+    """Return bounded operator context without reflecting upstream addresses or credentials."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    redacted = _URL_RE.sub("[redacted-url]", value.strip())
+    redacted = _AUTH_RE.sub(lambda match: f"{match.group(1)}=[redacted]", redacted)
+    redacted = _SECRET_RE.sub(lambda match: f"{match.group(1)}=[redacted]", redacted)
+    redacted = " ".join(redacted.split())
+    return redacted[:limit] or None
+
+
+def _bounded_string_map(value: object, *, max_items: int) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    pairs = sorted(
+        (key, item)
+        for key, item in value.items()
+        if isinstance(key, str) and isinstance(item, str) and key
+    )
+    return {key[:128]: item[:2_048] for key, item in pairs[:max_items]}
+
+
+def _parse_rule_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def parse_alert_rules_response(
+    payload: object,
+    *,
+    max_rules: int,
+    max_instances: int,
+) -> list[AlertRule]:
+    if not isinstance(payload, dict):
+        raise PrometheusQueryError("invalid_response", "Prometheus response must be an object")
+    if payload.get("status") != "success":
+        raise PrometheusQueryError("rules_failed", "Prometheus rules request failed")
+    data = payload.get("data")
+    groups = data.get("groups") if isinstance(data, dict) else None
+    if not isinstance(groups, list):
+        raise PrometheusQueryError("invalid_response", "Prometheus rule groups must be a list")
+
+    parsed: list[AlertRule] = []
+    instances_seen = 0
+    for group_index, raw_group in enumerate(groups):
+        if not isinstance(raw_group, dict):
+            raise PrometheusQueryError(
+                "invalid_rule_group", f"Prometheus rule group {group_index} must be an object"
+            )
+        group_name = raw_group.get("name")
+        file_name = raw_group.get("file")
+        raw_rules = raw_group.get("rules")
+        if not isinstance(group_name, str) or not isinstance(raw_rules, list):
+            raise PrometheusQueryError(
+                "invalid_rule_group", f"Prometheus rule group {group_index} has an invalid shape"
+            )
+        for rule_index, raw_rule in enumerate(raw_rules):
+            if len(parsed) >= max_rules:
+                raise PrometheusQueryError(
+                    "too_many_rules", "Prometheus rules result exceeds the rule limit"
+                )
+            if not isinstance(raw_rule, dict) or not isinstance(raw_rule.get("name"), str):
+                raise PrometheusQueryError(
+                    "invalid_rule",
+                    f"Prometheus rule {group_index}:{rule_index} has an invalid shape",
+                )
+            alerts = raw_rule.get("alerts")
+            if alerts is None:
+                alerts = []
+            if not isinstance(alerts, list):
+                raise PrometheusQueryError(
+                    "invalid_rule",
+                    f"Prometheus rule {group_index}:{rule_index} alerts must be a list",
+                )
+            instances_seen += len(alerts)
+            if instances_seen > max_instances:
+                raise PrometheusQueryError(
+                    "too_many_samples", "Prometheus rules result exceeds the alert instance limit"
+                )
+            firing = 0
+            pending = 0
+            for alert in alerts:
+                if not isinstance(alert, dict):
+                    continue
+                alert_state = str(alert.get("state") or "").lower()
+                firing += alert_state == "firing"
+                pending += alert_state == "pending"
+            raw_state = str(raw_rule.get("state") or "").lower()
+            state: Literal["firing", "pending", "inactive"]
+            if firing or raw_state == "firing":
+                state = "firing"
+            elif pending or raw_state == "pending":
+                state = "pending"
+            else:
+                state = "inactive"
+            evaluation_time = raw_rule.get("evaluationTime")
+            try:
+                parsed_evaluation_time = (
+                    float(evaluation_time)
+                    if isinstance(evaluation_time, str | int | float)
+                    else None
+                )
+            except (TypeError, ValueError):
+                parsed_evaluation_time = None
+            if parsed_evaluation_time is not None and (
+                not math.isfinite(parsed_evaluation_time) or parsed_evaluation_time < 0
+            ):
+                parsed_evaluation_time = None
+            parsed.append(
+                AlertRule(
+                    file=file_name if isinstance(file_name, str) else "",
+                    group=group_name,
+                    name=str(raw_rule["name"]),
+                    state=state,
+                    health=str(raw_rule.get("health") or "unknown").lower()[:64],
+                    firing_instances=firing,
+                    pending_instances=pending,
+                    last_evaluation=_parse_rule_time(raw_rule.get("lastEvaluation")),
+                    evaluation_time_seconds=parsed_evaluation_time,
+                    last_error=safe_upstream_text(raw_rule.get("lastError")),
+                    labels=_bounded_string_map(raw_rule.get("labels"), max_items=32),
+                    annotations=_bounded_string_map(raw_rule.get("annotations"), max_items=16),
+                )
+            )
+    return parsed
 
 
 def parse_vector_response(
@@ -213,16 +422,14 @@ class PrometheusHTTPClient:
             raise PrometheusQueryError("credentials", "Unsupported datasource authentication mode")
         return {}, None
 
-    async def query(
+    async def _request_json(
         self,
         url: str,
         credentials: Mapping[str, Any],
-        query_name: FixedQueryName,
+        path: str,
         *,
-        job_globs: Sequence[str] | None = None,
-        evaluated_at: datetime | None = None,
-        allow_non_finite_values: bool = False,
-    ) -> list[VectorSample]:
+        params: Mapping[str, str],
+    ) -> object:
         # Repeat DNS/address validation immediately before every request. Redirects are never
         # followed, which closes the common public-to-private redirect bypass.
         try:
@@ -233,13 +440,7 @@ class PrometheusHTTPClient:
             raise PrometheusQueryError("unsafe_url", str(exc)) from exc
         headers, auth = self._authorization(credentials)
         headers["Accept"] = "application/json"
-        query_url = f"{normalized.rstrip('/')}/api/v1/query"
-        params = {
-            "query": fixed_promql(query_name, job_globs),
-            "timeout": f"{self.settings.prometheus_query_timeout_seconds:g}s",
-        }
-        if evaluated_at is not None:
-            params["time"] = evaluated_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        request_url = f"{normalized.rstrip('/')}{path}"
         try:
             async with (
                 httpx.AsyncClient(
@@ -250,7 +451,7 @@ class PrometheusHTTPClient:
                 ) as client,
                 client.stream(
                     "GET",
-                    query_url,
+                    request_url,
                     params=params,
                     headers=headers,
                     auth=auth,
@@ -282,13 +483,53 @@ class PrometheusHTTPClient:
         except httpx.HTTPError as exc:
             raise PrometheusQueryError("transport", "Prometheus request failed") from exc
         try:
-            payload = json.loads(body)
+            return json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise PrometheusQueryError("invalid_json", "Prometheus returned invalid JSON") from exc
+
+    async def query(
+        self,
+        url: str,
+        credentials: Mapping[str, Any],
+        query_name: FixedQueryName,
+        *,
+        job_globs: Sequence[str] | None = None,
+        evaluated_at: datetime | None = None,
+        allow_non_finite_values: bool = False,
+    ) -> list[VectorSample]:
+        params = {
+            "query": fixed_promql(query_name, job_globs),
+            "timeout": f"{self.settings.prometheus_query_timeout_seconds:g}s",
+        }
+        if evaluated_at is not None:
+            params["time"] = evaluated_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        payload = await self._request_json(
+            url,
+            credentials,
+            "/api/v1/query",
+            params=params,
+        )
         return parse_vector_response(
             payload,
             max_samples=self.settings.prometheus_max_samples,
             allow_non_finite_values=allow_non_finite_values,
+        )
+
+    async def alert_rules(
+        self,
+        url: str,
+        credentials: Mapping[str, Any],
+    ) -> list[AlertRule]:
+        payload = await self._request_json(
+            url,
+            credentials,
+            "/api/v1/rules",
+            params={"type": "alert"},
+        )
+        return parse_alert_rules_response(
+            payload,
+            max_rules=self.settings.prometheus_max_samples,
+            max_instances=self.settings.prometheus_max_samples,
         )
 
 

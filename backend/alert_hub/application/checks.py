@@ -284,6 +284,7 @@ class ChecksSummary:
 class _AcceptedSample:
     sample: VectorSample
     key: CheckResultKey
+    logical_source: str
     name: str | None
     name_priority: int | None
     derived_name: str | None
@@ -305,9 +306,11 @@ class _InfoHint:
     scenario: str | None
     variant: str | None
     target: str | None
+    logical_source: str | None
     scenario_conflict: bool = False
     variant_conflict: bool = False
     target_conflict: bool = False
+    logical_source_conflict: bool = False
 
 
 def normalize_check_identifier(
@@ -405,17 +408,24 @@ def _derived_info_name(labels: Mapping[str, str]) -> str | None:
 
 def _build_info_hints(samples: Sequence[VectorSample]) -> dict[tuple[str, str], _InfoHint]:
     values: dict[tuple[str, str], dict[str, set[str]]] = defaultdict(
-        lambda: {"scenario": set(), "variant": set(), "target": set()}
+        lambda: {"scenario": set(), "variant": set(), "target": set(), "logical_source": set()}
     )
     for sample in samples:
         check_id = normalize_check_identifier(sample.labels.get("check_id"))
-        source, _ = _priority_identifier(
+        instance, _ = _priority_identifier(
             sample.labels,
-            ("source", "instance_id", "source_id"),
+            ("instance_id", "source", "source_id"),
             DEFAULT_SOURCE,
         )
-        if check_id is None or source is None:
+        if check_id is None or instance is None:
             continue
+        logical_source, _ = _priority_identifier(
+            sample.labels,
+            ("source", "source_id"),
+            instance,
+        )
+        if logical_source is not None:
+            values[(check_id, instance)]["logical_source"].add(logical_source)
         scenario, scenario_missing = _priority_identifier(
             sample.labels,
             ("scenario", "mode"),
@@ -427,14 +437,14 @@ def _build_info_hints(samples: Sequence[VectorSample]) -> dict[tuple[str, str], 
             DEFAULT_VARIANT,
         )
         if not scenario_missing and scenario is not None:
-            values[(check_id, source)]["scenario"].add(scenario)
+            values[(check_id, instance)]["scenario"].add(scenario)
         if not variant_missing and variant is not None:
-            values[(check_id, source)]["variant"].add(variant)
+            values[(check_id, instance)]["variant"].add(variant)
 
         raw_target = sample.labels.get("target")
         explicit_target = _safe_display(raw_target, max_length=255)
         if raw_target and explicit_target is not None:
-            values[(check_id, source)]["target"].add(explicit_target)
+            values[(check_id, instance)]["target"].add(explicit_target)
 
     hints: dict[tuple[str, str], _InfoHint] = {}
     for key, fields in values.items():
@@ -442,9 +452,13 @@ def _build_info_hints(samples: Sequence[VectorSample]) -> dict[tuple[str, str], 
             scenario=next(iter(fields["scenario"])) if len(fields["scenario"]) == 1 else None,
             variant=next(iter(fields["variant"])) if len(fields["variant"]) == 1 else None,
             target=next(iter(fields["target"])) if len(fields["target"]) == 1 else None,
+            logical_source=(
+                next(iter(fields["logical_source"])) if len(fields["logical_source"]) == 1 else None
+            ),
             scenario_conflict=len(fields["scenario"]) > 1,
             variant_conflict=len(fields["variant"]) > 1,
             target_conflict=len(fields["target"]) > 1,
+            logical_source_conflict=len(fields["logical_source"]) > 1,
         )
     return hints
 
@@ -453,7 +467,7 @@ def _build_previous_info_hints(previous: ChecksSnapshot) -> dict[tuple[str, str]
     """Recover only unambiguous dimensions that a prior authoritative info row established."""
 
     values: dict[tuple[str, str], dict[str, set[str]]] = defaultdict(
-        lambda: {"scenario": set(), "variant": set(), "target": set()}
+        lambda: {"scenario": set(), "variant": set(), "target": set(), "logical_source": set()}
     )
     for check in previous.checks:
         for result in check.results:
@@ -462,6 +476,7 @@ def _build_previous_info_hints(previous: ChecksSnapshot) -> dict[tuple[str, str]
             base_key = (result.key.check_id, result.key.source)
             values[base_key]["scenario"].add(result.key.scenario)
             values[base_key]["variant"].add(result.key.variant)
+            values[base_key]["logical_source"].add(result.logical_source or result.key.source)
             if result.target is not None:
                 values[base_key]["target"].add(result.target)
 
@@ -471,9 +486,13 @@ def _build_previous_info_hints(previous: ChecksSnapshot) -> dict[tuple[str, str]
             scenario=next(iter(fields["scenario"])) if len(fields["scenario"]) == 1 else None,
             variant=next(iter(fields["variant"])) if len(fields["variant"]) == 1 else None,
             target=next(iter(fields["target"])) if len(fields["target"]) == 1 else None,
+            logical_source=(
+                next(iter(fields["logical_source"])) if len(fields["logical_source"]) == 1 else None
+            ),
             scenario_conflict=len(fields["scenario"]) > 1,
             variant_conflict=len(fields["variant"]) > 1,
             target_conflict=len(fields["target"]) > 1,
+            logical_source_conflict=len(fields["logical_source"]) > 1,
         )
     return hints
 
@@ -527,7 +546,7 @@ def _accept_sample(
 
     source, _ = _priority_identifier(
         sample.labels,
-        ("source", "instance_id", "source_id"),
+        ("instance_id", "source", "source_id"),
         DEFAULT_SOURCE,
     )
     if source is None:
@@ -539,6 +558,20 @@ def _accept_sample(
         return None
 
     hint = info_hints.get((check_id, source))
+    logical_source, logical_source_missing = _priority_identifier(
+        sample.labels,
+        ("source", "source_id"),
+        source,
+    )
+    if logical_source_missing and hint is not None and hint.logical_source is not None:
+        logical_source = hint.logical_source
+    if logical_source is None:
+        diagnostics[check_id].add(
+            "invalid_identifier"
+            if query_name in _PRIMARY_CHECK_QUERIES
+            else "invalid_optional_identifier"
+        )
+        return None
     scenario, scenario_missing = _priority_identifier(
         sample.labels,
         ("scenario", "mode"),
@@ -550,6 +583,8 @@ def _accept_sample(
         DEFAULT_VARIANT,
     )
     info_conflict = False
+    if hint is not None:
+        info_conflict = hint.logical_source_conflict
     scenario_info_hint_applied = False
     variant_info_hint_applied = False
     key_dimensions_defaulted = False
@@ -648,6 +683,7 @@ def _accept_sample(
     return _AcceptedSample(
         sample=sample,
         key=CheckResultKey(check_id, source, scenario, variant),
+        logical_source=logical_source,
         name=name,
         name_priority=name_priority,
         derived_name=_derived_info_name(sample.labels) if query_name == "check_info" else None,
@@ -963,6 +999,23 @@ def normalize_check_metrics(
     normalized_results: dict[CheckResultKey, NormalizedCheckResult] = {}
     for key in sorted(primary_keys):
         result_diagnostics: set[str] = set()
+        previously_declared = previous_results_by_key.get(key)
+        logical_sources = {
+            item.logical_source
+            for query_name in CHECK_QUERY_NAMES
+            for item in by_query_key[query_name].get(key, ())
+        }
+        if len(logical_sources) > 1:
+            logical_source = key.source
+            result_diagnostics.update({"conflicting_info_metadata", "invalid_info"})
+        elif logical_sources:
+            logical_source = next(iter(logical_sources))
+        else:
+            logical_source = (
+                previously_declared.logical_source
+                if previously_declared is not None and previously_declared.logical_source
+                else key.source
+            )
         success, state, status_diagnostics = _reconcile_success(
             by_query_key["check_status"].get(key, ()),
             by_query_key["check_state"].get(key, ()),
@@ -1208,7 +1261,6 @@ def normalize_check_metrics(
             if count is not None:
                 error_reasons.append(CheckErrorReason(reason=reason, count=count))
 
-        previously_declared = previous_results_by_key.get(key)
         provisional_info_dimensions = reuse_previous_info_dimensions and any(
             item.key_dimensions_defaulted
             for query_name in ("check_state", "check_status", "check_last_run")
@@ -1243,6 +1295,7 @@ def normalize_check_metrics(
             state=cast(CheckResultState | None, state),
             targets=tuple(normalized_targets),
             error_reasons=tuple(error_reasons),
+            logical_source=logical_source,
         )
 
     if previous is not None:
@@ -1251,10 +1304,19 @@ def normalize_check_metrics(
             for previous_result in previous_check.results:
                 if previous_result.key in normalized_results:
                     continue
-                # A complete current info family may remove only tuples that were themselves
-                # declared by info. Status-only executors can coexist with info publishers; an
-                # unrelated info series must not silently erase their remembered inventory.
-                if info_is_present and previous_result.known_via_info:
+                # Preserve every previously observed executor when it disappears from the
+                # current scrape. Prometheus cannot distinguish a stopped instance from a
+                # deliberate configuration removal, and hiding the tuple would make coverage
+                # look healthier precisely when a region stopped reporting.
+                if (
+                    info_is_present
+                    and previous_result.known_via_info
+                    and valid_info_keys_by_base[
+                        (previous_result.key.check_id, previous_result.key.source)
+                    ]
+                ):
+                    # The same executor is still declared under a different Scenario/Variant;
+                    # retire only its superseded tuple, never a wholly missing executor.
                     continue
                 if info_is_present and _matches_proven_info_rekey(
                     previous_result,
@@ -1300,6 +1362,7 @@ def normalize_check_metrics(
                         )
                         for item in previous_result.targets
                     ),
+                    logical_source=previous_result.logical_source,
                 )
         if len(normalized_results) > max_series:
             raise ChecksDataError("checks_limit_exceeded")
@@ -1547,7 +1610,8 @@ def filter_checks(
         if filters.group is not None and check.group != filters.group:
             return False
         if filters.source is not None and not any(
-            result.key.source == filters.source for result in check.results
+            (result.logical_source or result.key.source) == filters.source
+            for result in check.results
         ):
             return False
         if filters.target is not None and not any(

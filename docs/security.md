@@ -95,6 +95,14 @@ unrelated address, verify the peer hostname fails closed.
 
 ### Checks data boundary
 
+The `/api/v1/alert-rules` and `/api/v1/availability` operations reuse the same authenticated,
+SSRF-checked Prometheus transport. The browser can select only a datasource filter, rule state,
+rule-name search, pagination, and one of the three fixed availability windows; it cannot provide an
+upstream URL or PromQL. Rule labels and annotations are count- and length-bounded, last evaluation
+errors are stripped of URLs and credential-shaped values, and datasource failures are mapped to a
+small public code/detail allowlist. Prometheus response bodies and raw exceptions never enter these
+responses.
+
 Checks reuses the validated Prometheus datasource transport and cannot select an upstream URL,
 metric name, or PromQL from request parameters. All twelve query expressions are fixed on the
 server, use one evaluation time, ignore environment proxies, reject redirects, and retain the
@@ -138,6 +146,13 @@ job globs; one invalid navigation convenience never discards the rest of the mon
 ## Authentication and browser policy
 
 Use exact HTTPS origins. Wildcard CORS with credentials is rejected. Refresh and logout require one exact allowed `Origin` plus the matching double-submit CSRF value; a missing Origin is not accepted. Authenticated responses expose `X-Alert-Hub-Cache-Partition`, and CORS permits/exposes that header so the service worker can keep session cache namespaces separate. Permission for browser notifications must be requested only from a direct user gesture in an installed Home Screen PWA; do not attempt silent push.
+
+The SPA revalidates an authenticated session when a backgrounded tab becomes visible or focused.
+An access-token `401` performs a single-flight refresh and retries the pending request. One rejected
+refresh is confirmed once before credentials and session-partitioned caches are cleared, preventing
+a transient response or cross-tab refresh race from displaying the login screen. Network and 5xx
+refresh failures leave the current identity intact; only two consecutive authentication rejections,
+explicit logout/revocation, or another definitive server rejection ends the frontend session.
 
 Web Push subscriptions are bound by the API to the authenticated session ID; the client-supplied device label is not an authorization or identity key. Revoking a device session, logging out, reaching absolute session expiry, or disabling the owning user prevents delivery and emits a replicated, remove-wins subscription tombstone before the next provider request. A locally observed sliding expiry suppresses delivery without a permanent tombstone because another replica may later supply a valid rotation. Pre-migration subscriptions without a session ID are disabled during migration and are also rejected fail-closed at runtime; the browser must register them again after upgrade.
 

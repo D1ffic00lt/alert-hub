@@ -124,6 +124,25 @@ invalid transitions such as acknowledging a resolved incident are reported per i
 so clients must display its per-item failures. The UI keeps that result visible after clearing the
 successful selection and asks for confirmation before bulk resolve.
 
+## Alerts and observed availability
+
+The `/alerts` screen reads alerting rules from every enabled Prometheus datasource and shows rule
+counts separately from firing and pending alert-instance counts. `GET /api/v1/alert-rules` supports
+stable server pagination plus `datasource_id`, `state`, and rule-name `q` filters. A rule links to
+incidents only when an ingested incident carries both the exact `alertname` and the rule's
+`prometheus_datasource_id`; Alert Hub does not guess a datasource relationship from a shared rule
+name.
+
+`GET /api/v1/availability?window=24h|7d|30d` evaluates backend-owned expressions over
+`probe_success`. Canonical datasources use `source_region × target_name`; datasource configured in
+server mode use `source_server × target_server`. Missing samples remain unknown, and a last sample
+older than `AVAILABILITY_STALE_AFTER_SECONDS` (300 seconds by default) is marked stale. The values
+are observed measurements, not contractual objectives, and no range samples are stored in SQLite.
+
+The existing Prometheus response byte and sample limits apply independently to the rules response
+and every availability vector. Repeated `partial`, `unavailable`, `response_too_large`, or
+`too_many_samples` results should be investigated at the named datasource.
+
 ## Checks
 
 Checks is an optional, read-only view of results produced by operator-managed external executors.
@@ -213,10 +232,12 @@ synthetic_check_egress_match{check_id="checkout-flow",source="edge-a",scenario="
 The current `xray-e2e-prober` projection is joined safely before result keys are built. Its
 `synthetic_check_info{check_id,instance_id,source_id,entry_name,mode,target_set_id}` metadata enriches
 the status/state/last-run/target/assertion families that carry only `check_id` and `instance_id`.
-The join never matches on the complete raw label set. Source identity uses declared `source` first,
-then `instance_id`, then `source_id`; consequently two prober instances with the same configuration
-source do not collapse. Scenario uses `scenario` then `mode`, and Variant uses `variant` then
-`target_set_id`. Conflicting info metadata fails closed instead of creating a favourable result.
+The join never matches on the complete raw label set. Execution identity uses `instance_id` first,
+then the generic `source`, then `source_id`, so two prober processes never collapse merely because
+they share one subscription. Logical Source remains a separate dimension: declared `source`, then
+`source_id`, with the execution identity only as a compatibility fallback. Scenario uses `scenario`
+then `mode`, and Variant uses `variant` then `target_set_id`. Conflicting info metadata fails closed
+instead of creating a favourable result.
 
 `check_name` is the preferred display name, followed by the prober's safe `entry_name`. If neither
 is exported, Alert Hub humanizes safe exported identifiers; it keeps `check_id` separately and does
@@ -234,11 +255,11 @@ fail the Check.
 
 `source` is the executor-declared logical observation point, not proof of physical independence.
 Give genuinely independent points different stable values, and give replicas of one logical point
-the same value. For the richer compatible contract, a missing `source` deliberately falls back to
-the stable exported `instance_id`, then `source_id`; the unrelated Prometheus scrape `instance` and
-`job` labels are still ignored. If none of those declared identities exists, Alert Hub uses one
-private default source. Scenario, variant, target, assertion, and canary identities never create
-extra failure-quorum votes.
+the same value. For the richer compatible contract, `source_id` identifies the logical Source while
+`instance_id` identifies the concrete execution process. A missing logical Source deliberately
+falls back to that stable execution identity; the unrelated Prometheus scrape `instance` and `job`
+labels are still ignored. If none of those declared identities exists, Alert Hub uses one private
+default source. Multiple Instances of one Source never create extra failure-quorum votes.
 
 Publish `synthetic_check_info` for every expected `(check_id, source, scenario, variant)`, including
 before its first run. Without `info`, Alert Hub can discover only tuples present in the required
@@ -247,16 +268,18 @@ it, is unknowable. Previously observed tuples remain visible only for the life o
 in-memory registry; after restart they cannot be reconstructed. Prometheus retention and `info`,
 not the Alert Hub database, provide durable inventory.
 
-Executors that publish `info` may coexist with status-only executors. A valid `info` family removes
-an absent cached tuple only when that tuple was itself previously declared by `info`; the presence
-of an unrelated `info` series never erases a remembered status-only source. The public identifier
-`summary` is reserved by the API route and is rejected like internal sentinels, IP/UUID-bearing
-identifiers, and obvious credential markers.
+Executors that publish `info` may coexist with status-only executors. A previously observed Instance
+that disappears from the current `info` family remains in the bounded process-local inventory as
+incomplete and later stale; otherwise a regional outage would improve the displayed coverage. A
+current declaration for that same Instance may still replace a superseded Scenario/Variant tuple.
+The public identifier `summary` is reserved by the API route and is rejected like internal
+sentinels, IP/UUID-bearing identifiers, and obvious credential markers.
 
 ### Freshness, quorum, and aggregation
 
-One result is keyed by `(check_id, source, scenario, variant)`. Exactly matching duplicates are
-coalesced. Conflicting main values for one key make that result `unknown`; conflicting optional
+One result is keyed by `(check_id, instance, scenario, variant)` and carries its logical Source
+separately. Exactly matching duplicates are coalesced. Conflicting main values for one key make
+that result `unknown`; conflicting optional
 values remove only that optional field. Conflicting names fall back to `check_id`, conflicting
 optional metadata becomes `null`, and a diagnostic code records the reason. Malformed identifiers,
 non-`0`/`1` status values, NaN/infinite values, negative durations, missing timestamps, and
@@ -290,6 +313,9 @@ otherwise. An empty set is never up. `sources_total` counts distinct known logic
 `sources_up` counts sources whose every known result is fresh and successful. List latency is the
 maximum available duration among fresh successful results, not an average. `last_checked_at`,
 `oldest_checked_at`, `stale_results`, and `data_incomplete` make age and partial evidence explicit.
+The list/detail API also returns `instances_total`, `instances_up`, `instances_stale`, and a bounded
+per-Instance status list. The UI keeps `Sources N/N` and `Instances N/N` distinct and omits the
+extra Instance summary for ordinary single-instance installations.
 
 List filters (`status`, `group`, `source`, `target`, `scenario`, and bounded `search`) are combined
 with AND. A source filter selects complete Checks but never recomputes their status from a subset.

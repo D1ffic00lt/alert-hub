@@ -77,6 +77,16 @@ class ChecksMetadataResponse(BaseModel):
     warning_codes: list[str] = Field(default_factory=list)
 
 
+class CheckInstanceResponse(BaseModel):
+    instance_id: str | None
+    source: str | None
+    status: CheckStatus
+    status_reason: str
+    last_checked_at: datetime | None
+    stale: bool
+    data_incomplete: bool
+
+
 class CheckListItemResponse(BaseModel):
     check_id: str
     name: str
@@ -88,6 +98,10 @@ class CheckListItemResponse(BaseModel):
     oldest_checked_at: datetime | None
     sources_total: int
     sources_up: int
+    instances_total: int
+    instances_up: int
+    instances_stale: int
+    instances: list[CheckInstanceResponse]
     stale_results: int
     data_incomplete: bool
     latency_seconds: float | None
@@ -128,6 +142,7 @@ class CheckErrorReasonResponse(BaseModel):
 
 class CheckResultResponse(BaseModel):
     source: str | None
+    instance_id: str | None
     scenario: str | None
     variant: str | None
     target: str | None
@@ -435,6 +450,7 @@ def _unavailable_result(result: CheckResultView) -> CheckResultView:
             for target in result.targets
         ),
         error_reasons=(),
+        logical_source=result.logical_source,
     )
 
 
@@ -571,13 +587,62 @@ def _active_count(
     return relations.active_counts.get(check_id, 0)
 
 
+def _instance_responses(check: AggregatedCheck) -> list[CheckInstanceResponse]:
+    grouped: dict[str, list[CheckResultView]] = {}
+    for result in check.results:
+        grouped.setdefault(result.key.source, []).append(result)
+
+    responses: list[CheckInstanceResponse] = []
+    for instance_id, results in sorted(grouped.items()):
+        statuses = {result.status for result in results}
+        if "up" in statuses and "down" in statuses:
+            status: CheckStatus = "degraded"
+            reason = "mixed_results"
+        elif "down" in statuses:
+            status = "down"
+            reason = "result_failed"
+        elif statuses == {"up"}:
+            status = "up"
+            reason = "result_up"
+        elif statuses == {"stale"}:
+            status = "stale"
+            reason = "expired_measurements"
+        else:
+            status = "unknown"
+            reason = "incomplete_data"
+        sources = {result.logical_source or result.key.source for result in results}
+        timestamps = [result.last_run_at for result in results if result.last_run_at is not None]
+        responses.append(
+            CheckInstanceResponse(
+                instance_id=_public_dimension(instance_id, DEFAULT_SOURCE),
+                source=(
+                    _public_dimension(next(iter(sources)), DEFAULT_SOURCE)
+                    if len(sources) == 1
+                    else None
+                ),
+                status=status,
+                status_reason=reason,
+                last_checked_at=max(timestamps) if timestamps else None,
+                stale=status == "stale",
+                data_incomplete=status == "unknown"
+                or any(result.data_incomplete for result in results),
+            )
+        )
+    return responses
+
+
 def _list_item(
     check: AggregatedCheck,
     relations: _IncidentRelations | None,
 ) -> CheckListItemResponse:
     sources = sorted(
-        {result.key.source for result in check.results if result.key.source != DEFAULT_SOURCE}
+        {
+            result.logical_source or result.key.source
+            for result in check.results
+            if (result.logical_source or result.key.source) != DEFAULT_SOURCE
+        }
     )
+    instances = _instance_responses(check)
     return CheckListItemResponse(
         check_id=check.check_id,
         name=check.name,
@@ -589,6 +654,10 @@ def _list_item(
         oldest_checked_at=check.oldest_checked_at,
         sources_total=check.sources_total,
         sources_up=check.sources_up,
+        instances_total=len(instances),
+        instances_up=sum(instance.status == "up" for instance in instances),
+        instances_stale=sum(instance.status == "stale" for instance in instances),
+        instances=instances,
         stale_results=check.stale_results,
         data_incomplete=check.data_incomplete,
         latency_seconds=check.latency_seconds,
@@ -634,8 +703,14 @@ def _error_reason_response(error: CheckErrorReason) -> CheckErrorReasonResponse:
 
 
 def _result_response(result: CheckResultView) -> CheckResultResponse:
+    logical_source = result.logical_source or result.key.source
     return CheckResultResponse(
-        source=_public_dimension(result.key.source, DEFAULT_SOURCE),
+        source=_public_dimension(logical_source, DEFAULT_SOURCE),
+        instance_id=(
+            _public_dimension(result.key.source, DEFAULT_SOURCE)
+            if result.key.source != logical_source
+            else None
+        ),
         scenario=_public_dimension(result.key.scenario, DEFAULT_SCENARIO),
         variant=_public_dimension(result.key.variant, DEFAULT_VARIANT),
         target=result.target,
