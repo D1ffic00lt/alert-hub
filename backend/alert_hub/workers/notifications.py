@@ -33,7 +33,6 @@ from alert_hub.application.notifications import (
 from alert_hub.domain.routing import (
     NodeCandidate,
     RouteRule,
-    failover_delay_seconds,
     parse_matcher,
     rank_delivery_nodes,
     select_channel_ids,
@@ -262,15 +261,22 @@ class NotificationOutboxProcessor:
                 no_eligible_node = True
             elif rank is None:
                 return _TargetProgress(True)
-            else:
-                due_at = event.received_at + timedelta(
-                    seconds=failover_delay_seconds(
-                        rank,
-                        self._settings.notification_failover_base_seconds,
-                    )
+            elif rank > 0:
+                # A local timeout cannot fence the current owner. Promoting every
+                # rendezvous rank after a delay lets all partitions call the
+                # provider for the same deterministic delivery. Keep the durable
+                # work queued until the rank-zero receipt arrives instead.
+                return _TargetProgress(
+                    False,
+                    now
+                    + timedelta(
+                        seconds=max(
+                            self._settings.notification_failover_base_seconds,
+                            self._settings.notification_poll_seconds,
+                        )
+                    ),
+                    "awaiting_owner_receipt",
                 )
-                if now < due_at:
-                    return _TargetProgress(False, due_at, "awaiting_failover")
 
         if no_eligible_node:
             return self._defer_no_eligible_node(
@@ -323,6 +329,19 @@ class NotificationOutboxProcessor:
             )
             for node in nodes
         ]
+        known_node_ids = {candidate.node_id for candidate in candidates}
+        configured_node_ids = {
+            str(node_id)
+            for node_id in (channel.eligible_nodes_or_regions or {}).get("node_ids", [])
+            if str(node_id)
+        }
+        # Explicit channel eligibility is replicated with the channel and is more
+        # stable than a partially synchronized Node projection. Retain configured
+        # candidates even if their inventory row has not arrived on this node yet.
+        candidates.extend(
+            NodeCandidate(node_id=node_id, region="", enabled_roles=frozenset({"notify"}))
+            for node_id in sorted(configured_node_ids - known_node_ids)
+        )
         ranking = rank_delivery_nodes(
             event_identity,
             channel.id,
@@ -405,6 +424,7 @@ class NotificationOutboxProcessor:
             delivery.error_code = None
             delivery.finished_at = None
             db.flush()
+            self._append_receipt(db, delivery, occurred_at=self._now())
             db.expunge(delivery)
             return delivery
 
@@ -536,7 +556,13 @@ class NotificationOutboxProcessor:
             delivery.error_code,
         )
 
-    def _append_receipt(self, db: Session, delivery: Delivery) -> None:
+    def _append_receipt(
+        self,
+        db: Session,
+        delivery: Delivery,
+        *,
+        occurred_at: datetime | None = None,
+    ) -> None:
         receipt_id = str(
             uuid5(
                 NAMESPACE_URL,
@@ -556,7 +582,10 @@ class NotificationOutboxProcessor:
             delivery,
             source_event_key=source_event.event_key,
         )
-        operation = "delivery_succeeded" if delivery.status == "succeeded" else "delivery_failed"
+        operation = {
+            "sending": "delivery_attempted",
+            "succeeded": "delivery_succeeded",
+        }.get(delivery.status, "delivery_failed")
         cluster_event = append_cluster_event(
             db,
             self._settings,
@@ -564,7 +593,7 @@ class NotificationOutboxProcessor:
             entity_id=delivery.id,
             operation=operation,
             payload=payload,
-            occurred_at=delivery.finished_at,
+            occurred_at=occurred_at or delivery.finished_at,
             event_id=receipt_id,
         )
         replicated_payload = {

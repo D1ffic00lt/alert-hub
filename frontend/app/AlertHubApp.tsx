@@ -10,7 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
 
 import { AlertsPage } from "./alerts/AlertsPage";
 import { createAsyncRequestLimiter } from "./api/concurrency";
@@ -1248,6 +1248,7 @@ const EVENT_TYPE_LABELS: Record<string, readonly [string, string]> = {
   acknowledged: ["Инцидент принят в работу", "Acknowledged"],
   silenced: ["Инцидент приглушён", "Silenced"],
   commented: ["Добавлен комментарий", "Commented"],
+  delivery_attempted: ["Начата отправка уведомления", "Delivery Attempted"],
   delivery_succeeded: ["Уведомление доставлено", "Delivery Succeeded"],
   delivery_failed: ["Ошибка доставки", "Delivery Failed"],
   delivery_retry: ["Повторная доставка", "Delivery Retry"],
@@ -2121,6 +2122,7 @@ async function apiFetch(
   init: RequestInit = {},
   expectedAuthGeneration?: number,
   expectedSessionId?: string | null,
+  endpointOptions: { retryNotFound?: boolean } = {},
 ) {
   const assertExpectedAuthContext = () => {
     if (
@@ -2157,6 +2159,7 @@ async function apiFetch(
   const requestInit = { ...init, credentials: "include" as RequestCredentials, headers };
   let response = await apiEndpointManager.fetchApi(path, requestInit, {
     replayRefresh: path === "/auth/refresh",
+    retryNotFound: endpointOptions.retryNotFound,
   });
   assertExpectedAuthContext();
   if (response.status === 401 && !path.startsWith("/auth/")) {
@@ -2167,7 +2170,7 @@ async function apiFetch(
     if (refreshed && memoryAccessToken) {
       headers.set("Authorization", `Bearer ${memoryAccessToken}`);
       if (memorySessionId) headers.set("X-Alert-Hub-Cache-Partition", memorySessionId);
-      response = await apiEndpointManager.fetchApi(path, requestInit);
+      response = await apiEndpointManager.fetchApi(path, requestInit, endpointOptions);
       assertExpectedAuthContext();
     }
   }
@@ -2262,7 +2265,11 @@ function useOverviewStatistics(demo: boolean): {
 }
 
 async function getChecksJson(path: string, signal: AbortSignal): Promise<ChecksRequestResult> {
-  const response = await apiFetch(path, { cache: "no-store", signal });
+  const detailSegment = /^\/checks\/([^/?]+)(?:[?#]|$)/u.exec(path)?.[1];
+  const checkDetailRequest = Boolean(detailSegment && detailSegment !== "summary");
+  const response = await apiFetch(path, { cache: "no-store", signal }, undefined, undefined, {
+    retryNotFound: checkDetailRequest,
+  });
   const payload = (await response.json().catch(() => ({}))) as unknown;
   return { status: response.status, payload };
 }
@@ -6400,13 +6407,13 @@ function IncidentDetailPage({
               <Icon symbol="checks" /> {tr("Связанные Checks", "Related Checks")}
             </span>
             {incident.checkIds?.map((checkId) => (
-              <button
+              <Link
                 key={checkId}
                 className="button button--quiet button--small"
-                onClick={() => navigate(`/checks/${encodeURIComponent(checkId)}`)}
+                to={`/checks/${encodeURIComponent(checkId)}`}
               >
                 <code>{checkId}</code> <span aria-hidden="true">→</span>
-              </button>
+              </Link>
             ))}
           </nav>
         )}
