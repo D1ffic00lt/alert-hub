@@ -82,9 +82,12 @@ failure_compose() {
 cleanup() {
   local exit_status=$?
   if ((exit_status != 0)); then
-    printf '%s\n' 'Image matrix smoke failed; container diagnostics follow.' >&2
+    printf '%s\n' 'Image matrix smoke failed; primary container diagnostics follow.' >&2
     compose ps --all >&2 || true
     compose logs --no-color --tail 200 alert-hub alert-hub-web >&2 || true
+    printf '%s\n' 'Failed-start container diagnostics follow.' >&2
+    failure_compose ps --all >&2 || true
+    failure_compose logs --no-color --tail 200 alert-hub alert-hub-web >&2 || true
   fi
   compose down --volumes --remove-orphans >/dev/null 2>&1 || true
   failure_compose down --volumes --remove-orphans >/dev/null 2>&1 || true
@@ -286,18 +289,40 @@ done
   exit 1
 }
 
-# A failed API entrypoint must never let the dependent web service start.
+# A failed API entrypoint must not expose a public web endpoint. Compose may
+# create the web container before the API exits; in single mode its entrypoint
+# remains in the bounded readiness wait and does not start Nginx.
 failure_compose up --detach --no-build >/dev/null 2>&1 || true
 sleep 5
+failure_api=$(docker container ls --all --quiet \
+  --filter "label=com.docker.compose.project=${failure_project}" \
+  --filter "label=com.docker.compose.service=alert-hub")
+if [[ -z ${failure_api} || ${failure_api} == *$'\n'* ]]; then
+  printf 'Expected exactly one failed-start API container, got: %s\n' \
+    "${failure_api:-none}" >&2
+  exit 1
+fi
+[[ $(docker container inspect "${failure_api}" --format '{{.State.Running}}') != true ]] || {
+  printf '%s\n' 'Invalid migration setting did not stop the API container' >&2
+  exit 1
+}
+[[ $(docker container inspect "${failure_api}" --format '{{.State.ExitCode}}') != 0 ]] || {
+  printf '%s\n' 'Invalid migration setting produced a successful API exit code' >&2
+  exit 1
+}
 failure_web=$(docker container ls --all --quiet \
   --filter "label=com.docker.compose.project=${failure_project}" \
   --filter "label=com.docker.compose.service=alert-hub-web")
-if [[ -n ${failure_web} ]]; then
-  [[ $(docker container inspect "${failure_web}" --format '{{.State.Running}}') != true ]] || {
-    printf '%s\n' 'Web container unexpectedly ran after the API entrypoint failed' >&2
-    exit 1
-  }
+if [[ ${failure_web} == *$'\n'* ]]; then
+  printf 'Expected at most one failed-start web container, got: %s\n' "${failure_web}" >&2
+  exit 1
 fi
+failure_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --max-time 3 "http://127.0.0.1:${failure_host_port}/" || true)
+[[ ${failure_status} == 000 ]] || {
+  printf 'Failed API startup exposed an HTTP %s web response\n' "${failure_status}" >&2
+  exit 1
+}
 
 printf '%s\n' \
   'Image matrix smoke passed: isolated API/Web runtimes, compatible pair, failure gating, and independent recovery.'
