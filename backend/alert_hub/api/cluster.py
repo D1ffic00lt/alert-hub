@@ -18,7 +18,6 @@ from alert_hub.api.schemas import SyncQueryRequest
 from alert_hub.application.auth import add_audit
 from alert_hub.application.cluster_health import (
     PEER_OFFLINE_FAILURE_THRESHOLD,
-    record_node_api_down,
     set_node_api_down_alert,
 )
 from alert_hub.application.sync import (
@@ -266,29 +265,16 @@ def update_node_api_down_alerts(
             detail={"message": "Cluster node not found", "node_ids": missing},
         )
 
-    peer_worker = getattr(request.app.state, "peer_sync_worker", None)
-    peer_snapshot = peer_worker.status_snapshot() if peer_worker is not None else {}
     updated = 0
-    alerts_opened = 0
     ordered_nodes = [nodes_by_id[node_id] for node_id in node_ids]
     for node in ordered_nodes:
         if set_node_api_down_alert(db, node, payload.enabled, settings):
             updated += 1
-        runtime = peer_snapshot.get(node.id)
-        if (
-            payload.enabled
-            and runtime is not None
-            and not bool(runtime.get("up"))
-            and int(runtime.get("failures") or 0) >= PEER_OFFLINE_FAILURE_THRESHOLD
-        ):
-            alerts_opened += int(
-                record_node_api_down(
-                    db,
-                    node,
-                    settings,
-                    failure_count=int(runtime.get("failures") or 0),
-                )
-            )
+
+    # Keep the response field for API compatibility. API-down settings remain
+    # durable, but private peer-sync state is no longer allowed to open a public
+    # API-down incident.
+    alerts_opened = 0
 
     add_audit(
         db,
