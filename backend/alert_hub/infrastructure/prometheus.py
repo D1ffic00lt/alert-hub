@@ -310,7 +310,7 @@ def parse_alert_rules_response(
                 AlertRule(
                     file=file_name if isinstance(file_name, str) else "",
                     group=group_name,
-                    name=str(raw_rule["name"]),
+                    name=str(raw_rule["name"])[:200],
                     state=state,
                     health=str(raw_rule.get("health") or "unknown").lower()[:64],
                     firing_instances=firing,

@@ -26,7 +26,14 @@ def _create_incident(
     key: str,
     severity: str = "critical",
     title: str | None = None,
+    alertname: str | None = None,
+    prometheus_datasource_id: str | None = None,
 ) -> str:
+    labels = {"target_name": f"target-{key}", "source_region": "test"}
+    if alertname is not None:
+        labels["alertname"] = alertname
+    if prometheus_datasource_id is not None:
+        labels["prometheus_datasource_id"] = prometheus_datasource_id
     response = client.post(
         f"/ingest/v1/events/{source['id']}",
         headers={"Authorization": f"Bearer {source['token']}"},
@@ -39,7 +46,7 @@ def _create_incident(
             "description": f"Description for {key}",
             "severity": severity,
             "starts_at": "2026-09-01T12:00:00Z",
-            "labels": {"target_name": f"target-{key}", "source_region": "test"},
+            "labels": labels,
         },
     )
     assert response.status_code == 200, response.text
@@ -53,9 +60,29 @@ def test_incident_list_filters_on_server_and_compact_view_is_bounded(
     app: Any,
 ) -> None:
     source = _create_source(client, auth)
-    first_id = _create_incident(client, source, key="alpha", title="API percent % incident")
-    _create_incident(client, source, key="beta", severity="warning")
-    resolved_id = _create_incident(client, source, key="gamma")
+    first_id = _create_incident(
+        client,
+        source,
+        key="alpha",
+        title="API percent % incident",
+        alertname="ApiDown",
+        prometheus_datasource_id="prom-ru",
+    )
+    _create_incident(
+        client,
+        source,
+        key="beta",
+        severity="warning",
+        alertname="ApiDown",
+        prometheus_datasource_id="prom-nl",
+    )
+    resolved_id = _create_incident(
+        client,
+        source,
+        key="gamma",
+        alertname="OtherRule",
+        prometheus_datasource_id="prom-ru",
+    )
     resolved = client.post(
         f"/api/v1/incidents/{resolved_id}/resolve",
         headers=auth,
@@ -138,6 +165,20 @@ def test_incident_list_filters_on_server_and_compact_view_is_bounded(
     assert "incidents.annotations_json" not in selected_columns
     assert "incidents.status in" in normalized_page_statement
 
+    exact = client.get(
+        "/api/v1/incidents",
+        headers=auth,
+        params={
+            "status": "active",
+            "alertname": "ApiDown",
+            "datasource_id": "prom-ru",
+            "view": "compact",
+        },
+    )
+    assert exact.status_code == 200, exact.text
+    assert exact.json()["total"] == 1
+    assert [item["id"] for item in exact.json()["items"]] == [first_id]
+
 
 def test_bulk_incident_action_reports_partial_and_idempotent_results(
     client: TestClient,
@@ -145,8 +186,20 @@ def test_bulk_incident_action_reports_partial_and_idempotent_results(
     app: Any,
 ) -> None:
     source = _create_source(client, auth)
-    first_id = _create_incident(client, source, key="first")
-    second_id = _create_incident(client, source, key="second")
+    first_id = _create_incident(
+        client,
+        source,
+        key="first",
+        alertname="ApiDown",
+        prometheus_datasource_id="prom-ru",
+    )
+    second_id = _create_incident(
+        client,
+        source,
+        key="second",
+        alertname="ApiDown",
+        prometheus_datasource_id="prom-nl",
+    )
     resolved_id = _create_incident(client, source, key="resolved")
     assert (
         client.post(
@@ -202,7 +255,13 @@ def test_bulk_incident_action_reports_partial_and_idempotent_results(
             "action": "silence",
             "selection_mode": "filter",
             "excluded_incident_ids": [first_id],
-            "filters": {"status": "active", "severity": "critical", "q": "Bulk incident"},
+            "filters": {
+                "status": "active",
+                "severity": "critical",
+                "q": "Bulk incident",
+                "alertname": "ApiDown",
+                "prometheus_datasource_id": "prom-nl",
+            },
         },
     )
     assert filtered.status_code == 200, filtered.text

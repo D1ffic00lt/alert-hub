@@ -47,6 +47,8 @@ export type IncidentListFilters = {
   status: "active" | "all" | "open" | "acknowledged" | "resolved" | "silenced";
   severity: "all" | "critical" | "warning" | "info" | "unknown";
   query: string;
+  alertname?: string;
+  datasourceId?: string;
   limit: number;
   offset: number;
 };
@@ -65,6 +67,8 @@ export function incidentListPath(filters: IncidentListFilters): string {
   if (filters.severity !== "all") params.set("severity", filters.severity);
   const query = normalizeIncidentSearch(filters.query);
   if (query) params.set("q", query);
+  if (filters.alertname) params.set("alertname", filters.alertname);
+  if (filters.datasourceId) params.set("datasource_id", filters.datasourceId);
   return `/incidents?${params.toString()}`;
 }
 

@@ -49,7 +49,11 @@ def _rule(
     health: str = "ok",
     alerts: list[dict[str, str]] | None = None,
     last_error: str = "",
+    category: str | None = None,
 ) -> dict[str, Any]:
+    labels = {"severity": "critical", "team": "platform"}
+    if category is not None:
+        labels["alert_category"] = category
     return {
         "name": name,
         "state": state,
@@ -58,7 +62,7 @@ def _rule(
         "lastEvaluation": "2026-09-07T00:00:00Z",
         "evaluationTime": 0.012,
         "lastError": last_error,
-        "labels": {"severity": "critical", "team": "platform"},
+        "labels": labels,
         "annotations": {"summary": f"{name} summary"},
     }
 
@@ -111,6 +115,14 @@ def test_alert_rule_parser_normalizes_states_bounds_fields_and_redacts_errors() 
     assert "prometheus.internal" not in rule.last_error
     assert "super-secret" not in rule.last_error
 
+    bounded = parse_alert_rules_response(
+        _rules(_rule("A" * 300, category="custom-" + "x" * 3_000)),
+        max_rules=10,
+        max_instances=10,
+    )[0]
+    assert len(bounded.name) == 200
+    assert len(bounded.labels["alert_category"]) == 2_048
+
     with pytest.raises(PrometheusQueryError, match="rule limit"):
         parse_alert_rules_response(_rules(_rule("A"), _rule("B")), max_rules=1, max_instances=10)
     with pytest.raises(PrometheusQueryError, match="instance limit"):
@@ -121,7 +133,7 @@ def test_alert_rule_parser_normalizes_states_bounds_fields_and_redacts_errors() 
         )
 
 
-def test_alert_rules_are_stable_paginated_filterable_and_partial(
+def test_alert_rules_are_grouped_by_dynamic_category_filterable_and_partial(
     client: TestClient,
     auth: dict[str, str],
     app: Any,
@@ -134,6 +146,26 @@ def test_alert_rules_are_stable_paginated_filterable_and_partial(
         assert request.url.params["type"] == "alert"
         if request.url.host == "8.8.8.8":
             return httpx.Response(503, request=request, text="secret upstream body")
+        if request.url.host == "9.9.9.9":
+            return httpx.Response(
+                200,
+                request=request,
+                json=_rules(
+                    _rule(
+                        "ApiDown",
+                        state="pending",
+                        alerts=[{"state": "pending"}],
+                        category="infrastructure",
+                    ),
+                    _rule(
+                        "DatabaseRuleBroken",
+                        health="error",
+                        last_error="query evaluation failed",
+                        category="database",
+                    ),
+                    _rule("XrayLatencyHigh", state="pending", category="xray"),
+                ),
+            )
         return httpx.Response(
             200,
             request=request,
@@ -145,32 +177,52 @@ def test_alert_rules_are_stable_paginated_filterable_and_partial(
                     health="error",
                     alerts=[{"state": "firing"}, {"state": "pending"}],
                     last_error="failed https://prometheus.private/query token=secret-token",
+                    category="infrastructure",
                 ),
             ),
         )
 
     app.state.prometheus_http_transport = httpx.MockTransport(prometheus)
     datasource_id = _create_datasource(client, auth, name="Primary Prometheus", host="1.1.1.1")
+    secondary_id = _create_datasource(client, auth, name="Secondary Prometheus", host="9.9.9.9")
     _create_datasource(client, auth, name="Unavailable Prometheus", host="8.8.8.8")
 
-    response = client.get("/api/v1/alert-rules?page_size=1", headers=auth)
+    response = client.get("/api/v1/alert-rules?page_size=10", headers=auth)
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["data_state"] == "partial"
     assert body["totals"] == {
-        "rules": 2,
-        "firing_instances": 1,
-        "pending_instances": 1,
-        "unhealthy_rules": 1,
+        "rules": 4,
+        "firing_rules": 1,
+        "pending_rules": 2,
+        "error_rules": 2,
+        "datasources": 3,
         "related_incidents": 0,
     }
+    assert body["filtered_rules"] == 4
+    assert body["categories"] == ["database", "infrastructure", "xray"]
+    assert body["has_uncategorized"] is True
+    assert body["last_successful_refresh"] is not None
     assert body["pagination"] == {
         "page": 1,
-        "page_size": 1,
-        "total_items": 2,
-        "total_pages": 2,
+        "page_size": 10,
+        "total_items": 4,
+        "total_pages": 1,
     }
     assert body["rules"][0]["name"] == "ApiDown"
+    assert body["rules"][0]["category"] == "infrastructure"
+    assert body["rules"][0]["state"] == "firing"
+    assert body["rules"][0]["firing_instances"] == 1
+    assert body["rules"][0]["pending_instances"] == 2
+    assert body["rules"][0]["datasource_count"] == 2
+    assert [item["datasource_name"] for item in body["rules"][0]["replicas"]] == [
+        "Primary Prometheus",
+        "Secondary Prometheus",
+    ]
+    assert body["rules"][0]["replicas"][0]["labels"]["alert_category"] == "infrastructure"
+    assert body["rules"][0]["replicas"][0]["incidents_href"] == (
+        f"/incidents?alertname=ApiDown&datasource_id={datasource_id}"
+    )
     stable_id = body["rules"][0]["id"]
     assert body["errors"][0] == {
         "datasource_id": body["errors"][0]["datasource_id"],
@@ -183,13 +235,31 @@ def test_alert_rules_are_stable_paginated_filterable_and_partial(
     assert "prometheus.private" not in serialized
     assert "secret upstream body" not in serialized
 
-    filtered = client.get(
+    error_filtered = client.get(
         "/api/v1/alert-rules",
         headers=auth,
-        params={"datasource_id": datasource_id, "state": "error", "q": "api"},
+        params={"state": "error", "category": "database"},
     ).json()
-    assert [item["name"] for item in filtered["rules"]] == ["ApiDown"]
-    assert filtered["rules"][0]["id"] == stable_id
+    assert [item["name"] for item in error_filtered["rules"]] == ["DatabaseRuleBroken"]
+
+    datasource_filtered = client.get(
+        "/api/v1/alert-rules",
+        headers=auth,
+        params={"datasource_id": secondary_id, "state": "pending", "q": "api"},
+    ).json()
+    assert [item["name"] for item in datasource_filtered["rules"]] == ["ApiDown"]
+    assert datasource_filtered["rules"][0]["id"] == stable_id
+    assert datasource_filtered["rules"][0]["state"] == "pending"
+    assert [item["datasource_id"] for item in datasource_filtered["rules"][0]["replicas"]] == [
+        secondary_id
+    ]
+
+    uncategorized = client.get(
+        "/api/v1/alert-rules", headers=auth, params={"uncategorized": "true"}
+    ).json()
+    assert [(item["category"], item["name"]) for item in uncategorized["rules"]] == [
+        (None, "ZuluInactive")
+    ]
     assert all("/api/v1/rules?type=alert" in value for value in requested_paths)
 
 

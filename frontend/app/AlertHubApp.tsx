@@ -5338,7 +5338,10 @@ function IncidentsPage({
   onStatusesChanged: (updates: Record<string, IncidentStatus>) => void;
 }) {
   const location = useLocation();
-  const initialQuery = new URLSearchParams(location.search).get("q")?.trim().slice(0, 200) ?? "";
+  const initialSearchParams = new URLSearchParams(location.search);
+  const initialQuery = initialSearchParams.get("q")?.trim().slice(0, 200) ?? "";
+  const exactAlertname = initialSearchParams.get("alertname")?.trim().slice(0, 200) ?? "";
+  const exactDatasourceId = initialSearchParams.get("datasource_id")?.trim().slice(0, 36) ?? "";
   const [query, setQuery] = useState(initialQuery);
   const [debouncedQuery, setDebouncedQuery] = useState(initialQuery);
   const [status, setStatus] = useState<"active" | "all" | IncidentStatus>(
@@ -5376,10 +5379,12 @@ function IncidentsPage({
         status,
         severity,
         query: debouncedQuery,
+        alertname: exactAlertname,
+        datasourceId: exactDatasourceId,
         limit: INCIDENT_PAGE_SIZE,
         offset,
       }),
-    [debouncedQuery, offset, severity, status],
+    [debouncedQuery, exactAlertname, exactDatasourceId, offset, severity, status],
   );
   const requestKey = `${externalRefreshVersion}:${reloadVersion}:${requestPath}`;
   const loading =
@@ -5504,6 +5509,9 @@ function IncidentsPage({
     const counts = { ...EMPTY_INCIDENT_COUNTS };
     for (const incident of incidents) {
       if (severity !== "all" && incident.severity !== severity) continue;
+      if (exactAlertname && incident.labels.alertname !== exactAlertname) continue;
+      if (exactDatasourceId && incident.labels.prometheus_datasource_id !== exactDatasourceId)
+        continue;
       if (
         needle &&
         !`${incident.title} ${incident.description} ${incident.source} ${Object.values(
@@ -5530,7 +5538,7 @@ function IncidentsPage({
       counts,
       bulkLimit: 500,
     };
-  }, [incidents, offset, query, severity, status]);
+  }, [exactAlertname, exactDatasourceId, incidents, offset, query, severity, status]);
 
   const snapshot = requestList
     ? remote.requestPath === requestPath
@@ -5629,6 +5637,8 @@ function IncidentsPage({
     if (status !== "all") filters.status = status;
     if (severity !== "all") filters.severity = severity;
     if (debouncedQuery) filters.q = debouncedQuery;
+    if (exactAlertname) filters.alertname = exactAlertname;
+    if (exactDatasourceId) filters.prometheus_datasource_id = exactDatasourceId;
     try {
       const response = await mutationJson("/incidents/bulk-action", {
         method: "POST",
@@ -5763,6 +5773,28 @@ function IncidentsPage({
         </button>
       </div>
       <Panel className="incident-table-panel">
+        {(exactAlertname || exactDatasourceId) && (
+          <div className="incident-exact-filter" role="status">
+            <span>
+              <b>{tr("Точный фильтр правила", "Exact rule filter")}</b>
+              <small>
+                {exactAlertname && `alertname=${exactAlertname}`}
+                {exactAlertname && exactDatasourceId && " · "}
+                {exactDatasourceId && `datasource=${exactDatasourceId}`}
+              </small>
+            </span>
+            <button
+              className="button button--quiet"
+              type="button"
+              onClick={() => {
+                resetPageAndSelection();
+                navigate("/incidents");
+              }}
+            >
+              {tr("Снять фильтр", "Clear filter")}
+            </button>
+          </div>
+        )}
         <div className="filter-bar">
           <label className="search-field">
             <Icon symbol="⌕" />

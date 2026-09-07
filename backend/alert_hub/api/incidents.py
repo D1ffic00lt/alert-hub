@@ -156,6 +156,8 @@ def _incident_predicates(
     severity: Literal["info", "warning", "critical", "unknown"] | None,
     source_id: str | None,
     q: str | None,
+    alertname: str | None,
+    prometheus_datasource_id: str | None,
 ) -> list[Any]:
     predicates: list[Any] = []
     if status_filter == "active":
@@ -166,6 +168,13 @@ def _incident_predicates(
         predicates.append(Incident.severity == severity)
     if source_id:
         predicates.append(Incident.source_id == source_id)
+    if alertname:
+        predicates.append(func.json_extract(Incident.labels_json, "$.alertname") == alertname)
+    if prometheus_datasource_id:
+        predicates.append(
+            func.json_extract(Incident.labels_json, "$.prometheus_datasource_id")
+            == prometheus_datasource_id
+        )
     normalized_query = q.strip() if q else ""
     if normalized_query:
         pattern = _search_pattern(normalized_query)
@@ -186,12 +195,16 @@ def _status_counts(
     severity: Literal["info", "warning", "critical", "unknown"] | None,
     source_id: str | None,
     q: str | None,
+    alertname: str | None,
+    prometheus_datasource_id: str | None,
 ) -> dict[str, int]:
     predicates = _incident_predicates(
         status_filter=None,
         severity=severity,
         source_id=source_id,
         q=q,
+        alertname=alertname,
+        prometheus_datasource_id=prometheus_datasource_id,
     )
     query = select(Incident.status, func.count(Incident.id)).group_by(Incident.status)
     if predicates:
@@ -215,6 +228,10 @@ def list_incidents(
     severity: Literal["info", "warning", "critical", "unknown"] | None = None,
     source_id: str | None = None,
     q: str | None = Query(default=None, max_length=200),
+    alertname: str | None = Query(default=None, min_length=1, max_length=200),
+    prometheus_datasource_id: str | None = Query(
+        default=None, alias="datasource_id", min_length=1, max_length=36
+    ),
     view: Literal["full", "compact"] = "full",
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -228,8 +245,17 @@ def list_incidents(
         severity=severity,
         source_id=source_id,
         q=q,
+        alertname=alertname,
+        prometheus_datasource_id=prometheus_datasource_id,
     )
-    counts = _status_counts(db, severity=severity, source_id=source_id, q=q)
+    counts = _status_counts(
+        db,
+        severity=severity,
+        source_id=source_id,
+        q=q,
+        alertname=alertname,
+        prometheus_datasource_id=prometheus_datasource_id,
+    )
     if view == "compact":
         query = select(Incident).options(
             load_only(
@@ -285,6 +311,8 @@ def _bulk_incidents(
         severity=filters.severity,
         source_id=filters.source_id,
         q=filters.q,
+        alertname=filters.alertname,
+        prometheus_datasource_id=filters.prometheus_datasource_id,
     )
     if payload.excluded_incident_ids:
         predicates.append(Incident.id.not_in(payload.excluded_incident_ids))
