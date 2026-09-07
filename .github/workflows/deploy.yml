@@ -142,8 +142,57 @@ jobs:
           done
           sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
 
-      - name: Deploy API or compatible pair through the pre-provisioned root-owned boundary
-        if: inputs.component != 'web'
+      - name: Deploy API or compatible pair through the legacy root-owned boundary
+        if: >-
+          inputs.component != 'web' &&
+          vars.API_HA_MODE == '' &&
+          vars.PUBLIC_UI_URL == '' &&
+          vars.NODE_PUBLIC_API_URL == '' &&
+          vars.PUBLIC_INGEST_URL == '' &&
+          vars.PUBLIC_API_CANDIDATES == '' &&
+          vars.COOKIE_DOMAIN == ''
+        env:
+          NODE_NAME: ru
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_PUBLIC_URL: ${{ vars.PEER_PUBLIC_URL }}
+          ALERT_HUB_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
+          ALERT_HUB_WEB_IMAGE: ${{ needs.prepare.outputs.web_ref }}
+          ALERT_HUB_RELEASE_COMPATIBILITY: ${{ needs.prepare.outputs.compatibility }}
+          CLUSTER_MASTER_KEY: ${{ secrets.CLUSTER_MASTER_KEY }}
+          SESSION_SIGNING_KEY: ${{ secrets.SESSION_SIGNING_KEY }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          PREVIEW_PUBLIC_DOMAIN: ${{ vars.PREVIEW_PUBLIC_DOMAIN }}
+          PEER_URLS: ${{ vars.PEER_URLS }}
+          PEER_ALLOWED_CIDRS: ${{ vars.PEER_ALLOWED_CIDRS }}
+          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
+          CHECKS_ENABLED: ${{ vars.CHECKS_ENABLED }}
+          CHECKS_STALE_AFTER_SECONDS: ${{ vars.CHECKS_STALE_AFTER_SECONDS }}
+          CHECKS_MIN_FAILURE_SOURCES: ${{ vars.CHECKS_MIN_FAILURE_SOURCES }}
+          CHECKS_GRAFANA_BASE_URL: ${{ vars.CHECKS_GRAFANA_BASE_URL }}
+          CHECKS_CACHE_TTL_SECONDS: ${{ vars.CHECKS_CACHE_TTL_SECONDS }}
+          CHECKS_FUTURE_TOLERANCE_SECONDS: ${{ vars.CHECKS_FUTURE_TOLERANCE_SECONDS }}
+          CHECKS_MAX_SERIES: ${{ vars.CHECKS_MAX_SERIES }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_PUBLIC_URL CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PREVIEW_PUBLIC_DOMAIN,PEER_PUBLIC_URL,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY,CHECKS_ENABLED,CHECKS_STALE_AFTER_SECONDS,CHECKS_MIN_FAILURE_SOURCES,CHECKS_GRAFANA_BASE_URL,CHECKS_CACHE_TTL_SECONDS,CHECKS_FUTURE_TOLERANCE_SECONDS,CHECKS_MAX_SERIES /usr/local/sbin/docker-deploy-node.sh
+
+      - name: Deploy API or compatible pair through the API HA root-owned boundary
+        if: >-
+          inputs.component != 'web' &&
+          (vars.API_HA_MODE != '' ||
+          vars.PUBLIC_UI_URL != '' ||
+          vars.NODE_PUBLIC_API_URL != '' ||
+          vars.PUBLIC_INGEST_URL != '' ||
+          vars.PUBLIC_API_CANDIDATES != '' ||
+          vars.COOKIE_DOMAIN != '')
         env:
           NODE_NAME: ru
           NODE_IP: ${{ vars.NODE_IP }}
@@ -219,8 +268,56 @@ jobs:
           done
           sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
 
-      - name: Deploy API or compatible pair through the pre-provisioned root-owned boundary
-        if: inputs.component != 'web'
+      - name: Deploy API or compatible pair through the legacy root-owned boundary
+        if: >-
+          inputs.component != 'web' &&
+          vars.API_HA_MODE == '' &&
+          vars.PUBLIC_UI_URL == '' &&
+          vars.NODE_PUBLIC_API_URL == '' &&
+          vars.PUBLIC_INGEST_URL == '' &&
+          vars.PUBLIC_API_CANDIDATES == '' &&
+          vars.COOKIE_DOMAIN == ''
+        env:
+          NODE_NAME: nl
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_PUBLIC_URL: ${{ vars.PEER_PUBLIC_URL }}
+          ALERT_HUB_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
+          ALERT_HUB_WEB_IMAGE: ${{ needs.prepare.outputs.web_ref }}
+          ALERT_HUB_RELEASE_COMPATIBILITY: ${{ needs.prepare.outputs.compatibility }}
+          CLUSTER_MASTER_KEY: ${{ secrets.CLUSTER_MASTER_KEY }}
+          SESSION_SIGNING_KEY: ${{ secrets.SESSION_SIGNING_KEY }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          PEER_URLS: ${{ vars.PEER_URLS }}
+          PEER_ALLOWED_CIDRS: ${{ vars.PEER_ALLOWED_CIDRS }}
+          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
+          CHECKS_ENABLED: ${{ vars.CHECKS_ENABLED }}
+          CHECKS_STALE_AFTER_SECONDS: ${{ vars.CHECKS_STALE_AFTER_SECONDS }}
+          CHECKS_MIN_FAILURE_SOURCES: ${{ vars.CHECKS_MIN_FAILURE_SOURCES }}
+          CHECKS_GRAFANA_BASE_URL: ${{ vars.CHECKS_GRAFANA_BASE_URL }}
+          CHECKS_CACHE_TTL_SECONDS: ${{ vars.CHECKS_CACHE_TTL_SECONDS }}
+          CHECKS_FUTURE_TOLERANCE_SECONDS: ${{ vars.CHECKS_FUTURE_TOLERANCE_SECONDS }}
+          CHECKS_MAX_SERIES: ${{ vars.CHECKS_MAX_SERIES }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_PUBLIC_URL CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_PUBLIC_URL,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY,CHECKS_ENABLED,CHECKS_STALE_AFTER_SECONDS,CHECKS_MIN_FAILURE_SOURCES,CHECKS_GRAFANA_BASE_URL,CHECKS_CACHE_TTL_SECONDS,CHECKS_FUTURE_TOLERANCE_SECONDS,CHECKS_MAX_SERIES /usr/local/sbin/docker-deploy-node.sh
+
+      - name: Deploy API or compatible pair through the API HA root-owned boundary
+        if: >-
+          inputs.component != 'web' &&
+          (vars.API_HA_MODE != '' ||
+          vars.PUBLIC_UI_URL != '' ||
+          vars.NODE_PUBLIC_API_URL != '' ||
+          vars.PUBLIC_INGEST_URL != '' ||
+          vars.PUBLIC_API_CANDIDATES != '' ||
+          vars.COOKIE_DOMAIN != '')
         env:
           NODE_NAME: nl
           NODE_IP: ${{ vars.NODE_IP }}
@@ -296,8 +393,56 @@ jobs:
           done
           sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME /usr/local/sbin/docker-deploy-node.sh
 
-      - name: Deploy API or compatible pair through the pre-provisioned root-owned boundary
-        if: inputs.component != 'web'
+      - name: Deploy API or compatible pair through the legacy root-owned boundary
+        if: >-
+          inputs.component != 'web' &&
+          vars.API_HA_MODE == '' &&
+          vars.PUBLIC_UI_URL == '' &&
+          vars.NODE_PUBLIC_API_URL == '' &&
+          vars.PUBLIC_INGEST_URL == '' &&
+          vars.PUBLIC_API_CANDIDATES == '' &&
+          vars.COOKIE_DOMAIN == ''
+        env:
+          NODE_NAME: de
+          NODE_IP: ${{ vars.NODE_IP }}
+          PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+          PEER_PUBLIC_URL: ${{ vars.PEER_PUBLIC_URL }}
+          ALERT_HUB_VERSION: ${{ inputs.version }}
+          ALERT_HUB_COMPONENT: ${{ inputs.component }}
+          ALERT_HUB_API_IMAGE: ${{ needs.prepare.outputs.api_ref }}
+          ALERT_HUB_WEB_IMAGE: ${{ needs.prepare.outputs.web_ref }}
+          ALERT_HUB_RELEASE_COMPATIBILITY: ${{ needs.prepare.outputs.compatibility }}
+          CLUSTER_MASTER_KEY: ${{ secrets.CLUSTER_MASTER_KEY }}
+          SESSION_SIGNING_KEY: ${{ secrets.SESSION_SIGNING_KEY }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          PEER_URLS: ${{ vars.PEER_URLS }}
+          PEER_ALLOWED_CIDRS: ${{ vars.PEER_ALLOWED_CIDRS }}
+          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
+          CHECKS_ENABLED: ${{ vars.CHECKS_ENABLED }}
+          CHECKS_STALE_AFTER_SECONDS: ${{ vars.CHECKS_STALE_AFTER_SECONDS }}
+          CHECKS_MIN_FAILURE_SOURCES: ${{ vars.CHECKS_MIN_FAILURE_SOURCES }}
+          CHECKS_GRAFANA_BASE_URL: ${{ vars.CHECKS_GRAFANA_BASE_URL }}
+          CHECKS_CACHE_TTL_SECONDS: ${{ vars.CHECKS_CACHE_TTL_SECONDS }}
+          CHECKS_FUTURE_TOLERANCE_SECONDS: ${{ vars.CHECKS_FUTURE_TOLERANCE_SECONDS }}
+          CHECKS_MAX_SERIES: ${{ vars.CHECKS_MAX_SERIES }}
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_IP PUBLIC_DOMAIN PEER_PUBLIC_URL CLUSTER_MASTER_KEY SESSION_SIGNING_KEY VAPID_PRIVATE_KEY; do
+            [[ -n ${!required} ]] || { printf 'Required protected value %s is missing\n' "${required}" >&2; exit 2; }
+          done
+          sudo --preserve-env=NODE_NAME,NODE_IP,PUBLIC_DOMAIN,PEER_PUBLIC_URL,ALERT_HUB_VERSION,ALERT_HUB_COMPONENT,ALERT_HUB_API_IMAGE,ALERT_HUB_WEB_IMAGE,ALERT_HUB_RELEASE_COMPATIBILITY,CLUSTER_MASTER_KEY,SESSION_SIGNING_KEY,VAPID_PRIVATE_KEY,GHCR_TOKEN,GITHUB_ACTOR,GITHUB_REPOSITORY,APP_NAME,PEER_URLS,PEER_ALLOWED_CIDRS,VAPID_PUBLIC_KEY,CHECKS_ENABLED,CHECKS_STALE_AFTER_SECONDS,CHECKS_MIN_FAILURE_SOURCES,CHECKS_GRAFANA_BASE_URL,CHECKS_CACHE_TTL_SECONDS,CHECKS_FUTURE_TOLERANCE_SECONDS,CHECKS_MAX_SERIES /usr/local/sbin/docker-deploy-node.sh
+
+      - name: Deploy API or compatible pair through the API HA root-owned boundary
+        if: >-
+          inputs.component != 'web' &&
+          (vars.API_HA_MODE != '' ||
+          vars.PUBLIC_UI_URL != '' ||
+          vars.NODE_PUBLIC_API_URL != '' ||
+          vars.PUBLIC_INGEST_URL != '' ||
+          vars.PUBLIC_API_CANDIDATES != '' ||
+          vars.COOKIE_DOMAIN != '')
         env:
           NODE_NAME: de
           NODE_IP: ${{ vars.NODE_IP }}

@@ -1645,34 +1645,41 @@ def test_web_only_production_deploy_does_not_receive_crypto_secrets() -> None:
     for job_name in ("deploy_ru", "deploy_nl", "deploy_de"):
         steps = deploy["jobs"][job_name]["steps"]
         web_step = next(step for step in steps if step.get("if") == "inputs.component == 'web'")
-        api_step = next(step for step in steps if step.get("if") == "inputs.component != 'web'")
+        api_steps = [
+            step for step in steps if "inputs.component != 'web'" in str(step.get("if", ""))
+        ]
         status_step = next(
             step
             for step in steps
             if "/usr/local/sbin/docker-status-node.sh" in str(step.get("run", ""))
         )
         web_step_text = str(web_step)
-        api_step_text = str(api_step)
+        assert len(api_steps) == 2
 
         assert crypto_secrets.isdisjoint(web_step["env"])
-        assert crypto_secrets <= api_step["env"].keys()
+        assert all(crypto_secrets <= api_step["env"].keys() for api_step in api_steps)
         assert crypto_secrets.isdisjoint(status_step.get("env", {}))
         assert checks_settings.isdisjoint(web_step["env"])
-        assert checks_settings <= api_step["env"].keys()
+        assert all(checks_settings <= api_step["env"].keys() for api_step in api_steps)
         assert checks_settings.isdisjoint(status_step.get("env", {}))
         assert "PEER_PUBLIC_URL" not in web_step["env"]
-        assert "PEER_PUBLIC_URL" in api_step["env"]
+        assert all("PEER_PUBLIC_URL" in api_step["env"] for api_step in api_steps)
         assert "PEER_ADDRESS" not in web_step_text
-        assert "PEER_ADDRESS" not in api_step_text
+        assert all("PEER_ADDRESS" not in str(api_step) for api_step in api_steps)
         for secret in crypto_secrets:
             assert secret not in web_step_text
-            assert secret in api_step_text
+            assert all(secret in str(api_step) for api_step in api_steps)
         for setting in checks_settings:
             assert web_step_text.count(setting) == 0
-            assert setting in api_step_text
-            assert api_step["env"][setting] == f"${{{{ vars.{setting} }}}}"
+            assert all(setting in str(api_step) for api_step in api_steps)
+            assert all(
+                api_step["env"][setting] == f"${{{{ vars.{setting} }}}}" for api_step in api_steps
+            )
         assert "/usr/local/sbin/docker-deploy-node.sh" in str(web_step["run"])
-        assert "/usr/local/sbin/docker-deploy-node.sh" in str(api_step["run"])
+        assert all(
+            "/usr/local/sbin/docker-deploy-node.sh" in str(api_step["run"])
+            for api_step in api_steps
+        )
         assert "/usr/local/sbin/docker-status-node.sh" in str(status_step["run"])
 
     rollback_text = str(_workflow("rollback.yml"))
@@ -1699,14 +1706,20 @@ def test_preview_origin_is_optional_and_reaches_only_the_ru_api_deploy() -> None
     for job_name in ("deploy_ru", "deploy_nl", "deploy_de"):
         steps = deploy_workflow["jobs"][job_name]["steps"]
         web_step = next(step for step in steps if step.get("if") == "inputs.component == 'web'")
-        api_step = next(step for step in steps if step.get("if") == "inputs.component != 'web'")
+        api_steps = [
+            step for step in steps if "inputs.component != 'web'" in str(step.get("if", ""))
+        ]
+        assert len(api_steps) == 2
         assert "PREVIEW_PUBLIC_DOMAIN" not in web_step["env"]
         if job_name == "deploy_ru":
-            assert api_step["env"]["PREVIEW_PUBLIC_DOMAIN"] == ("${{ vars.PREVIEW_PUBLIC_DOMAIN }}")
-            assert "PREVIEW_PUBLIC_DOMAIN" in api_step["run"]
+            assert all(
+                api_step["env"]["PREVIEW_PUBLIC_DOMAIN"] == "${{ vars.PREVIEW_PUBLIC_DOMAIN }}"
+                for api_step in api_steps
+            )
+            assert all("PREVIEW_PUBLIC_DOMAIN" in api_step["run"] for api_step in api_steps)
         else:
-            assert "PREVIEW_PUBLIC_DOMAIN" not in api_step["env"]
-            assert "PREVIEW_PUBLIC_DOMAIN" not in api_step["run"]
+            assert all("PREVIEW_PUBLIC_DOMAIN" not in api_step["env"] for api_step in api_steps)
+            assert all("PREVIEW_PUBLIC_DOMAIN" not in api_step["run"] for api_step in api_steps)
 
 
 def test_production_checks_settings_are_allowlisted_validated_and_snapshotted() -> None:
@@ -1769,10 +1782,19 @@ def test_api_ha_settings_and_proxy_surfaces_are_bounded_and_peer_free() -> None:
 
     for job_name in ("deploy_ru", "deploy_nl", "deploy_de"):
         steps = deploy_workflow["jobs"][job_name]["steps"]
-        api_step = next(step for step in steps if step.get("if") == "inputs.component != 'web'")
-        assert settings <= api_step["env"].keys()
+        api_steps = [
+            step for step in steps if "inputs.component != 'web'" in str(step.get("if", ""))
+        ]
+        assert len(api_steps) == 2
+        legacy_step = next(step for step in api_steps if "legacy" in step["name"])
+        ha_step = next(step for step in api_steps if "API HA" in step["name"])
+        assert settings.isdisjoint(legacy_step["env"])
+        assert all(setting not in legacy_step["run"] for setting in settings)
+        assert settings <= ha_step["env"].keys()
         for setting in settings:
-            assert setting in api_step["run"]
+            assert setting in ha_step["run"]
+            assert f"vars.{setting} == ''" in legacy_step["if"]
+            assert f"vars.{setting} != ''" in ha_step["if"]
 
     for relative in (
         "deploy/proxy/nginx/alert-hub-public-api.conf.example",
