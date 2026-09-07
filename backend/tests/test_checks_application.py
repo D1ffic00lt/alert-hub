@@ -593,6 +593,10 @@ def test_xray_prober_contract_joins_instances_and_preserves_nested_identities() 
     check = checks[0]
     assert check.name == "RU Primary XTLS"
     assert [item.key.source for item in check.results] == ["edge-a", "edge-b"]
+    assert [item.logical_source for item in check.results] == [
+        "subscription-main",
+        "subscription-main",
+    ]
     assert {(item.key.scenario, item.key.variant) for item in check.results} == {
         ("connection", "public-web")
     }
@@ -633,6 +637,7 @@ def test_xray_prober_contract_joins_instances_and_preserves_nested_identities() 
     assert (edge_b.state, edge_b.success) == ("error", None)
     assert "missing_status" not in edge_b.diagnostics
     evaluated = evaluate_checks_snapshot(_snapshot(checks), _settings(), now=NOW)[0]
+    assert (evaluated.sources_up, evaluated.sources_total) == (0, 1)
     assert evaluated.target is None
     assert evaluated.targets == ("Dns probe", "Landing page", "Pending api", "Status api")
     assert filter_checks((evaluated,), CheckFilters(target="dns-probe")) == (evaluated,)
@@ -669,7 +674,8 @@ def test_prober_non_result_zero_timestamp_is_not_epoch_and_source_priority_is_st
     )
 
     result = checks[0].results[0]
-    assert result.key.source == "logical-source"
+    assert result.key.source == "edge-a"
+    assert result.logical_source == "logical-source"
     assert (result.key.scenario, result.key.variant) == (
         "explicit-scenario",
         "explicit-variant",
@@ -958,7 +964,7 @@ def test_partial_info_does_not_erase_a_status_only_executor_inventory() -> None:
     )
 
 
-def test_authoritative_info_can_remove_only_a_previously_declared_tuple() -> None:
+def test_authoritative_info_retains_a_missing_previously_declared_instance() -> None:
     initial = normalize_check_metrics(
         _metrics(
             check_info=[
@@ -978,7 +984,9 @@ def test_authoritative_info_can_remove_only_a_previously_declared_tuple() -> Non
         previous=_snapshot(initial),
     )
 
-    assert [result.key.source for result in current[0].results] == ["a"]
+    assert [result.key.source for result in current[0].results] == ["a", "b"]
+    assert current[0].results[1].success is None
+    assert "missing_current_result" in current[0].results[1].diagnostics
 
 
 def test_invalid_primary_dimension_cannot_improve_check_to_up() -> None:

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from alert_hub.infrastructure.db.models import PrometheusDatasource
 from alert_hub.infrastructure.encryption import EncryptionError, EnvelopeCipher
 from alert_hub.infrastructure.prometheus import (
+    AlertRule,
     FixedQueryName,
     PrometheusClient,
     PrometheusQueryError,
@@ -61,6 +62,13 @@ class DatasourceQueryTarget:
     url: str
     reachability_label_mode: str
     credentials: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class DatasourceRulesResult:
+    datasource_id: str
+    datasource_name: str
+    rules: list[AlertRule]
 
 
 def prepare_enabled_datasources(
@@ -160,5 +168,29 @@ async def query_datasource_targets(
 
     raw_results = await asyncio.gather(*(query_one(target) for target in targets))
     successes = [item for item in raw_results if isinstance(item, DatasourceQueryResult)]
+    failures = [item for item in raw_results if isinstance(item, DatasourceQueryFailure)]
+    return successes, failures
+
+
+async def query_datasource_rules_targets(
+    targets: list[DatasourceQueryTarget],
+    client: PrometheusClient,
+) -> tuple[list[DatasourceRulesResult], list[DatasourceQueryFailure]]:
+    async def query_one(
+        target: DatasourceQueryTarget,
+    ) -> DatasourceRulesResult | DatasourceQueryFailure:
+        try:
+            rules = await client.alert_rules(target.url, target.credentials)
+        except PrometheusQueryError as exc:
+            return DatasourceQueryFailure(
+                target.datasource_id,
+                target.datasource_name,
+                exc.code,
+                exc.detail,
+            )
+        return DatasourceRulesResult(target.datasource_id, target.datasource_name, rules)
+
+    raw_results = await asyncio.gather(*(query_one(target) for target in targets))
+    successes = [item for item in raw_results if isinstance(item, DatasourceRulesResult)]
     failures = [item for item in raw_results if isinstance(item, DatasourceQueryFailure)]
     return successes, failures

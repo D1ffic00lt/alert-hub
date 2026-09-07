@@ -13,6 +13,14 @@ node-local replicated append-only event history, with current-active counters fr
 projection. This remains an eventually consistent operational summary; Prometheus and Grafana
 continue to own detailed infrastructure time-series.
 
+The authenticated Alerts read model uses the same outbound Prometheus boundary. Rule inventory is
+read directly from `/api/v1/rules?type=alert`; observed availability is calculated on demand with
+fixed `avg_over_time`, `count_over_time`, and `last_over_time` expressions for exactly `24h`, `7d`,
+or `30d`. Neither result is persisted in SQLite. Rules retain datasource identity and a stable hash
+of datasource, file, group, and rule name, so similarly named rules from different Prometheus
+instances are never merged. A datasource failure produces an explicit partial result when another
+datasource answered.
+
 ```mermaid
 flowchart LR
     AM["Existing Alertmanager"] -->|"HTTPS webhook"| PX["Existing public reverse proxy"]
@@ -44,8 +52,9 @@ flowchart LR
     AGG -. "never persisted" .-> CACHE["Bounded in-memory snapshot"]
 ```
 
-A result key is `(check_id, source, scenario, variant)`; absent optional dimensions use private,
-stable sentinels that are not presented as invented user data. `synthetic_check_info` supplies the
+A result key is `(check_id, instance, scenario, variant)` and carries its logical Source separately;
+absent optional dimensions use private, stable sentinels that are not presented as invented user
+data. `synthetic_check_info` supplies the
 expected inventory when available. Without it, only series currently visible in the required
 status/timestamp metrics can establish inventory, and process restart loses any cache-only memory
 of disappeared series. Samples, run history, current status, and snapshots are never copied into
@@ -57,8 +66,9 @@ The normalization boundary also understands the richer xray-e2e-prober projectio
 it mandatory. It joins safe info metadata to other families by `check_id` plus exported
 `instance_id`, keeps each target and egress `assertion_id` nested under the universal result, and
 exposes only allowlisted one-hot states and structured cumulative reason counters. Free-form error
-text and raw/expected addresses never cross the boundary. A declared generic `source` still has
-priority; otherwise separate prober instances remain separate sources.
+text and raw/expected addresses never cross the boundary. The exported `instance_id` keeps concrete
+prober processes separate while generic `source`/`source_id` remain the logical Source used for
+quorum. The API and UI report both coverage concepts explicitly.
 
 Every node evaluates its own configured Prometheus view and owns its own short-lived cache. Checks
 failure or disablement cannot affect local ingest, incident actions, notification work, peer sync,

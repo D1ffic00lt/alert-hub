@@ -200,6 +200,7 @@ class Settings(BaseSettings):
     prometheus_query_timeout_seconds: float = Field(default=8.0, ge=0.1, le=120.0)
     prometheus_max_response_bytes: int = Field(default=2_097_152, ge=1_024, le=20_971_520)
     prometheus_max_samples: int = Field(default=10_000, ge=1, le=100_000)
+    availability_stale_after_seconds: int = Field(default=300, ge=1, le=86_400)
     heartbeat_scan_seconds: float = Field(default=10.0, ge=0.0, le=300.0)
     notification_poll_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
     notification_lock_seconds: float = Field(default=60.0, ge=5.0, le=3_600.0)

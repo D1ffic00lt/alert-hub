@@ -18,6 +18,16 @@ export type CheckSummary = Record<CheckStatus, number> & {
   total: number;
 };
 
+export type CheckInstanceCoverage = {
+  instanceId: string | null;
+  source: string | null;
+  status: CheckStatus;
+  statusReason: string | null;
+  lastCheckedAt: string | null;
+  stale: boolean;
+  dataIncomplete: boolean;
+};
+
 export type CheckListItem = {
   checkId: string;
   name: string;
@@ -29,6 +39,10 @@ export type CheckListItem = {
   oldestCheckedAt: string | null;
   sourcesTotal: number;
   sourcesUp: number;
+  instancesTotal: number;
+  instancesUp: number;
+  instancesStale: number;
+  instances: CheckInstanceCoverage[];
   staleResults: number;
   dataIncomplete: boolean;
   latencySeconds: number | null;
@@ -69,6 +83,7 @@ export type CheckErrorReason = {
 
 export type CheckResult = {
   source: string | null;
+  instanceId: string | null;
   scenario: string | null;
   variant: string | null;
   target: string | null;
@@ -241,6 +256,23 @@ function status(value: unknown): CheckStatus {
   return STATUS_SET.has(normalized as CheckStatus) ? (normalized as CheckStatus) : "unknown";
 }
 
+function normalizeInstanceCoverage(value: unknown): CheckInstanceCoverage | null {
+  const body = record(value);
+  const instanceId = stringOrNull(body.instance_id ?? body.instance);
+  const source = stringOrNull(body.source ?? body.source_id);
+  if (!instanceId && !source) return null;
+  const normalizedStatus = status(body.status);
+  return {
+    instanceId,
+    source,
+    status: normalizedStatus,
+    statusReason: stringOrNull(body.status_reason),
+    lastCheckedAt: stringOrNull(body.last_checked_at),
+    stale: Boolean(body.stale) || normalizedStatus === "stale",
+    dataIncomplete: Boolean(body.data_incomplete) || normalizedStatus === "unknown",
+  };
+}
+
 function dataState(value: unknown, enabled: boolean, itemCount = 0): ChecksDataState {
   if (!enabled) return "disabled";
   const normalized = String(value ?? "").toLowerCase();
@@ -276,6 +308,11 @@ export function normalizeCheckListItem(value: unknown): CheckListItem | null {
   const checkId = stringOrNull(body.check_id ?? body.id);
   if (!checkId) return null;
   const sourceValues = body.sources ?? body.source_names;
+  const instances = array(body.instances)
+    .map(normalizeInstanceCoverage)
+    .filter((item): item is CheckInstanceCoverage => item !== null);
+  const sourcesTotal = count(body.sources_total);
+  const sourcesUp = count(body.sources_up);
   return {
     checkId,
     name: stringOrNull(body.name ?? body.check_name) ?? checkId,
@@ -285,8 +322,18 @@ export function normalizeCheckListItem(value: unknown): CheckListItem | null {
     statusReason: stringOrNull(body.status_reason),
     lastCheckedAt: stringOrNull(body.last_checked_at),
     oldestCheckedAt: stringOrNull(body.oldest_checked_at),
-    sourcesTotal: count(body.sources_total),
-    sourcesUp: count(body.sources_up),
+    sourcesTotal,
+    sourcesUp,
+    instancesTotal: count(body.instances_total, instances.length || sourcesTotal),
+    instancesUp: count(
+      body.instances_up,
+      instances.length ? instances.filter((item) => item.status === "up").length : sourcesUp,
+    ),
+    instancesStale: count(
+      body.instances_stale,
+      instances.filter((item) => item.status === "stale").length,
+    ),
+    instances,
     staleResults: count(body.stale_results),
     dataIncomplete: Boolean(body.data_incomplete),
     latencySeconds: optionalDuration(body.latency_seconds),
@@ -428,6 +475,7 @@ export function normalizeCheckResult(value: unknown): CheckResult {
     body.status === undefined && success !== null ? (success ? "up" : "down") : status(body.status);
   return {
     source: stringOrNull(body.source),
+    instanceId: stringOrNull(body.instance_id ?? body.instance),
     scenario: stringOrNull(body.scenario),
     variant: stringOrNull(body.variant),
     target: stringOrNull(body.target),
@@ -637,15 +685,15 @@ export function resultMatrix(check: CheckDetail): {
   scenarios: Array<string | null>;
   cells: Map<string, CheckResult[]>;
 } {
-  const sources = [...new Set(check.results.map((item) => item.source))].sort((left, right) =>
-    (left ?? "").localeCompare(right ?? ""),
+  const sources = [...new Set(check.results.map((item) => item.instanceId ?? item.source))].sort(
+    (left, right) => (left ?? "").localeCompare(right ?? ""),
   );
   const scenarios = [...new Set(check.results.map((item) => item.scenario))].sort((left, right) =>
     (left ?? "").localeCompare(right ?? ""),
   );
   const cells = new Map<string, CheckResult[]>();
   check.results.forEach((item) => {
-    const key = `${item.source ?? ""}\u0000${item.scenario ?? ""}`;
+    const key = `${item.instanceId ?? item.source ?? ""}\u0000${item.scenario ?? ""}`;
     cells.set(key, [...(cells.get(key) ?? []), item]);
   });
   return { sources, scenarios, cells };

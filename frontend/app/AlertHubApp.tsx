@@ -12,6 +12,7 @@ import {
 } from "react";
 import { useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
 
+import { AlertsPage } from "./alerts/AlertsPage";
 import { CheckDetailPage, ChecksPage, ChecksWidget } from "./checks/ChecksViews";
 import {
   type ChecksOverviewState,
@@ -94,6 +95,8 @@ const SESSION_HINT_KEY = "alert-hub-session-partition-v1";
 const LOGOUT_TOMBSTONE_KEY = "alert-hub-local-logout-v1";
 const AUTH_BROADCAST_CHANNEL = "alert-hub-auth-v1";
 const SESSION_HINT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_REVALIDATE_MIN_INTERVAL_MS = 5000;
+const REFRESH_REJECTION_RETRY_MS = 250;
 
 class PushSetupCancelledError extends Error {
   constructor() {
@@ -1078,6 +1081,14 @@ const NAV_ITEMS = [
     icon: "incidents",
   },
   {
+    id: "alerts",
+    get label() {
+      return tr("Алерты", "Alerts");
+    },
+    path: "/alerts",
+    icon: "alerts",
+  },
+  {
     id: "reachability",
     get label() {
       return tr("Доступность", "Regional reachability");
@@ -2042,36 +2053,46 @@ async function refreshAccessToken(): Promise<boolean> {
   if (refreshInFlight) return refreshInFlight;
   const generation = authGeneration;
   const pending = (async () => {
-    const headers = new Headers({ Accept: "application/json" });
-    const csrf = readCookie("alert_hub_csrf") || readCookie("csrf_token") || readCookie("csrf");
-    if (csrf) headers.set("X-CSRF-Token", csrf);
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 8000);
-    try {
-      const response = await fetch(`${API_BASE}/auth/refresh`, {
-        method: "POST",
-        credentials: "include",
-        headers,
-        signal: controller.signal,
-      });
-      if (refreshBlocked || generation !== authGeneration) return false;
-      if (!response.ok) {
-        if (response.status === 401 || response.status === 403) {
-          forgetAccessToken(true);
-          window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const headers = new Headers({ Accept: "application/json" });
+      const csrf = readCookie("alert_hub_csrf") || readCookie("csrf_token") || readCookie("csrf");
+      if (csrf) headers.set("X-CSRF-Token", csrf);
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 8000);
+      try {
+        const response = await fetch(`${API_BASE}/auth/refresh`, {
+          method: "POST",
+          credentials: "include",
+          headers,
+          signal: controller.signal,
+        });
+        if (refreshBlocked || generation !== authGeneration) return false;
+        if (!response.ok) {
+          if ((response.status === 401 || response.status === 403) && attempt === 0) {
+            await new Promise<void>((resolve) => {
+              window.setTimeout(resolve, REFRESH_REJECTION_RETRY_MS);
+            });
+            if (refreshBlocked || generation !== authGeneration) return false;
+            continue;
+          }
+          if (response.status === 401 || response.status === 403) {
+            forgetAccessToken(true);
+            window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+          }
+          return false;
         }
+        const payload = await response.json();
+        if (refreshBlocked || generation !== authGeneration) return false;
+        const restored = Boolean(rememberAccessToken(payload));
+        if (restored) window.dispatchEvent(new Event(SESSION_RESTORED_EVENT));
+        return restored;
+      } catch {
         return false;
+      } finally {
+        window.clearTimeout(timer);
       }
-      const payload = await response.json();
-      if (refreshBlocked || generation !== authGeneration) return false;
-      const restored = Boolean(rememberAccessToken(payload));
-      if (restored) window.dispatchEvent(new Event(SESSION_RESTORED_EVENT));
-      return restored;
-    } catch {
-      return false;
-    } finally {
-      window.clearTimeout(timer);
     }
+    return false;
   })();
   refreshInFlight = pending;
   try {
@@ -2290,6 +2311,7 @@ function useAuthSession() {
   }, [state]);
   useEffect(() => {
     let active = true;
+    let lastActivationRevalidation = 0;
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 4500);
     const sessionExpired = () => {
@@ -2318,7 +2340,29 @@ function useAuthSession() {
         offlineReadOnlyActive = true;
       }
     };
-    const sessionRestored = () => void recoverOfflineIdentity();
+    const sessionRestored = () => {
+      if (stateRef.current.status === "offline") {
+        void recoverOfflineIdentity();
+      } else if (stateRef.current.status === "authenticated") {
+        void queryClient.invalidateQueries();
+      }
+    };
+    const revalidateActiveSession = () => {
+      if (
+        document.hidden ||
+        stateRef.current.status !== "authenticated" ||
+        refreshBlocked ||
+        hasLogoutTombstone()
+      )
+        return;
+      const now = Date.now();
+      if (now - lastActivationRevalidation < SESSION_REVALIDATE_MIN_INTERVAL_MS) return;
+      lastActivationRevalidation = now;
+      void refreshAccessToken();
+    };
+    const visibilityChanged = () => {
+      if (!document.hidden) revalidateActiveSession();
+    };
     const reconnectOfflineSession = () => {
       if (stateRef.current.status === "offline") void refreshAccessToken();
     };
@@ -2336,6 +2380,8 @@ function useAuthSession() {
     window.addEventListener(SESSION_RESTORED_EVENT, sessionRestored);
     window.addEventListener("storage", storageChanged);
     window.addEventListener("online", reconnectOfflineSession);
+    window.addEventListener("focus", revalidateActiveSession);
+    document.addEventListener("visibilitychange", visibilityChanged);
     const restore = async () => {
       try {
         forgetAccessToken(false);
@@ -2407,6 +2453,8 @@ function useAuthSession() {
       window.removeEventListener(SESSION_RESTORED_EVENT, sessionRestored);
       window.removeEventListener("storage", storageChanged);
       window.removeEventListener("online", reconnectOfflineSession);
+      window.removeEventListener("focus", revalidateActiveSession);
+      document.removeEventListener("visibilitychange", visibilityChanged);
       channel?.close();
     };
   }, [queryClient]);
@@ -3050,6 +3098,9 @@ function useHubData(
       setOnline(true);
       void refreshVisibleData();
     };
+    const onSessionRestored = () => {
+      void refreshVisibleData(true);
+    };
     const onOffline = () => {
       fullRefreshEpoch.current += 1;
       clusterRequestEpoch.current += 1;
@@ -3075,6 +3126,7 @@ function useHubData(
     };
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
+    window.addEventListener(SESSION_RESTORED_EVENT, onSessionRestored);
     return () => {
       mounted.current = false;
       fullRefreshEpoch.current += 1;
@@ -3084,6 +3136,7 @@ function useHubData(
       window.clearTimeout(initialRefresh);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
+      window.removeEventListener(SESSION_RESTORED_EVENT, onSessionRestored);
     };
   }, [demo, enabled, localizedDataVersion, refresh, refreshVisibleData]);
 
@@ -3252,6 +3305,13 @@ function iconArtwork(name: string): ReactNode | null {
           <path d="M10.3 3.8 2.8 17a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 3.8a2 2 0 0 0-3.4 0Z" />
           <path d="M12 9v4" />
           <path d="M12 17h.01" />
+        </>
+      );
+    case "alerts":
+      return (
+        <>
+          <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+          <path d="M10 21h4" />
         </>
       );
     case "reachability":
@@ -3834,7 +3894,7 @@ function Sidebar({
       </div>
       <nav className="sidebar__nav" aria-label={tr("Основная навигация", "Primary navigation")}>
         <span className="sidebar__section-label">{tr("Мониторинг", "Operations")}</span>
-        {NAV_ITEMS.slice(0, 6)
+        {NAV_ITEMS.slice(0, 7)
           .filter((item) => item.id !== "checks" || checksVisible)
           .map((item) => (
             <button
@@ -3855,7 +3915,7 @@ function Sidebar({
             </button>
           ))}
         <span className="sidebar__section-label">{tr("Управление", "Manage")}</span>
-        {NAV_ITEMS.slice(6).map((item) => (
+        {NAV_ITEMS.slice(7).map((item) => (
           <button
             key={item.id}
             className={route === item.id ? "active" : ""}
@@ -3910,27 +3970,19 @@ function MobileNav({
   route,
   navigate,
   onMore,
-  checksVisible,
 }: {
   route: RouteId;
   navigate: (path: string) => void;
   onMore: () => void;
-  checksVisible: boolean;
 }) {
-  const items = checksVisible
-    ? [NAV_ITEMS[0], NAV_ITEMS[1], NAV_ITEMS[2], NAV_ITEMS[3]]
-    : [NAV_ITEMS[0], NAV_ITEMS[1], NAV_ITEMS[2], NAV_ITEMS[7]];
+  const items = [NAV_ITEMS[0], NAV_ITEMS[1], NAV_ITEMS[2], NAV_ITEMS[3]];
   return (
     <nav className="mobile-nav" aria-label={tr("Мобильная навигация", "Mobile navigation")}>
       {items.map((item) => (
         <button
           key={item.id}
           className={
-            route === item.id ||
-            (route === "incident" && item.id === "incidents") ||
-            (route === "check" && item.id === "checks")
-              ? "active"
-              : ""
+            route === item.id || (route === "incident" && item.id === "incidents") ? "active" : ""
           }
           onClick={() => navigate(item.path)}
         >
@@ -4375,6 +4427,7 @@ function AlertHubRuntime() {
   const hubPageReady = (() => {
     switch (route.id) {
       case "incidents":
+      case "alerts":
       case "checks":
       case "check":
       case "incident":
@@ -4423,6 +4476,24 @@ function AlertHubRuntime() {
               readOnly={readOnly}
               externalRefreshVersion={incidentsVersion}
               onStatusesChanged={updateIncidentStatuses}
+            />
+          );
+        case "alerts":
+          return (
+            <AlertsPage
+              request={getJson}
+              runtimeMode={
+                auth.state.status === "demo"
+                  ? "demo"
+                  : auth.state.status === "offline"
+                    ? "unavailable"
+                    : "active"
+              }
+              language={language}
+              datasources={data.datasources}
+              grafanaUrl={data.summary.grafanaUrl}
+              navigate={navigate}
+              externalRefreshVersion={incidentsVersion}
             />
           );
         case "incident":
@@ -4599,12 +4670,7 @@ function AlertHubRuntime() {
           {view}
         </main>
       </div>
-      <MobileNav
-        route={route.id}
-        navigate={navigate}
-        onMore={() => setMobileMenu(true)}
-        checksVisible={checksVisible}
-      />
+      <MobileNav route={route.id} navigate={navigate} onMore={() => setMobileMenu(true)} />
       <MobileDrawer
         open={mobileMenu}
         route={route.id}
@@ -5334,9 +5400,13 @@ function IncidentsPage({
   externalRefreshVersion: number;
   onStatusesChanged: (updates: Record<string, IncidentStatus>) => void;
 }) {
-  const [query, setQuery] = useState("");
-  const [debouncedQuery, setDebouncedQuery] = useState("");
-  const [status, setStatus] = useState<"active" | "all" | IncidentStatus>("active");
+  const location = useLocation();
+  const initialQuery = new URLSearchParams(location.search).get("q")?.trim().slice(0, 200) ?? "";
+  const [query, setQuery] = useState(initialQuery);
+  const [debouncedQuery, setDebouncedQuery] = useState(initialQuery);
+  const [status, setStatus] = useState<"active" | "all" | IncidentStatus>(
+    initialQuery ? "all" : "active",
+  );
   const [severity, setSeverity] = useState<"all" | Severity>("all");
   const [offset, setOffset] = useState(0);
   const [remote, setRemote] = useState<RemoteIncidentPageSnapshot>({

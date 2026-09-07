@@ -75,6 +75,7 @@ class NormalizedCheckResult:
     state: CheckResultState | None = None
     targets: tuple[CheckTarget, ...] = ()
     error_reasons: tuple[CheckErrorReason, ...] = ()
+    logical_source: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +96,11 @@ class CheckResultView:
     state: CheckResultState | None = None
     targets: tuple[CheckTarget, ...] = ()
     error_reasons: tuple[CheckErrorReason, ...] = ()
+    logical_source: str | None = None
+
+
+def _logical_source(result: NormalizedCheckResult | CheckResultView) -> str:
+    return result.logical_source or result.key.source
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +227,7 @@ def _result_view(
         state=result.state,
         targets=result.targets,
         error_reasons=result.error_reasons,
+        logical_source=result.logical_source,
     )
 
 
@@ -229,8 +236,8 @@ def _part_status(
     *,
     min_failure_sources: int,
 ) -> tuple[CheckStatus, str, bool]:
-    fresh_successes = {result.key.source for result in results if result.status == "up"}
-    fresh_failures = {result.key.source for result in results if result.status == "down"}
+    fresh_successes = {_logical_source(result) for result in results if result.status == "up"}
+    fresh_failures = {_logical_source(result) for result in results if result.status == "down"}
     stale_count = sum(result.status == "stale" for result in results)
     unknown_count = sum(result.status == "unknown" for result in results)
 
@@ -314,9 +321,9 @@ def aggregate_check(
                 variant=variant,
                 status=part_status,
                 status_reason=reason,
-                sources_total=len({result.key.source for result in part_results}),
+                sources_total=len({_logical_source(result) for result in part_results}),
                 sources_up=len(
-                    {result.key.source for result in part_results if result.status == "up"}
+                    {_logical_source(result) for result in part_results if result.status == "up"}
                 ),
                 stale_results=sum(result.status == "stale" for result in part_results),
                 data_incomplete=incomplete,
@@ -354,10 +361,10 @@ def aggregate_check(
         status = "unknown"
         reason = "invalid_data"
 
-    sources = {result.key.source for result in views}
+    sources = {_logical_source(result) for result in views}
     source_results: dict[str, list[CheckResultView]] = defaultdict(list)
     for result in views:
-        source_results[result.key.source].append(result)
+        source_results[_logical_source(result)].append(result)
     sources_up = sum(
         bool(source_views) and all(result.status == "up" for result in source_views)
         for source_views in source_results.values()
