@@ -688,8 +688,17 @@ on:
 permissions:
   contents: read
 jobs:
-  build:
+  preview_policy:
     if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    outputs:
+      should_run: ${{{{ steps.decision.outputs.should_run }}}}
+    steps:
+      - id: decision
+        run: echo 'should_run=true' >>"${{GITHUB_OUTPUT}}"
+  build:
+    needs: preview_policy
+    if: needs.preview_policy.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -1339,11 +1348,26 @@ def test_dev_preview_is_one_dev_only_frontend_pipeline() -> None:
         "group": "alert-hub-dev-preview-ru",
         "cancel-in-progress": False,
     }
-    assert set(workflow["jobs"]) == {"build", "deploy_ru"}
+    assert set(workflow["jobs"]) == {"preview_policy", "build", "deploy_ru"}
+
+    preview_policy = workflow["jobs"]["preview_policy"]
+    policy_run = _job_run(preview_policy)
+    assert preview_policy["if"] == "github.ref == 'refs/heads/dev'"
+    assert preview_policy["runs-on"] == "ubuntu-24.04"
+    checkout = next(
+        step
+        for step in preview_policy["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert checkout["with"] == {"fetch-depth": 0, "persist-credentials": False}
+    assert '"${EVENT_NAME}" == "push"' in policy_run
+    assert "git diff --quiet origin/main HEAD -- backend/" in policy_run
+    assert "workflow_dispatch from dev" in policy_run
 
     build = workflow["jobs"]["build"]
     build_run = _job_run(build)
-    assert build["if"] == "github.ref == 'refs/heads/dev'"
+    assert build["needs"] == "preview_policy"
+    assert build["if"] == "needs.preview_policy.outputs.should_run == 'true'"
     assert build["runs-on"] == "ubuntu-24.04"
     assert build["permissions"] == {"contents": "read", "packages": "write"}
     assert sum("docker buildx build" in str(step.get("run", "")) for step in build["steps"]) == 1

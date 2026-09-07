@@ -15,9 +15,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preview_policy:
+    name: Check preview eligibility
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.decision.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: decision
+        name: Require manual launch when backend differs from main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -Eeuo pipefail
+          should_run=true
+          if [[ "${EVENT_NAME}" == "push" ]] && ! git diff --quiet origin/main HEAD -- backend/; then
+            should_run=false
+            printf '%s\n' '::notice::Automatic frontend preview skipped because backend differs from main; use workflow_dispatch from dev to run it explicitly.'
+          fi
+          printf 'should_run=%s\n' "${should_run}" >>"${GITHUB_OUTPUT}"
+
   build:
     name: Build and publish frontend preview
-    if: github.ref == 'refs/heads/dev'
+    needs: preview_policy
+    if: needs.preview_policy.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

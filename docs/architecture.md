@@ -109,12 +109,14 @@ mode publishes the backend directly on loopback and does not require the web ima
 
 The optional RU development preview reuses this web image boundary without creating another API
 or SQLite owner. A frontend-changing push to `dev`, or an input-free manual dispatch selected from
-`dev`, builds an immutable web digest and deploys one separate read-only web container on the
-existing edge/ingress networks. Backend-only pushes skip this frontend pipeline. The preview
-container proxies to the healthy RU production API, mounts no data or secrets, and is accepted only
-when its OpenAPI compatibility label matches the recorded and running API. Its loopback port and
-later HTTPS hostname are distinct from production, while all state access still passes through the
-single RU API process.
+`dev`, can build an immutable web digest and deploy one separate read-only web container on the
+existing edge/ingress networks. Automatic runs are skipped whenever `backend/**` differs between
+`dev` and `main`; a manual run bypasses that gate but retains the production API compatibility
+check. Backend-only pushes also skip this frontend pipeline. The preview container proxies to the
+healthy RU production API, mounts no data or secrets, and is accepted only when its OpenAPI
+compatibility label matches the recorded and running API. Its loopback port and later HTTPS
+hostname are distinct from production, while all state access still passes through the single RU
+API process.
 
 ## Application layers
 

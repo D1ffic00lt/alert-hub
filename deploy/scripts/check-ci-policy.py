@@ -44,6 +44,7 @@ REQUIRED_AGENT_MARKERS = {
 PRODUCTION_WORKFLOWS = {"deploy.yml", "rollback.yml"}
 RELEASE_WORKFLOW = "release.yml"
 PREVIEW_WORKFLOW = "dev-preview.yml"
+PREVIEW_POLICY_JOB = "preview_policy"
 PREVIEW_PUBLISH_JOB = "build"
 SELF_HOSTED_WORKFLOWS = {*PRODUCTION_WORKFLOWS, PREVIEW_WORKFLOW}
 GITHUB_HOSTED_RUNNERS = {"ubuntu-24.04"}
@@ -416,10 +417,20 @@ def _production_workflow_errors(path: Path, workflow: Mapping[str, Any]) -> list
     if not isinstance(jobs, Mapping):
         return [*failures, f"{path}: jobs must be a mapping"]
     if path.name == PREVIEW_WORKFLOW:
+        preview_policy = jobs.get(PREVIEW_POLICY_JOB)
+        policy_condition = preview_policy.get("if") if isinstance(preview_policy, Mapping) else None
+        if str(policy_condition).strip() != "github.ref == 'refs/heads/dev'":
+            failures.append(f"{path}: manual preview runs must be restricted to refs/heads/dev")
         build = jobs.get(PREVIEW_PUBLISH_JOB)
         build_condition = build.get("if") if isinstance(build, Mapping) else None
-        if str(build_condition).strip() != "github.ref == 'refs/heads/dev'":
-            failures.append(f"{path}: manual preview runs must be restricted to refs/heads/dev")
+        build_dependency = build.get("needs") if isinstance(build, Mapping) else None
+        if (
+            str(build_dependency).strip() != PREVIEW_POLICY_JOB
+            or str(build_condition).strip() != "needs.preview_policy.outputs.should_run == 'true'"
+        ):
+            failures.append(
+                f"{path}: preview publication must depend on the dev-only preview policy job"
+            )
     has_self_hosted_job = any(
         isinstance(job, Mapping) and _is_approved_self_hosted_job(path, job)
         for job in jobs.values()
