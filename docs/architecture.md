@@ -174,12 +174,12 @@ durable notification ownership, and replicated delivery receipts. A heartbeat re
 cluster event; each node projects the newest observation timestamp and reconciles a missed or
 restored incident even when the observation and firing event arrive in the opposite order.
 
-Per-node API-down monitoring is also projected from append-only settings. A peer URL is associated
-with a node only after an authenticated health handshake; that verified local association survives
-observer restarts. Three consecutive peer failures open a critical system incident on a live node,
-and the next successful check resolves it. The incident and notification work are durable SQLite
-state and replicate normally. No node claims to detect its own stopped process, and a full-cluster
-outage still requires an external observer.
+Per-node API-down settings are projected from append-only history. Automatic incident firing is
+temporarily disarmed because an authenticated private peer-sync failure is replication-health
+evidence, not proof that the public API is unavailable. A successful peer request may resolve a
+legacy incident created by an earlier release but cannot open or reopen one. Independent sustained
+public-readiness observation remains follow-on work; until then, public API availability requires
+an external observer.
 
 Connected nodes may store the same logical incident event under different local row IDs. Delivery
 ownership and deterministic delivery IDs therefore use the stable incident `event_key`. A receipt

@@ -8327,8 +8327,8 @@ function ClusterPage({
           <div className="cluster-api-alerts__intro">
             <p>
               {tr(
-                "После трёх подряд ошибок живой peer создаст critical-инцидент и отправит его по обычным маршрутам уведомлений. Для мониторинга нужен хотя бы один другой настроенный узел.",
-                "After three consecutive failures, a live peer creates a critical incident and sends it through the normal notification routes. Monitoring requires at least one other configured node.",
+                "Автоматическая отправка временно приостановлена: ошибки приватной peer-синхронизации не доказывают недоступность публичного API. Настройки сохранены; доступность пока проверяйте внешним мониторингом через /health/ready.",
+                "Automatic delivery is temporarily paused: private peer-sync failures do not prove public API unavailability. Settings are preserved; monitor /health/ready externally for now.",
               )}
             </p>
           </div>
