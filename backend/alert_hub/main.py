@@ -299,6 +299,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.db_public_read_limiter = asyncio.Semaphore(
+            runtime_settings.database_public_read_limit
+        )
         initialize_database(engine, session_factory, runtime_settings)
         with session_factory.begin() as db:
             ensure_bootstrap_token(db, runtime_settings)

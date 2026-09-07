@@ -13,6 +13,7 @@ import {
 import { useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
 
 import { AlertsPage } from "./alerts/AlertsPage";
+import { createAsyncRequestLimiter } from "./api/concurrency";
 import { apiEndpointManager, type ApiEndpointSnapshot } from "./api/endpoints";
 import { CheckDetailPage, ChecksPage, ChecksWidget } from "./checks/ChecksViews";
 import {
@@ -26,6 +27,7 @@ import {
   incidentListPath,
   mergeIncidentSummariesWithHistory,
   normalizeIncidentSearch,
+  sseReconnectDelay,
 } from "./incidents";
 import {
   applicationServerKeyMatches,
@@ -2176,21 +2178,25 @@ async function mutationJson(path: string, init: RequestInit) {
   return (await response.json()) as unknown;
 }
 
+const hubReadLimiter = createAsyncRequestLimiter(4);
+
 async function getJson(path: string, signal?: AbortSignal) {
-  const response = await apiFetch(path, { signal });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  const cached = response.headers.get("X-Alert-Hub-Cache") === "hit";
-  return {
-    payload: (await response.json()) as unknown,
-    cached,
-    // A live response from the selected API can define a filter-wide mutation
-    // on that same endpoint. A service-worker snapshot cannot do so safely.
-    mutationAuthoritative:
-      authoritativeApiResponses.has(response) &&
-      !cached &&
-      Boolean(memoryAccessToken) &&
-      !offlineReadOnlyActive,
-  };
+  return hubReadLimiter.run(async () => {
+    const response = await apiFetch(path, { signal });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const cached = response.headers.get("X-Alert-Hub-Cache") === "hit";
+    return {
+      payload: (await response.json()) as unknown,
+      cached,
+      // A live response from the selected API can define a filter-wide mutation
+      // on that same endpoint. A service-worker snapshot cannot do so safely.
+      mutationAuthoritative:
+        authoritativeApiResponses.has(response) &&
+        !cached &&
+        Boolean(memoryAccessToken) &&
+        !offlineReadOnlyActive,
+    };
+  }, signal);
 }
 
 function useOverviewStatistics(demo: boolean): {
@@ -3084,6 +3090,7 @@ function useHubData(
     let renewalTimer: number | undefined;
     let stream: EventSource | undefined;
     let renewal: Promise<void> | null = null;
+    let reconnectAttempt = 0;
     const eventRefresh = createRefreshBurstCoalescer(async () => {
       if (!stopped) await refreshVisibleData(true);
     });
@@ -3110,8 +3117,11 @@ function useHubData(
         const refreshed = await refreshAccessToken();
         if (stopped) return;
         stream?.close();
-        if (refreshed) scheduleRetry(connect, 250);
-        else {
+        if (refreshed) {
+          const delay = sseReconnectDelay(reconnectAttempt);
+          reconnectAttempt += 1;
+          scheduleRetry(connect, delay);
+        } else {
           startPolling();
           scheduleRetry(connect, 30000);
         }
@@ -3143,6 +3153,7 @@ function useHubData(
         if (stopped) return;
         if (poller) window.clearInterval(poller);
         poller = undefined;
+        reconnectAttempt = 0;
         setLiveUpdates(true);
         scheduleRenewal();
       };
@@ -3151,7 +3162,14 @@ function useHubData(
         if (stopped) return;
         setLiveUpdates(false);
         stream?.close();
-        void renewStream();
+        startPolling();
+        if (memoryAccessExpiresAt && memoryAccessExpiresAt - Date.now() <= 30_000) {
+          void renewStream();
+          return;
+        }
+        const delay = sseReconnectDelay(reconnectAttempt);
+        reconnectAttempt += 1;
+        scheduleRetry(connect, delay);
       };
     };
     connect();

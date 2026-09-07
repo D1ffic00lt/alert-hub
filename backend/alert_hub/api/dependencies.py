@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+import asyncio
+import logging
+import time
+from collections.abc import AsyncIterator
 from typing import cast
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
 
 from alert_hub.application.auth import add_audit
@@ -13,17 +17,84 @@ from alert_hub.infrastructure.db.models import Session as AuthSession
 from alert_hub.infrastructure.db.models import User
 from alert_hub.infrastructure.encryption import EnvelopeCipher
 from alert_hub.infrastructure.request_security import address_in_cidrs
+from alert_hub.metrics import DB_POOL_ACQUIRE_SECONDS, DB_POOL_ACQUIRE_TIMEOUTS
 from alert_hub.security import TokenError, constant_time_equal, decode_access_token, hash_token
 from alert_hub.settings import Settings
+
+logger = logging.getLogger("alert_hub.database")
 
 
 def get_settings(request: Request) -> Settings:
     return cast(Settings, request.app.state.settings)
 
 
-def get_db(request: Request) -> Iterator[Session]:
-    with request.app.state.session_factory() as db:
+def _priority_database_request(request: Request) -> bool:
+    path = request.url.path
+    return (
+        request.method not in {"GET", "HEAD"}
+        or path.startswith("/health/")
+        or path == "/metrics"
+        or path.startswith("/internal/")
+        or path.startswith("/ingest/")
+    )
+
+
+async def get_db(request: Request) -> AsyncIterator[Session]:
+    settings = get_settings(request)
+    lane = "priority" if _priority_database_request(request) else "public_read"
+    limiter: asyncio.Semaphore | None = None
+    limiter_acquired = False
+    db = request.app.state.session_factory()
+    started = time.monotonic()
+    try:
+        if lane == "public_read":
+            limiter = request.app.state.db_public_read_limiter
+            try:
+                async with asyncio.timeout(settings.database_public_queue_timeout_seconds):
+                    await limiter.acquire()
+                limiter_acquired = True
+            except TimeoutError as exc:
+                raise SQLAlchemyTimeoutError("public database queue timed out") from exc
+        # Connection waits run outside AnyIO's worker pool. A queued request therefore
+        # cannot consume the worker needed by a connection holder to finish and check in.
+        await asyncio.to_thread(db.connection)
+        DB_POOL_ACQUIRE_SECONDS.labels(
+            node_id=settings.node_id,
+            lane=lane,
+            result="success",
+        ).observe(time.monotonic() - started)
         yield db
+    except SQLAlchemyTimeoutError as exc:
+        timeout_result = (
+            "queue_timeout" if not limiter_acquired and limiter is not None else "pool_timeout"
+        )
+        DB_POOL_ACQUIRE_SECONDS.labels(
+            node_id=settings.node_id,
+            lane=lane,
+            result=timeout_result,
+        ).observe(time.monotonic() - started)
+        DB_POOL_ACQUIRE_TIMEOUTS.labels(node_id=settings.node_id, lane=lane).inc()
+        logger.warning(
+            "database_connection_acquire_timeout",
+            extra={
+                "event": "database_connection_acquire_timeout",
+                "request_id": getattr(request.state, "request_id", None),
+                "node_id": settings.node_id,
+                "method": request.method,
+                "path": request.url.path,
+                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+                "db_lane": lane,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is busy; retry shortly",
+            headers={"Retry-After": "1"},
+        ) from exc
+    finally:
+        db.close()
+        if limiter is not None and limiter_acquired:
+            limiter.release()
 
 
 def _bearer_token(request: Request) -> str:

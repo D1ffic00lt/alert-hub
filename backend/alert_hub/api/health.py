@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -97,17 +98,17 @@ def _web_push_capability(settings: Settings, enabled_channels: int) -> dict[str,
 
 
 @router.get("/health/live")
-def live() -> dict[str, str]:
+async def live() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @router.get("/health/ready")
-def ready(
+async def ready(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> Response:
     try:
-        db.execute(select(1))
+        await asyncio.to_thread(db.execute, select(1))
     except SQLAlchemyError:
         DB_ERRORS.labels(operation="readiness").inc()
         return JSONResponse(

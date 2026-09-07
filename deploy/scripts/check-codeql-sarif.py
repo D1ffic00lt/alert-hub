@@ -28,7 +28,7 @@ REVIEWED_SOURCE_DIGESTS = {
         "4f1a3de109386c007c70d744ec0b2a31af2839b993ae6cffeca12f72b36ccd8e"
     ),
     "backend/alert_hub/api/dependencies.py": (
-        "3c6f31d61bcef3950ce5fc2564b0f683e24f85004f32eda34d3193d9e7d91556"
+        "dea16c3387c94b186178a0a05686163a109f08923399e3fe1a55d09c15a7a6cb"
     ),
     "backend/alert_hub/application/auth.py": (
         "80d393b5300b561ae9eab121ba0f0a8137777becfe54b4d6dca24c130fa2b8b4"

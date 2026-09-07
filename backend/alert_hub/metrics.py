@@ -1,4 +1,4 @@
-from prometheus_client import Counter, Gauge, Info
+from prometheus_client import Counter, Gauge, Histogram, Info
 
 INGEST_TOTAL = Counter(
     "alert_hub_ingest_total",
@@ -38,4 +38,25 @@ PEER_UP = Gauge(
     "alert_hub_peer_up", "Whether a configured cluster peer is reachable", ("peer_node_id",)
 )
 DB_ERRORS = Counter("alert_hub_db_errors_total", "Database operation failures", ("operation",))
+DB_POOL_EVENTS = Counter(
+    "alert_hub_db_pool_events_total",
+    "SQLAlchemy connection-pool lifecycle events",
+    ("node_id", "event"),
+)
+DB_POOL_CONNECTIONS = Gauge(
+    "alert_hub_db_pool_connections",
+    "Current SQLAlchemy connection-pool usage",
+    ("node_id", "state"),
+)
+DB_POOL_ACQUIRE_SECONDS = Histogram(
+    "alert_hub_db_pool_acquire_seconds",
+    "Time spent waiting for a database connection",
+    ("node_id", "lane", "result"),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+)
+DB_POOL_ACQUIRE_TIMEOUTS = Counter(
+    "alert_hub_db_pool_acquire_timeouts_total",
+    "Database connection acquisition timeouts",
+    ("node_id", "lane"),
+)
 BUILD_INFO = Info("alert_hub_build", "Alert Hub build information")

@@ -211,6 +211,13 @@ web image. Disabling a role must not silently broaden another network boundary.
 - `/health/deep`: local database plus informational peer/channel state. A remote peer failure must not make a locally useful node unready. The supplied public proxy denies it.
 - `/metrics`: Prometheus exposition on the same loopback application port; there is no separately published monitoring port, and the supplied public proxy denies it.
 
+File-backed SQLite uses an explicitly bounded SQLAlchemy pool. Dashboard reads acquire one of a
+smaller set of public slots asynchronously before entering FastAPI's synchronous worker pool, so a
+burst of browser tabs cannot occupy the workers needed by current connection holders to finish.
+The reserved pool capacity remains available to readiness, ingest, mutations, internal cluster
+operations, and the short-lived background-worker transactions. `/health/live` stays event-loop
+local, while `/health/ready` uses a separately scheduled database probe.
+
 ## Deployment model
 
 The release workflow builds version-tagged API and web GHCR images, tests their exact compatible

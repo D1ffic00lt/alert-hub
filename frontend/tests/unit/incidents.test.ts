@@ -4,6 +4,7 @@ import {
   incidentListPath,
   mergeIncidentSummariesWithHistory,
   normalizeIncidentSearch,
+  sseReconnectDelay,
 } from "../../app/incidents";
 
 afterEach(() => {
@@ -150,6 +151,12 @@ describe("incident list request", () => {
 });
 
 describe("SSE refresh burst coalescing", () => {
+  it("backs reconnects off with bounded jitter", () => {
+    expect(sseReconnectDelay(0, () => 0)).toBe(800);
+    expect(sseReconnectDelay(2, () => 0.5)).toBe(4_000);
+    expect(sseReconnectDelay(20, () => 1)).toBe(30_000);
+  });
+
   it("turns a burst into one refresh", async () => {
     vi.useFakeTimers();
     const run = vi.fn(async () => undefined);
