@@ -1,0 +1,25 @@
+# Same-origin proxy selection for API_HA_MODE=proxy-failover. Import this handle
+# before the UI catch-all. Active checks remove failed APIs before a request is
+# sent; no request retry window is configured, so ambiguous mutations are not
+# replayed automatically.
+
+@browser_api path /api/v1/*
+handle @browser_api {
+    reverse_proxy __API_RU_UPSTREAM__ __API_NL_UPSTREAM__ __API_DE_UPSTREAM__ {
+        lb_policy first
+        health_uri /health/ready
+        health_interval 10s
+        health_timeout 2s
+        fail_duration 10s
+        max_fails 2
+        header_up Host {host}
+        header_up X-Forwarded-Proto https
+        transport http {
+            dial_timeout 2s
+            response_header_timeout 60s
+        }
+    }
+}
+
+@internal path /internal/*
+respond @internal 404

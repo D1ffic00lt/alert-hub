@@ -116,6 +116,8 @@ class IncidentBulkFilters(BaseModel):
     severity: IncidentSeverity | None = None
     source_id: str | None = Field(default=None, min_length=1, max_length=36)
     q: str | None = Field(default=None, max_length=200)
+    alertname: str | None = Field(default=None, min_length=1, max_length=200)
+    prometheus_datasource_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
 class IncidentBulkActionRequest(BaseModel):

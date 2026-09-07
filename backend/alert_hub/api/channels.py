@@ -512,7 +512,7 @@ async def test_channel(
         app_name=settings.app_name,
         labels={"test": "true", "node_id": settings.node_id},
         annotations={},
-        incident_url=settings.public_api_url,
+        incident_url=settings.public_ui_url or settings.public_api_url,
     )
     outcomes: list[dict[str, Any]] = []
     gone_subscriptions: list[PushSubscription] = []

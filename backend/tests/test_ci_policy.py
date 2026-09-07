@@ -16,6 +16,9 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 CHECKER_PATH = REPOSITORY / "deploy" / "scripts" / "check-ci-policy.py"
 CODEQL_GATE_PATH = REPOSITORY / "deploy" / "scripts" / "check-codeql-sarif.py"
 DEPLOY_ENGINE_PATH = REPOSITORY / ".github" / "deploy" / "scripts" / "docker-deploy-node.sh"
+PREVIEW_DEPLOY_ENGINE_PATH = (
+    REPOSITORY / ".github" / "deploy" / "scripts" / "docker-deploy-preview-node.sh"
+)
 PROVISIONER_PATH = REPOSITORY / ".github" / "deploy" / "scripts" / "docker-provision-node.sh"
 PROXY_INSTALLER_PATH = REPOSITORY / "deploy" / "scripts" / "install-proxy-config.sh"
 BACKUP_TOOL_PATH = REPOSITORY / "deploy" / "scripts" / "alert-hub-backup"
@@ -627,7 +630,7 @@ jobs:
     assert len(failures) == 2
     assert any("unsafe" in failure and "contents" in failure for failure in failures)
     assert any(
-        "only release.yml may request packages: write" in failure and "publish" in failure
+        "only release.yml or the 'build' job in dev-preview.yml" in failure and "publish" in failure
         for failure in failures
     )
 
@@ -653,7 +656,161 @@ jobs:
 
     failures = _checker().check_repository(repository)
 
-    assert any("only release.yml may execute docker push" in failure for failure in failures)
+    assert any(
+        "only release.yml or the 'build' job in dev-preview.yml" in failure
+        and "execute docker push" in failure
+        for failure in failures
+    )
+
+
+def test_ci_policy_accepts_exact_dev_preview_boundary(tmp_path: Path) -> None:
+    required_value_check = _checker().REQUIRED_VALUE_CHECK
+    repository = _write_ci(
+        tmp_path,
+        """\
+name: CI
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs: {}
+""",
+    )
+    (repository / ".github" / "workflows" / "dev-preview.yml").write_text(
+        f"""\
+name: Dev frontend preview
+on:
+  push:
+    branches: [dev]
+    paths: [frontend/**]
+  workflow_dispatch: {{}}
+permissions:
+  contents: read
+jobs:
+  preview_policy:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    outputs:
+      should_run: ${{{{ steps.decision.outputs.should_run }}}}
+    steps:
+      - id: decision
+        run: echo 'should_run=true' >>"${{GITHUB_OUTPUT}}"
+  build:
+    needs: preview_policy
+    if: needs.preview_policy.outputs.should_run == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - run: docker buildx build --push --file frontend/Dockerfile frontend
+  deploy_ru:
+    needs: build
+    runs-on: [self-hosted, alert-hub-ru]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - env:
+          NODE_NAME: ru
+        run: |
+          set -Eeuo pipefail
+          for required in NODE_NAME; do
+            {required_value_check}
+          done
+          sudo --preserve-env=NODE_NAME /usr/local/sbin/docker-deploy-preview-node.sh
+""",
+        encoding="utf-8",
+    )
+
+    assert _checker().check_repository(repository) == []
+
+
+def test_ci_policy_rejects_preview_on_another_branch_or_publisher_job(
+    tmp_path: Path,
+) -> None:
+    repository = _write_ci(
+        tmp_path,
+        """\
+name: CI
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs: {}
+""",
+    )
+    (repository / ".github" / "workflows" / "dev-preview.yml").write_text(
+        """\
+name: Unsafe preview
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  publish-api:
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - run: docker push ghcr.io/example/alert-hub-api:unsafe
+""",
+        encoding="utf-8",
+    )
+
+    failures = _checker().check_repository(repository)
+
+    assert any(
+        "preview workflow must use frontend-only pushes to dev" in failure for failure in failures
+    )
+    assert any("may request packages: write" in failure for failure in failures)
+    assert any("may execute docker push" in failure for failure in failures)
+
+
+def test_ci_policy_rejects_manual_preview_from_arbitrary_ref(tmp_path: Path) -> None:
+    repository = _write_ci(
+        tmp_path,
+        """\
+name: CI
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs: {}
+""",
+    )
+    (repository / ".github" / "workflows" / "dev-preview.yml").write_text(
+        """\
+name: Unsafe manual preview
+on:
+  push:
+    branches: [dev]
+    paths: [frontend/**]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - run: docker buildx build --push --file frontend/Dockerfile frontend
+""",
+        encoding="utf-8",
+    )
+
+    failures = _checker().check_repository(repository)
+
+    assert any(
+        "manual preview runs must be restricted to refs/heads/dev" in failure
+        for failure in failures
+    )
 
 
 def test_ci_policy_fails_closed_on_ambiguous_pr_job_conditions(tmp_path: Path) -> None:
@@ -776,6 +933,8 @@ def test_ci_policy_accepts_only_exact_no_argument_root_wrappers() -> None:
         "sudo --preserve-env=NODE_NAME,NODE_IP /usr/local/sbin/docker-deploy-node.sh",
         "sudo --preserve-env=ALERT_HUB_ROLLBACK_VERSION,ALERT_HUB_CONFIRMATION "
         "/usr/local/sbin/docker-rollback-node.sh",
+        "sudo --preserve-env=ALERT_HUB_PREVIEW_IMAGE,ALERT_HUB_PREVIEW_REVISION "
+        "/usr/local/sbin/docker-deploy-preview-node.sh",
     ]
     rejected = [
         "sudo /bin/sh",
@@ -1174,6 +1333,65 @@ def test_ci_runs_for_main_while_release_owns_version_tags() -> None:
     assert "tags:" not in source
 
 
+def test_dev_preview_is_one_dev_only_frontend_pipeline() -> None:
+    path = REPOSITORY / ".github/workflows/dev-preview.yml"
+    source = path.read_text(encoding="utf-8")
+    document = yaml.load(source, Loader=yaml.BaseLoader)
+    assert isinstance(document, dict)
+    assert document["on"] == {
+        "push": {"branches": ["dev"], "paths": ["frontend/**"]},
+        "workflow_dispatch": {},
+    }
+
+    workflow = _workflow("dev-preview.yml")
+    assert workflow["concurrency"] == {
+        "group": "alert-hub-dev-preview-ru",
+        "cancel-in-progress": False,
+    }
+    assert set(workflow["jobs"]) == {"preview_policy", "build", "deploy_ru"}
+
+    preview_policy = workflow["jobs"]["preview_policy"]
+    policy_run = _job_run(preview_policy)
+    assert preview_policy["if"] == "github.ref == 'refs/heads/dev'"
+    assert preview_policy["runs-on"] == "ubuntu-24.04"
+    checkout = next(
+        step
+        for step in preview_policy["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert checkout["with"] == {"fetch-depth": 0, "persist-credentials": False}
+    assert '"${EVENT_NAME}" == "push"' in policy_run
+    assert "git diff --quiet origin/main HEAD -- backend/" in policy_run
+    assert "workflow_dispatch from dev" in policy_run
+
+    build = workflow["jobs"]["build"]
+    build_run = _job_run(build)
+    assert build["needs"] == "preview_policy"
+    assert build["if"] == "needs.preview_policy.outputs.should_run == 'true'"
+    assert build["runs-on"] == "ubuntu-24.04"
+    assert build["permissions"] == {"contents": "read", "packages": "write"}
+    assert sum("docker buildx build" in str(step.get("run", "")) for step in build["steps"]) == 1
+    assert "--file frontend/Dockerfile" in build_run
+    assert re.search(r"(?m)^\s*frontend$", build_run)
+    assert "--push" in build_run
+    assert "alert-hub-web" in build_run
+    assert "backend/Dockerfile" not in build_run
+    assert "alert-hub-api" not in build_run
+    assert "npm --prefix frontend" not in build_run
+    assert not any(action.startswith("actions/setup-node@") for action in _job_actions(build))
+
+    deploy = workflow["jobs"]["deploy_ru"]
+    assert deploy["needs"] == "build"
+    assert deploy["runs-on"] == ["self-hosted", "alert-hub-ru"]
+    assert deploy["environment"] == {"name": "preview-ru"}
+    assert deploy["permissions"] == {"contents": "read", "packages": "read"}
+    assert _job_actions(deploy) == []
+    deploy_run = _job_run(deploy)
+    assert deploy_run.count("sudo ") == 1
+    assert "/usr/local/sbin/docker-deploy-preview-node.sh" in deploy_run
+    assert ".github/deploy" not in deploy_run
+
+
 def test_manual_release_reserves_tag_and_publishes_assets_idempotently() -> None:
     path = REPOSITORY / ".github/workflows/release.yml"
     source = path.read_text(encoding="utf-8")
@@ -1258,7 +1476,15 @@ def test_compose_contract_has_only_independent_api_and_web_images() -> None:
         assert services["alert-hub-web"]["image"].startswith("${ALERT_HUB_WEB_IMAGE:")
         assert services["alert-hub"]["environment"]["BACKEND_PORT"] == "8080"
         assert services["alert-hub-web"]["depends_on"]["alert-hub"]["condition"] == (
-            "service_healthy"
+            "service_started"
+        )
+        assert (
+            services["alert-hub-web"]["environment"].items()
+            >= {
+                "API_HA_MODE": "${API_HA_MODE:-single}",
+                "NODE_PUBLIC_API_URL": "${NODE_PUBLIC_API_URL:-}",
+                "PUBLIC_API_CANDIDATES": "${PUBLIC_API_CANDIDATES:-}",
+            }.items()
         )
 
     for model in (default, split):
@@ -1315,6 +1541,31 @@ def test_compose_contract_has_only_independent_api_and_web_images() -> None:
     assert not (REPOSITORY / "Dockerfile.api").exists()
 
 
+def test_ru_preview_reuses_the_api_without_mounting_production_data() -> None:
+    preview = _compose(".github/deploy/docker-compose.preview.yml")
+
+    assert set(preview["services"]) == {"alert-hub-web-preview"}
+    web = preview["services"]["alert-hub-web-preview"]
+    assert web["container_name"] == "alert-hub-web-preview"
+    assert web["image"].startswith("${ALERT_HUB_PREVIEW_WEB_IMAGE:")
+    assert web["pull_policy"] == "never"
+    assert web["ports"] == ["127.0.0.1:${ALERT_HUB_PREVIEW_HOST_PORT:-18083}:8080"]
+    assert web["read_only"] is True
+    assert "volumes" not in web
+    assert "env_file" not in web
+    assert "depends_on" not in web
+    assert set(web["networks"]) == {"edge", "ingress"}
+    assert preview["networks"] == {
+        "edge": {"external": True, "name": "alert-hub-edge"},
+        "ingress": {"external": True, "name": "alert-hub-ingress"},
+    }
+
+    source = PREVIEW_DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
+    assert "alert-hub-api" in source
+    assert "/data" not in source
+    assert "ALERT_HUB_DATA_DIR" not in source
+
+
 def test_repository_quality_checks_each_split_runtime_boundary() -> None:
     quality = _workflow("ci.yml")["jobs"]["repository-quality"]
     run = _job_run(quality)
@@ -1325,6 +1576,7 @@ def test_repository_quality_checks_each_split_runtime_boundary() -> None:
         "frontend/container/render-ui-runtime.sh",
         ".github/deploy/scripts/docker-provision-node.sh",
         ".github/deploy/scripts/docker-deploy-node.sh",
+        ".github/deploy/scripts/docker-deploy-preview-node.sh",
         ".github/deploy/scripts/docker-rollback-node.sh",
         ".github/deploy/scripts/docker-status-node.sh",
     ):
@@ -1429,6 +1681,34 @@ def test_web_only_production_deploy_does_not_receive_crypto_secrets() -> None:
     assert all(setting not in rollback_text for setting in checks_settings)
 
 
+def test_preview_origin_is_optional_and_reaches_only_the_ru_api_deploy() -> None:
+    checker = _checker()
+    deploy_workflow = _workflow("deploy.yml")
+    deploy_engine = DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
+    runtime = _shell_function(deploy_engine, "write_runtime_material")
+    provisioner = PROVISIONER_PATH.read_text(encoding="utf-8")
+
+    assert "PREVIEW_PUBLIC_DOMAIN" in checker.PRESERVABLE_ROOT_ENVIRONMENT
+    assert "PREVIEW_PUBLIC_DOMAIN=${PREVIEW_PUBLIC_DOMAIN:-}" in deploy_engine
+    assert 'validate_domain "${PREVIEW_PUBLIC_DOMAIN}"' in runtime
+    assert "trusted_origins=${PUBLIC_UI_URL}" in runtime
+    assert "trusted_origins=${trusted_origins},https://${PREVIEW_PUBLIC_DOMAIN}" in runtime
+    assert '"TRUSTED_ORIGINS=${trusted_origins}"' in runtime
+    assert "PREVIEW_PUBLIC_DOMAIN" in provisioner
+
+    for job_name in ("deploy_ru", "deploy_nl", "deploy_de"):
+        steps = deploy_workflow["jobs"][job_name]["steps"]
+        web_step = next(step for step in steps if step.get("if") == "inputs.component == 'web'")
+        api_step = next(step for step in steps if step.get("if") == "inputs.component != 'web'")
+        assert "PREVIEW_PUBLIC_DOMAIN" not in web_step["env"]
+        if job_name == "deploy_ru":
+            assert api_step["env"]["PREVIEW_PUBLIC_DOMAIN"] == ("${{ vars.PREVIEW_PUBLIC_DOMAIN }}")
+            assert "PREVIEW_PUBLIC_DOMAIN" in api_step["run"]
+        else:
+            assert "PREVIEW_PUBLIC_DOMAIN" not in api_step["env"]
+            assert "PREVIEW_PUBLIC_DOMAIN" not in api_step["run"]
+
+
 def test_production_checks_settings_are_allowlisted_validated_and_snapshotted() -> None:
     checker = _checker()
     deploy = DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
@@ -1459,6 +1739,58 @@ def test_production_checks_settings_are_allowlisted_validated_and_snapshotted() 
     assert 'validate_bounded_decimal "${CHECKS_CACHE_TTL_SECONDS}" 0.1 5' in runtime
     assert 'validate_bounded_decimal "${CHECKS_FUTURE_TOLERANCE_SECONDS}" 0 300' in runtime
     assert 'validate_bounded_integer "${CHECKS_MAX_SERIES}" 1 100000' in runtime
+
+
+def test_api_ha_settings_and_proxy_surfaces_are_bounded_and_peer_free() -> None:
+    checker = _checker()
+    deploy_workflow = _workflow("deploy.yml")
+    deploy_engine = DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
+    runtime = _shell_function(deploy_engine, "write_runtime_material")
+    candidate_validator = _shell_function(deploy_engine, "validate_https_origin_list")
+    settings = {
+        "API_HA_MODE",
+        "PUBLIC_UI_URL",
+        "NODE_PUBLIC_API_URL",
+        "PUBLIC_INGEST_URL",
+        "PUBLIC_API_CANDIDATES",
+        "COOKIE_DOMAIN",
+    }
+
+    assert settings <= checker.PRESERVABLE_ROOT_ENVIRONMENT
+    assert 'validate_https_origin_list "${PUBLIC_API_CANDIDATES}"' in runtime
+    assert "[[ -z ${seen[${item}]:-} ]] || return 1" in candidate_validator
+    assert "[[ ${API_HA_MODE} == client-failover ]]" in runtime
+    assert 'cookie_domain_contains_origin "${COOKIE_DOMAIN}" "${candidate}"' in runtime
+    assert "COOKIE_DOMAIN must contain every browser API, UI, and ingest host" in runtime
+    assert '"NODE_PUBLIC_API_URL=${NODE_PUBLIC_API_URL}"' in runtime
+    assert '"PUBLIC_UI_URL=${PUBLIC_UI_URL}"' in runtime
+    assert '"PUBLIC_INGEST_URL=${PUBLIC_INGEST_URL}"' in runtime
+    assert '"COOKIE_DOMAIN=${COOKIE_DOMAIN}"' in runtime
+
+    for job_name in ("deploy_ru", "deploy_nl", "deploy_de"):
+        steps = deploy_workflow["jobs"][job_name]["steps"]
+        api_step = next(step for step in steps if step.get("if") == "inputs.component != 'web'")
+        assert settings <= api_step["env"].keys()
+        for setting in settings:
+            assert setting in api_step["run"]
+
+    for relative in (
+        "deploy/proxy/nginx/alert-hub-public-api.conf.example",
+        "deploy/proxy/caddy/Caddyfile.public-api.example",
+    ):
+        source = (REPOSITORY / relative).read_text(encoding="utf-8")
+        assert "/api/v1/" in source
+        assert "/ingest/v1/" in source
+        assert "/health/ready" in source
+        assert "/internal/" in source
+        assert "return 404" in source or "respond 404" in source
+        assert "/internal/v1/nodes/health" not in source
+        assert "/internal/v1/sync/events/query" not in source
+
+    nginx_pool = (REPOSITORY / "deploy/proxy/nginx/alert-hub-api-failover.conf.example").read_text(
+        encoding="utf-8"
+    )
+    assert "proxy_next_upstream non_idempotent" not in nginx_pool
 
 
 @pytest.mark.parametrize(
@@ -2330,6 +2662,35 @@ def test_peer_transport_guard_runs_before_image_or_state_changes() -> None:
         "apply_target",
         "write_state",
     )
+
+
+def test_preview_deploy_fails_closed_before_replacing_the_running_preview() -> None:
+    source = PREVIEW_DEPLOY_ENGINE_PATH.read_text(encoding="utf-8")
+    _definitions, marker, entrypoint = source.partition("[[ ${EUID} -eq 0 ]]")
+    assert marker
+
+    _assert_order(
+        entrypoint,
+        'require_root_controlled_file "${script_path}"',
+        'require_root_controlled_file "${COMPOSE_FILE}"',
+        'require_private_file "${LOCK_FILE}"',
+        "flock -n 9",
+        "load_deploy_policy",
+        "validate_production_state",
+        'api_status=$(docker container inspect "${API_CONTAINER}"',
+        'production_compatibility=$(docker container inspect "${API_CONTAINER}"',
+        '[[ ${production_compatibility} == "${recorded_production_compatibility}" ]]',
+        '[[ ${ALERT_HUB_PREVIEW_COMPATIBILITY} == "${production_compatibility}" ]]',
+        "start_registry_auth",
+        "pull_and_verify_image",
+        'apply_preview "${ALERT_HUB_PREVIEW_IMAGE}"',
+        "write_preview_state",
+    )
+    apply_preview = _shell_function(source, "apply_preview")
+    _assert_order(apply_preview, "compose", "container_uses_image", "verify_preview_ready")
+    assert "alert-hub-edge" in entrypoint
+    assert "alert-hub-ingress" in entrypoint
+    assert "Restoring previous preview" in entrypoint
 
 
 def test_same_api_digest_is_not_a_noop_when_runtime_config_changes() -> None:

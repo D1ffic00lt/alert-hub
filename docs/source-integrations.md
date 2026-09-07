@@ -24,6 +24,12 @@ management path and incident projection, but it deliberately does not exercise t
 public ingress, sender CIDR, or external system. Complete setup with one real request from the
 sender. Rotating a source token invalidates the previous token immediately.
 
+Generated webhook URLs use `PUBLIC_INGEST_URL` when it is configured. Keep this
+stable ingress origin separate from per-node `NODE_PUBLIC_API_URL` values used
+for browser failover; changing the active browser API must not rewrite source
+configuration. `PUBLIC_API_URL` remains the compatibility fallback for existing
+installations that have not split those origins yet.
+
 Prometheus is not an event source in this menu. Add it under **Regional reachability → Add
 datasource**; Alert Hub runs only its named backend-owned queries. Set the Grafana link and the
 allowed `job` globs under **Settings → Grafana and job selection**. Grafana webhook payloads are not
@@ -199,7 +205,7 @@ such as `vless_blackbox_*` or `alert-hub-api-*`. Patterns accept only bounded jo
 and `*`; the backend escapes them and constructs the `up{job=~...}` selector. The browser cannot
 provide metric names, operators, functions, or other PromQL syntax.
 
-`GET /api/v1/metrics/reachability` merges the latest `probe_success` samples using the label pair selected on each datasource. The default `canonical` mode reads `source_region` and `target_name`. An explicit `server` mode reads `source_server` and `target_server` for existing installations that retain geographic `source_region` grouping for Grafana. Modes never fall back into one another, so adding the compatibility option cannot silently change an existing datasource's matrix identity. It returns `partial` with per-datasource errors when some Prometheus instances fail. `GET /api/v1/metrics/queries/{query_name}` exposes the other fixed vectors, and `POST /api/v1/prometheus-datasources/{id}/test` uses a fixed `vector(1)` probe.
+`GET /api/v1/metrics/reachability` merges the latest `probe_success` samples using the label pair selected on each datasource. The default `canonical` mode reads `source_region` and `target_name`; its fixed query requires both labels to be non-empty. An explicit `server` mode reads and requires non-empty `source_server` and `target_server` for existing installations that retain geographic `source_region` grouping for Grafana. Each datasource gets the fixed selector for its own mode, so unrelated Blackbox/TLS `probe_success` series do not enter reachability validation. Modes never fall back into one another, and a malformed sample that still reaches the selected dataset remains a visible datasource error. It returns `partial` with per-datasource errors when some Prometheus instances fail. `GET /api/v1/metrics/queries/{query_name}` exposes the other fixed vectors, and `POST /api/v1/prometheus-datasources/{id}/test` uses a fixed `vector(1)` probe.
 
 Set the optional Grafana HTTPS dashboard link under **Settings** when operators should get a
 detailed-view link. `GRAFANA_URL` remains an initial fallback for installations that configure it
@@ -272,12 +278,14 @@ tenant/account names, tokens, credentials, protocol identifiers, or subscription
 label. Replicas of one executor location use the same logical `source`. In the minimal contract,
 missing `source` means one private default source and is never inferred from Prometheus scrape
 `instance` or `job`. In the richer xray-e2e-prober contract, the explicitly exported `instance_id`
-then `source_id` are safe fallback identities; distinct instance IDs never collapse. Its info
-metadata is joined to state/status/last-run/target/assertion series before `mode` and `target_set_id`
-become Scenario and Variant. `entry_name` is the safe display-name fallback. Keep `check_id` unique
-across all enabled datasources. Publish `synthetic_check_info` for expected tuples so a never-run or
-vanished result remains observable; without it, restart loses inventory that no longer exists in
-Prometheus.
+identifies the concrete prober process while `source` or `source_id` identifies its logical Source.
+Distinct instance IDs never collapse, but several Instances of one Source do not add independent
+quorum votes. Its info metadata is joined to state/status/last-run/target/assertion series before
+`mode` and `target_set_id` become Scenario and Variant. `entry_name` is the safe display-name
+fallback. Keep `check_id` unique across all enabled datasources. Publish `synthetic_check_info` for
+expected tuples so a never-run or vanished result remains observable; previously seen missing
+Instances remain visible in the bounded in-memory inventory, but restart still loses inventory that
+no longer exists in Prometheus.
 
 The richer projection also supports one-hot `synthetic_check_state`, target-specific
 `synthetic_check_target_success`/`synthetic_check_target_state` plus duration/TTFB, separate

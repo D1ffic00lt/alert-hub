@@ -170,6 +170,7 @@ and modes:
 /opt/alert-hub/history/*.env            root:root 0600
 /opt/alert-hub/history/configs/         root:root 0700
 /opt/alert-hub/history/configs/*.env    root:root 0600
+/opt/alert-hub/preview/current.env       root:root 0600
 /opt/alert-hub/.deploy.lock             root:root 0600
 /etc/alert-hub/deploy-policy.env         root:root 0600
 /etc/alert-hub/backup.env                root:root 0600
@@ -247,10 +248,11 @@ monitoring bridge provide masqueraded outbound routing. This deliberately avoids
 `gw_priority`, retaining compatibility with Docker Compose 2.15.1 even if Docker
 chooses either bridge as the container's default gateway.
 
-The web container performs a readiness authorization subrequest before serving
-the PWA. If API readiness is lost, web stays running but returns `503` for
-application and static requests. It recovers automatically when API is ready
-again.
+The web container renders a mode-specific shell guard. `single` and `external`
+perform a readiness authorization subrequest and return `503` while the local
+API is unavailable. `client-failover` and `proxy-failover` serve the shell
+without waiting for the local API. The full routing, cookie, and mutation safety
+contract is documented in [Frontend API high availability](api-ha.md).
 
 ## GitHub Environments and secrets
 
@@ -274,6 +276,12 @@ Optional Environment or Repository Variables consumed by deployment are:
 
 ```text
 APP_NAME
+API_HA_MODE
+PUBLIC_UI_URL
+NODE_PUBLIC_API_URL
+PUBLIC_INGEST_URL
+PUBLIC_API_CANDIDATES
+COOKIE_DOMAIN
 PEER_URLS
 PEER_ALLOWED_CIDRS
 VAPID_PUBLIC_KEY
@@ -285,6 +293,11 @@ CHECKS_CACHE_TTL_SECONDS
 CHECKS_FUTURE_TOLERANCE_SECONDS
 CHECKS_MAX_SERIES
 ```
+
+`PREVIEW_PUBLIC_DOMAIN` is an additional optional variable for the
+`production-ru` Environment only. When set, an API or `all` RU deployment adds
+`https://<PREVIEW_PUBLIC_DOMAIN>` to the exact trusted-origin list used for the
+RU development frontend preview. Do not set it on NL or DE.
 
 `APP_NAME` defaults to `Alert Hub`. `PEER_URLS` is a comma-separated list of the
 other nodes' exact HTTPS peer origins; setting it also requires their exact
@@ -439,6 +452,72 @@ Console status is available without exposing secrets:
 sudo /usr/local/sbin/docker-status-node.sh
 ```
 
+## RU development frontend preview
+
+`.github/workflows/dev-preview.yml` is the single lightweight preview pipeline.
+It runs automatically only when a push to `dev` changes `frontend/**`, and it can
+also be dispatched manually from the `dev` branch. Manual runs selected from any
+other ref are skipped. Before an automatic build, a GitHub-hosted policy job
+compares `dev` with `main`; any change under `backend/**` skips the automatic
+preview even when the same push changes the frontend. An explicit manual run
+from `dev` bypasses only this backend-difference gate. It does not bypass the
+OpenAPI compatibility check against the running production API.
+
+The workflow checks out that exact commit, builds only `frontend/Dockerfile`,
+publishes the web image, resolves its immutable digest, and asks only the
+`alert-hub-ru` runner to deploy it. Backend-only pushes do not build or deploy a
+preview. The Docker build already runs `npm ci` and the Vite production build;
+the preview workflow does not repeat the full lint, backend, browser, migration,
+or recovery suites. Those remain required on the normal PR to `main`.
+
+Before enabling the workflow, re-run the node provisioner once on RU from the
+reviewed commit containing the preview files. This installs the root-owned
+`docker-deploy-preview-node.sh`, preview Compose file, and narrow no-argument
+sudoers rule. The self-hosted job never checks out or executes repository code.
+Create an unprotected `preview-ru` GitHub Environment if deployment must follow
+the build immediately; its deployment-branch rule should allow only `dev`.
+`GITHUB_TOKEN` provides package read/write access, so no new registry secret is
+required. An optional `PREVIEW_APP_NAME` Environment or Repository Variable
+overrides the preview brand; otherwise `APP_NAME` is used, falling back to
+`Alert Hub Preview`.
+
+The preview is one additional unprivileged, read-only web container. It mounts
+no database, application env file, secret, or Docker socket. It joins the
+existing `alert-hub-edge` and `alert-hub-ingress` networks, proxies same-origin
+requests to the healthy RU production API, and is published only on
+`127.0.0.1:18083`. Consequently it uses the RU node's existing SQLite state
+through the single API owner rather than opening the SQLite file from a second
+process. Deployment refuses a web image whose OpenAPI compatibility label does
+not exactly match both the recorded and running production API. A failed
+readiness check restores the previous compatible preview when available.
+
+Before DNS exists, an operator can verify the loopback endpoint without making
+it public:
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:18083/health/ready
+curl --fail --silent --show-error http://127.0.0.1:18083/runtime-config.js
+```
+
+Publishing the preview later is a separate, explicit production-network
+operation:
+
+1. Add the preview hostname's DNS `A` record to the RU host.
+2. Set `PREVIEW_PUBLIC_DOMAIN` only in `production-ru`, then perform an `api` or
+   `all` deployment so the existing API accepts that exact HTTPS Origin.
+3. Add a separate ordinary UI HTTPS virtual host. A host proxy targets
+   `127.0.0.1:18083`; a containerized proxy already attached to
+   `alert-hub-ingress` targets `alert-hub-web-preview:8080`.
+4. Preserve the ordinary UI template's unconditional `404` rules for
+   `/internal/*`, metrics, deep health, and API documentation, validate the
+   complete proxy configuration, and reload it explicitly.
+
+Treat the preview hostname as production-data access even though its JavaScript
+comes from `dev`. Restrict it to trusted testers with the existing VPN,
+source-allowlist, or identity-aware proxy control; do not expose it as an
+anonymous public test site. A tester who signs in grants that reviewed dev
+frontend the tester's normal RU API permissions, including mutations.
+
 ## Existing public reverse proxy
 
 Use [nginx.conf.example](../nginx.conf.example) or
@@ -466,6 +545,11 @@ separate explicit reload.
 The examples preserve SSE, no-store service-worker/runtime headers, CSP and
 security headers, and public `404` denials for `/internal/*`, `/metrics`,
 `/health/deep`, `/api/docs*`, `/api/redoc*`, and `/api/openapi.json`.
+
+Client-failover and same-origin proxy-failover use the additional reviewed
+templates under `deploy/proxy/{nginx,caddy}`. Follow
+[Frontend API high availability](api-ha.md) and validate the complete active
+proxy before reload.
 
 ## Dedicated HTTPS peer proxy
 

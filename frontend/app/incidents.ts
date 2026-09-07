@@ -47,6 +47,8 @@ export type IncidentListFilters = {
   status: "active" | "all" | "open" | "acknowledged" | "resolved" | "silenced";
   severity: "all" | "critical" | "warning" | "info" | "unknown";
   query: string;
+  alertname?: string;
+  datasourceId?: string;
   limit: number;
   offset: number;
 };
@@ -65,6 +67,8 @@ export function incidentListPath(filters: IncidentListFilters): string {
   if (filters.severity !== "all") params.set("severity", filters.severity);
   const query = normalizeIncidentSearch(filters.query);
   if (query) params.set("q", query);
+  if (filters.alertname) params.set("alertname", filters.alertname);
+  if (filters.datasourceId) params.set("datasource_id", filters.datasourceId);
   return `/incidents?${params.toString()}`;
 }
 
@@ -72,6 +76,13 @@ export type RefreshBurstCoalescer = {
   request: () => void;
   cancel: () => void;
 };
+
+export function sseReconnectDelay(attempt: number, random: () => number = Math.random): number {
+  const boundedAttempt = Math.max(0, Math.min(5, Math.floor(attempt)));
+  const base = Math.min(30_000, 1_000 * 2 ** boundedAttempt);
+  const jitter = 0.8 + Math.max(0, Math.min(1, random())) * 0.4;
+  return Math.min(30_000, Math.round(base * jitter));
+}
 
 export function createRefreshBurstCoalescer(
   run: () => Promise<unknown>,

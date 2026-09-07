@@ -1,10 +1,21 @@
 import react from "@vitejs/plugin-react";
 import type { Connect, Plugin } from "vite";
 import { defineConfig } from "vite";
+import { readApiRuntimeConfig } from "./app/api/endpoints.ts";
 import { normalizeAppName } from "./app/product.ts";
 
 function runtimeConfigScript(appName: string) {
-  const serialized = JSON.stringify({ appName })
+  const api = readApiRuntimeConfig({
+    apiHaMode: process.env.API_HA_MODE,
+    nodePublicApiUrl: process.env.NODE_PUBLIC_API_URL,
+    publicApiCandidates: process.env.PUBLIC_API_CANDIDATES?.split(","),
+  });
+  const serialized = JSON.stringify({
+    appName,
+    apiHaMode: api.mode,
+    nodePublicApiUrl: api.nodePublicApiUrl,
+    publicApiCandidates: api.candidates,
+  })
     .replaceAll("<", "\\u003c")
     .replaceAll("\u2028", "\\u2028")
     .replaceAll("\u2029", "\\u2029");

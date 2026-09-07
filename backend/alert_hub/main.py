@@ -18,6 +18,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from alert_hub import __version__
 from alert_hub.api import (
+    alerts,
     application_settings,
     audit,
     auth,
@@ -186,10 +187,26 @@ def _validate_production_settings(settings: Settings) -> None:
     ):
         raise RuntimeError("TRUSTED_ORIGINS must use HTTPS in production")
     public_origin = f"https://{public_url.netloc.lower()}"
-    if public_origin not in settings.trusted_origins:
-        raise RuntimeError("PUBLIC_API_URL origin must be present in TRUSTED_ORIGINS")
+    browser_origin = settings.public_ui_url or public_origin
+    if settings.api_ha_mode == "client-failover" and not settings.public_ui_url:
+        raise RuntimeError("PUBLIC_UI_URL is required for client-failover in production")
+    if settings.api_ha_mode == "client-failover" and not settings.cookie_domain:
+        raise RuntimeError("COOKIE_DOMAIN is required for client-failover in production")
+    if urlsplit(browser_origin).scheme != "https" or _is_loopback_host(
+        urlsplit(browser_origin).hostname
+    ):
+        raise RuntimeError("PUBLIC_UI_URL must be an exact non-loopback HTTPS origin")
+    if browser_origin not in settings.trusted_origins:
+        raise RuntimeError("PUBLIC_UI_URL origin must be present in TRUSTED_ORIGINS")
+    if settings.public_ingest_url:
+        ingest_url = urlsplit(settings.public_ingest_url)
+        if ingest_url.scheme != "https" or _is_loopback_host(ingest_url.hostname):
+            raise RuntimeError("PUBLIC_INGEST_URL must be an exact non-loopback HTTPS origin")
     if settings.cookie_domain:
-        hosts = [urlsplit(origin).hostname or "" for origin in settings.trusted_origins]
+        hosts = [
+            *(urlsplit(origin).hostname or "" for origin in settings.trusted_origins),
+            public_url.hostname or "",
+        ]
         if any(
             host != settings.cookie_domain and not host.endswith(f".{settings.cookie_domain}")
             for host in hosts
@@ -282,6 +299,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.db_public_read_limiter = asyncio.Semaphore(
+            runtime_settings.database_public_read_limit
+        )
         initialize_database(engine, session_factory, runtime_settings)
         with session_factory.begin() as db:
             ensure_bootstrap_token(db, runtime_settings)
@@ -485,6 +505,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     app.include_router(auth.router)
+    app.include_router(alerts.router)
     app.include_router(checks.router)
     app.include_router(incidents.router)
     app.include_router(sources.router)

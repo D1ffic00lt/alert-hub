@@ -68,7 +68,9 @@ def source_path(source: Source) -> str:
 
 
 def source_webhook_url(source: Source, settings: Settings, request: Request) -> str:
-    if settings.public_api_url:
+    if settings.public_ingest_url:
+        origin = settings.public_ingest_url.rstrip("/")
+    elif settings.public_api_url:
         origin = settings.public_api_url.rstrip("/")
     elif settings.trusted_origins:
         origin = settings.trusted_origins[0].rstrip("/")

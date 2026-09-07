@@ -94,6 +94,26 @@ def test_peer_public_url_alias_is_exact_and_backward_compatible(monkeypatch) -> 
         Settings()
 
 
+def test_public_api_ha_settings_keep_the_legacy_api_alias(monkeypatch) -> None:
+    monkeypatch.setenv("PUBLIC_API_URL", "https://legacy-api.alerts.example/")
+    settings = Settings()
+    assert settings.public_api_url == "https://legacy-api.alerts.example"
+
+    monkeypatch.setenv("NODE_PUBLIC_API_URL", "https://api-ru.alerts.example/")
+    monkeypatch.setenv("PUBLIC_UI_URL", "https://alerts.example/")
+    monkeypatch.setenv("PUBLIC_INGEST_URL", "https://ingest.alerts.example/")
+    monkeypatch.setenv("API_HA_MODE", "client-failover")
+    settings = Settings()
+    assert settings.api_ha_mode == "client-failover"
+    assert settings.public_api_url == "https://api-ru.alerts.example"
+    assert settings.public_ui_url == "https://alerts.example"
+    assert settings.public_ingest_url == "https://ingest.alerts.example"
+
+    monkeypatch.setenv("PUBLIC_UI_URL", "https://alerts.example/path")
+    with pytest.raises(ValueError, match="exact origin"):
+        Settings()
+
+
 def test_sync_backoff_max_cannot_be_smaller_than_initial() -> None:
     with pytest.raises(ValueError, match="SYNC_BACKOFF_MAX_SECONDS"):
         Settings(sync_backoff_initial_seconds=10, sync_backoff_max_seconds=5)

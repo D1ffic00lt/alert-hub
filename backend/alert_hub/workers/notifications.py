@@ -460,7 +460,7 @@ class NotificationOutboxProcessor:
             message = message_from_event(
                 event,
                 incident,
-                public_api_url=self._settings.public_api_url,
+                public_api_url=self._settings.public_ui_url or self._settings.public_api_url,
                 app_name=self._settings.app_name,
             )
             target = DeliveryTarget(

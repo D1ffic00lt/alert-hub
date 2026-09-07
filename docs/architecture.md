@@ -8,10 +8,25 @@ visualization surface. A replicated, validated Grafana URL supplies an authentic
 credential or query surface. Administrators can select bounded `job` globs for named `up` queries;
 the server constructs PromQL and never accepts browser-authored PromQL. Each Alert Hub node owns a
 local SQLite database and is intended to remain useful when peers are unreachable.
+The UI can use one API origin, a bounded server-owned list of public API origins,
+a same-origin proxy pool, or an external load balancer. Browser API routing is
+separate from append-only peer replication; no browser candidate exposes the
+peer protocol. See [Frontend API high availability](api-ha.md).
 The overview can aggregate bounded `24h`, `7d`, or `30d` incident and delivery history from that
 node-local replicated append-only event history, with current-active counters from the incident
 projection. This remains an eventually consistent operational summary; Prometheus and Grafana
 continue to own detailed infrastructure time-series.
+
+The authenticated Alerts read model uses the same outbound Prometheus boundary. Rule inventory is
+read directly from `/api/v1/rules?type=alert`; observed availability is calculated on demand with
+fixed `avg_over_time`, `count_over_time`, and `last_over_time` expressions for exactly `24h`, `7d`,
+or `30d`. Neither result is persisted in SQLite. The Alerts catalog groups rules by the arbitrary
+Prometheus label `alert_category`, with a separate uncategorized group when the label is absent.
+Replicas with the same category and alert name are one logical rule while their datasource, file,
+group, state, instance counts, evaluation health, error, labels, and annotations remain separate.
+Availability evidence is not mixed into that catalog; the regional matrix and Checks remain their
+own screens. A datasource failure produces an explicit partial result when another datasource
+answered.
 
 ```mermaid
 flowchart LR
@@ -44,8 +59,9 @@ flowchart LR
     AGG -. "never persisted" .-> CACHE["Bounded in-memory snapshot"]
 ```
 
-A result key is `(check_id, source, scenario, variant)`; absent optional dimensions use private,
-stable sentinels that are not presented as invented user data. `synthetic_check_info` supplies the
+A result key is `(check_id, instance, scenario, variant)` and carries its logical Source separately;
+absent optional dimensions use private, stable sentinels that are not presented as invented user
+data. `synthetic_check_info` supplies the
 expected inventory when available. Without it, only series currently visible in the required
 status/timestamp metrics can establish inventory, and process restart loses any cache-only memory
 of disappeared series. Samples, run history, current status, and snapshots are never copied into
@@ -57,8 +73,9 @@ The normalization boundary also understands the richer xray-e2e-prober projectio
 it mandatory. It joins safe info metadata to other families by `check_id` plus exported
 `instance_id`, keeps each target and egress `assertion_id` nested under the universal result, and
 exposes only allowlisted one-hot states and structured cumulative reason counters. Free-form error
-text and raw/expected addresses never cross the boundary. A declared generic `source` still has
-priority; otherwise separate prober instances remain separate sources.
+text and raw/expected addresses never cross the boundary. The exported `instance_id` keeps concrete
+prober processes separate while generic `source`/`source_id` remain the logical Source used for
+quorum. The API and UI report both coverage concepts explicitly.
 
 Every node evaluates its own configured Prometheus view and owns its own short-lived cache. Checks
 failure or disablement cannot affect local ingest, incident actions, notification work, peer sync,
@@ -96,16 +113,27 @@ flowchart LR
 ```
 
 Both runtimes are unprivileged and use read-only root filesystems. The API alone mounts persistent
-`/data` and secret files. The web service gets only bounded tmpfs space for runtime branding and
+`/data` and secret files. The web service gets only bounded tmpfs space for runtime branding and API endpoint configuration and
 Nginx state; it never receives the application env file, database, or secrets. It proxies through
 a dedicated bridge address which is the only container proxy trusted by the API. If API readiness
-is lost, Nginx stays alive and fails application/static requests closed with `503`; it recovers
-without a web restart when the API returns. Uvicorn remains one worker because SQLite write
+is lost, Nginx stays alive. Single/external mode fails application/static requests closed with
+`503`; client/proxy failover mode keeps the shell available for reserve API selection. Uvicorn remains one worker because SQLite write
 serialization and restart-safe in-process background loops are part of the MVP constraint.
 
 The two images carry the same release version and OpenAPI-derived compatibility value, but have
 separate immutable digests. Updating one Compose service does not recreate the other. API-only
 mode publishes the backend directly on loopback and does not require the web image.
+
+The optional RU development preview reuses this web image boundary without creating another API
+or SQLite owner. A frontend-changing push to `dev`, or an input-free manual dispatch selected from
+`dev`, can build an immutable web digest and deploy one separate read-only web container on the
+existing edge/ingress networks. Automatic runs are skipped whenever `backend/**` differs between
+`dev` and `main`; a manual run bypasses that gate but retains the production API compatibility
+check. Backend-only pushes also skip this frontend pipeline. The preview container proxies to the
+healthy RU production API, mounts no data or secrets, and is accepted only when its OpenAPI
+compatibility label matches the recorded and running API. Its loopback port and later HTTPS
+hostname are distinct from production, while all state access still passes through the single RU
+API process.
 
 ## Application layers
 
@@ -185,6 +213,13 @@ web image. Disabling a role must not silently broaden another network boundary.
 - `/health/ready`: local API and SQLite are serviceable. Deploy gating uses this endpoint.
 - `/health/deep`: local database plus informational peer/channel state. A remote peer failure must not make a locally useful node unready. The supplied public proxy denies it.
 - `/metrics`: Prometheus exposition on the same loopback application port; there is no separately published monitoring port, and the supplied public proxy denies it.
+
+File-backed SQLite uses an explicitly bounded SQLAlchemy pool. Dashboard reads acquire one of a
+smaller set of public slots asynchronously before entering FastAPI's synchronous worker pool, so a
+burst of browser tabs cannot occupy the workers needed by current connection holders to finish.
+The reserved pool capacity remains available to readiness, ingest, mutations, internal cluster
+operations, and the short-lived background-worker transactions. `/health/live` stays event-loop
+local, while `/health/ready` uses a separately scheduled database probe.
 
 ## Deployment model
 

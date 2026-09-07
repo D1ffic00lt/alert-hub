@@ -54,6 +54,50 @@ describe("Checks API model", () => {
     });
   });
 
+  it("keeps logical source and prober instance coverage separate", () => {
+    const check = normalizeCheckListItem({
+      check_id: "regional",
+      name: "Regional",
+      status: "degraded",
+      sources_total: 1,
+      sources_up: 0,
+      instances_total: 3,
+      instances_up: 2,
+      instances_stale: 1,
+      instances: [
+        {
+          instance_id: "ru2-test",
+          source: "remnawave-service",
+          status: "up",
+        },
+        {
+          instance_id: "nl2-test",
+          source: "remnawave-service",
+          status: "up",
+        },
+        {
+          instance_id: "de2-test",
+          source: "remnawave-service",
+          status: "stale",
+          stale: true,
+        },
+      ],
+    });
+
+    expect(check).toMatchObject({
+      sourcesTotal: 1,
+      sourcesUp: 0,
+      instancesTotal: 3,
+      instancesUp: 2,
+      instancesStale: 1,
+    });
+    expect(check?.instances.map((instance) => [instance.instanceId, instance.status])).toEqual([
+      ["ru2-test", "up"],
+      ["nl2-test", "up"],
+      ["de2-test", "stale"],
+    ]);
+  });
+
   it("normalizes all five summary states and common snapshot metadata", () => {
     const response = normalizeChecksSummary({
       enabled: true,

@@ -43,6 +43,10 @@ REQUIRED_AGENT_MARKERS = {
 }
 PRODUCTION_WORKFLOWS = {"deploy.yml", "rollback.yml"}
 RELEASE_WORKFLOW = "release.yml"
+PREVIEW_WORKFLOW = "dev-preview.yml"
+PREVIEW_POLICY_JOB = "preview_policy"
+PREVIEW_PUBLISH_JOB = "build"
+SELF_HOSTED_WORKFLOWS = {*PRODUCTION_WORKFLOWS, PREVIEW_WORKFLOW}
 GITHUB_HOSTED_RUNNERS = {"ubuntu-24.04"}
 PRODUCTION_RUNNER_LABELS = {
     ("self-hosted", "alert-hub-ru"),
@@ -51,6 +55,7 @@ PRODUCTION_RUNNER_LABELS = {
 }
 ROOT_WRAPPERS = {
     "/usr/local/sbin/docker-deploy-node.sh",
+    "/usr/local/sbin/docker-deploy-preview-node.sh",
     "/usr/local/sbin/docker-rollback-node.sh",
     "/usr/local/sbin/docker-status-node.sh",
 }
@@ -58,11 +63,15 @@ PRESERVABLE_ROOT_ENVIRONMENT = {
     "ALERT_HUB_API_IMAGE",
     "ALERT_HUB_COMPONENT",
     "ALERT_HUB_CONFIRMATION",
+    "ALERT_HUB_PREVIEW_COMPATIBILITY",
+    "ALERT_HUB_PREVIEW_IMAGE",
+    "ALERT_HUB_PREVIEW_REVISION",
     "ALERT_HUB_RELEASE_COMPATIBILITY",
     "ALERT_HUB_ROLLBACK_VERSION",
     "ALERT_HUB_VERSION",
     "ALERT_HUB_WEB_IMAGE",
     "APP_NAME",
+    "API_HA_MODE",
     "CHECKS_CACHE_TTL_SECONDS",
     "CHECKS_ENABLED",
     "CHECKS_FUTURE_TOLERANCE_SECONDS",
@@ -71,15 +80,21 @@ PRESERVABLE_ROOT_ENVIRONMENT = {
     "CHECKS_MIN_FAILURE_SOURCES",
     "CHECKS_STALE_AFTER_SECONDS",
     "CLUSTER_MASTER_KEY",
+    "COOKIE_DOMAIN",
     "GHCR_TOKEN",
     "GITHUB_ACTOR",
     "GITHUB_REPOSITORY",
     "NODE_IP",
     "NODE_NAME",
+    "NODE_PUBLIC_API_URL",
     "PEER_ALLOWED_CIDRS",
     "PEER_PUBLIC_URL",
     "PEER_URLS",
+    "PREVIEW_PUBLIC_DOMAIN",
+    "PUBLIC_API_CANDIDATES",
+    "PUBLIC_INGEST_URL",
     "PUBLIC_DOMAIN",
+    "PUBLIC_UI_URL",
     "SESSION_SIGNING_KEY",
     "VAPID_PRIVATE_KEY",
     "VAPID_PUBLIC_KEY",
@@ -288,7 +303,7 @@ def _action_errors(path: Path, workflow: Mapping[str, Any]) -> list[str]:
 
 
 def _publication_errors(path: Path, workflow: Mapping[str, Any]) -> list[str]:
-    """Keep every registry mutation inside the dedicated release workflow."""
+    """Keep registry mutations inside the release and branch-preview workflows."""
 
     if path.name == RELEASE_WORKFLOW:
         return []
@@ -308,23 +323,37 @@ def _publication_errors(path: Path, workflow: Mapping[str, Any]) -> list[str]:
                 if isinstance(permissions, Mapping)
                 else ""
             )
-            if package_access == "write":
+            preview_publish_job = (
+                path.name == PREVIEW_WORKFLOW and str(job_name) == PREVIEW_PUBLISH_JOB
+            )
+            if package_access == "write" and not preview_publish_job:
                 failures.append(
-                    f"{path}: only {RELEASE_WORKFLOW} may request packages: write "
+                    f"{path}: only {RELEASE_WORKFLOW} or the {PREVIEW_PUBLISH_JOB!r} "
+                    f"job in {PREVIEW_WORKFLOW} may request packages: write "
                     f"(job {job_name!r})"
                 )
-
-    for step in _steps(workflow):
-        if "docker push" in str(step.get("run", "")).lower():
-            failures.append(f"{path}: only {RELEASE_WORKFLOW} may execute docker push")
+            steps = job.get("steps", [])
+            if not isinstance(steps, list):
+                continue
+            for step in steps:
+                if not isinstance(step, Mapping):
+                    continue
+                if "docker push" in str(step.get("run", "")).lower() and not preview_publish_job:
+                    failures.append(
+                        f"{path}: only {RELEASE_WORKFLOW} or the {PREVIEW_PUBLISH_JOB!r} "
+                        f"job in {PREVIEW_WORKFLOW} may execute docker push"
+                    )
     return failures
 
 
-def _is_production_self_hosted_job(path: Path, job: Mapping[str, Any]) -> bool:
+def _is_approved_self_hosted_job(path: Path, job: Mapping[str, Any]) -> bool:
     runs_on = job.get("runs-on")
-    if path.name not in PRODUCTION_WORKFLOWS or not isinstance(runs_on, list):
+    if not isinstance(runs_on, list):
         return False
-    return tuple(str(label) for label in runs_on) in PRODUCTION_RUNNER_LABELS
+    labels = tuple(str(label) for label in runs_on)
+    if path.name in PRODUCTION_WORKFLOWS:
+        return labels in PRODUCTION_RUNNER_LABELS
+    return path.name == PREVIEW_WORKFLOW and labels == ("self-hosted", "alert-hub-ru")
 
 
 def _runner_errors(path: Path, workflow: Mapping[str, Any]) -> list[str]:
@@ -342,12 +371,11 @@ def _runner_errors(path: Path, workflow: Mapping[str, Any]) -> list[str]:
         runs_on = job.get("runs-on")
         if isinstance(runs_on, str) and runs_on in GITHUB_HOSTED_RUNNERS:
             continue
-        if _is_production_self_hosted_job(path, job):
+        if _is_approved_self_hosted_job(path, job):
             continue
         failures.append(
             f"{path}: job {job_name!r} must use an approved static GitHub-hosted "
-            "runner; exact production self-hosted labels are allowed only in "
-            "deploy.yml and rollback.yml"
+            "runner; exact self-hosted labels are allowed only at audited deploy boundaries"
         )
     return failures
 
@@ -363,32 +391,66 @@ def _default_run_shell(owner: Mapping[str, Any]) -> Any | None:
 
 
 def _production_workflow_errors(path: Path, workflow: Mapping[str, Any]) -> list[str]:
-    if path.name not in PRODUCTION_WORKFLOWS:
+    if path.name not in SELF_HOSTED_WORKFLOWS:
         return []
 
     failures: list[str] = []
     triggers = workflow.get("on", {})
-    if not isinstance(triggers, Mapping) or set(triggers) != {"workflow_dispatch"}:
-        failures.append(f"{path}: production workflow must be workflow_dispatch-only")
+    if path.name in PRODUCTION_WORKFLOWS:
+        if not isinstance(triggers, Mapping) or set(triggers) != {"workflow_dispatch"}:
+            failures.append(f"{path}: production workflow must be workflow_dispatch-only")
+    else:
+        push = triggers.get("push", {}) if isinstance(triggers, Mapping) else {}
+        branches = push.get("branches") if isinstance(push, Mapping) else None
+        paths = push.get("paths") if isinstance(push, Mapping) else None
+        normalized = [str(branch) for branch in branches] if isinstance(branches, list) else []
+        normalized_paths = [str(item) for item in paths] if isinstance(paths, list) else []
+        dispatch = triggers.get("workflow_dispatch") if isinstance(triggers, Mapping) else None
+        if (
+            not isinstance(triggers, Mapping)
+            or set(triggers) != {"push", "workflow_dispatch"}
+            or normalized != ["dev"]
+            or normalized_paths != ["frontend/**"]
+            or not isinstance(dispatch, Mapping)
+            or dispatch
+        ):
+            failures.append(
+                f"{path}: preview workflow must use frontend-only pushes to dev "
+                "plus an input-free manual dispatch"
+            )
 
     jobs = workflow.get("jobs", {})
     if not isinstance(jobs, Mapping):
         return [*failures, f"{path}: jobs must be a mapping"]
+    if path.name == PREVIEW_WORKFLOW:
+        preview_policy = jobs.get(PREVIEW_POLICY_JOB)
+        policy_condition = preview_policy.get("if") if isinstance(preview_policy, Mapping) else None
+        if str(policy_condition).strip() != "github.ref == 'refs/heads/dev'":
+            failures.append(f"{path}: manual preview runs must be restricted to refs/heads/dev")
+        build = jobs.get(PREVIEW_PUBLISH_JOB)
+        build_condition = build.get("if") if isinstance(build, Mapping) else None
+        build_dependency = build.get("needs") if isinstance(build, Mapping) else None
+        if (
+            str(build_dependency).strip() != PREVIEW_POLICY_JOB
+            or str(build_condition).strip() != "needs.preview_policy.outputs.should_run == 'true'"
+        ):
+            failures.append(
+                f"{path}: preview publication must depend on the dev-only preview policy job"
+            )
     has_self_hosted_job = any(
-        isinstance(job, Mapping) and _is_production_self_hosted_job(path, job)
+        isinstance(job, Mapping) and _is_approved_self_hosted_job(path, job)
         for job in jobs.values()
     )
     if has_self_hosted_job and _default_run_shell(workflow) is not None:
         failures.append(
-            f"{path}: workflow-level defaults.run.shell is forbidden for "
-            "production self-hosted jobs"
+            f"{path}: workflow-level defaults.run.shell is forbidden for self-hosted deploy jobs"
         )
     if has_self_hosted_job and "env" in workflow:
-        failures.append(f"{path}: workflow-level env is forbidden for production self-hosted jobs")
+        failures.append(f"{path}: workflow-level env is forbidden for self-hosted deploy jobs")
     for job_name, job in jobs.items():
         if not isinstance(job, Mapping):
             continue
-        if not _is_production_self_hosted_job(path, job):
+        if not _is_approved_self_hosted_job(path, job):
             continue
         if _default_run_shell(job) is not None:
             failures.append(

@@ -1,0 +1,36 @@
+# Dedicated browser/API virtual host for client-failover mode. It exposes only
+# browser API, ingest, and shallow health operations; /internal is never routed.
+
+__API_SERVER_NAME__ {
+    encode zstd gzip
+
+    request_body {
+        max_size 1MB
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    @public_api path /api/v1/* /ingest/v1/* /health/live /health/ready
+    handle @public_api {
+        reverse_proxy __API_UPSTREAM__ {
+            header_up X-Forwarded-Proto https
+            transport http {
+                dial_timeout 2s
+                response_header_timeout 60s
+            }
+        }
+    }
+
+    @internal path /internal/*
+    respond @internal 404
+
+    handle {
+        respond 404
+    }
+}

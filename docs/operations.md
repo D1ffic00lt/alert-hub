@@ -23,13 +23,30 @@ public proxy examples deny `/health/deep`, `/metrics`, API documentation, and `/
 `404`. Query or scrape those operator surfaces through loopback/private paths; never publish a
 separate metrics port.
 
-After a previously healthy web container loses its local API, browser navigation returns a
-self-contained outage screen with HTTP `503`; API, ingest, health, and metrics clients continue to
-receive the compact JSON `503`. The screen retries every 10 seconds and requires neither the React
-bundle nor a working API. The failed process cannot report its own complete outage. A different
+In `single` and `external` mode, after a previously healthy web container loses its local API,
+browser navigation returns a self-contained outage screen with HTTP `503`; API, ingest, health,
+and metrics clients continue to receive the compact JSON `503`. In `client-failover` and
+`proxy-failover`, the web shell remains available and reports endpoint selection while the browser
+or outer proxy selects a reserve API. See [Frontend API high availability](api-ha.md) for the
+failure and no-mutation-replay contract. The failed process cannot report its own complete outage. A different
 Alert Hub node can do so through the peer watcher described below; Prometheus or another external
 watcher is still required when no configured peer remains alive, before an endpoint has ever
 proved its node identity, or when the entire cluster is unavailable.
+
+When the RU development preview is enabled, inspect it independently without treating it as a
+second application node:
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:18083/health/ready
+sudo docker inspect alert-hub-web-preview \
+  --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.Config.Image}}'
+sudo docker logs --tail=200 alert-hub-web-preview
+```
+
+The preview has no database or worker health of its own; its readiness proves that the dev web
+container can reach the current RU API. A compatibility rejection is intentional when `dev`
+changes the OpenAPI contract before production. Do not work around it by mounting production
+SQLite or weakening the digest/compatibility checks.
 
 The authenticated UI uses `/api/v1/cluster/status`. It combines durable node inventory with the
 serving process's current peer result: the local node is healthy when it serves the request, a peer
@@ -81,9 +98,11 @@ Alert on at least:
 
 `GET /api/v1/incidents` performs filtering and pagination on the serving node. It accepts
 `status` (`active`, `open`, `acknowledged`, `resolved`, or `silenced`), `severity`, `source_id`,
-`q`, `limit`, and `offset`. The response `total` applies the complete filter, while `counts`
-applies the severity/source/search filters and reports every status so the UI can change status
-tabs without downloading the journal. `status=active` means open, acknowledged, or silenced.
+`q`, exact `alertname`, exact Prometheus `datasource_id`, `limit`, and `offset`. The response `total`
+applies the complete filter, while `counts` applies every filter except status and reports every
+status so the UI can change status tabs without downloading the journal. `status=active` means
+open, acknowledged, or silenced. Alerts catalog links use the two exact label filters rather than a
+broad title search.
 
 Use `view=compact` for list screens. Compact rows retain identity, status, timestamps, source,
 region/target hints, and bounded Check relations, set `summary_only: true`, and omit the potentially
@@ -96,9 +115,9 @@ in-flight refresh plus one trailing refresh.
 `POST /api/v1/incidents/bulk-action` supports one of two explicit selection modes:
 
 - `ids`: up to 500 unique `incident_ids` selected across visible pages;
-- `filter`: the same status/severity/source/search filter as the list, plus up to 500 explicit
-  `excluded_incident_ids`. The server rejects a matching population above 500 instead of silently
-  truncating it.
+- `filter`: the same status/severity/source/search/exact-rule filter as the list, plus up to 500
+  explicit `excluded_incident_ids`. The server rejects a matching population above 500 instead of
+  silently truncating it.
 
 The actions are `acknowledge`, `resolve`, and `silence`. Every changed incident produces the same
 append-only replicated incident event and audit record as its single-item operation. Repeating an
@@ -108,6 +127,30 @@ invalid transitions such as acknowledging a resolved incident are reported per i
 `updated`, `unchanged`, and `failed` totals. A `207` is an operation result, not a transport failure,
 so clients must display its per-item failures. The UI keeps that result visible after clearing the
 successful selection and asks for confirmation before bulk resolve.
+
+## Alert catalog and observed availability API
+
+The `/alerts` screen is a technical catalog, not a second active-incident queue. It reads alerting
+rules from every enabled Prometheus datasource, groups them by arbitrary `alert_category`, puts
+rules without that label under an uncategorized group, and merges matching category/name HA rules
+while retaining a card for every datasource replica. Problem categories and rules open
+automatically; healthy groups may stay collapsed. Global counters use unique logical rules rather
+than summing replicas. `GET /api/v1/alert-rules` supports stable server pagination plus exact
+category/uncategorized, `datasource_id`, `state`, and rule-name `q` filters. Firing and pending
+replicas link to Incidents with exact `alertname` and `prometheus_datasource_id`; acknowledge,
+resolve, silence, and bulk actions remain only in Incidents.
+
+`GET /api/v1/availability?window=24h|7d|30d` evaluates backend-owned expressions over
+`probe_success`. Canonical datasources use `source_region × target_name`; datasource configured in
+server mode use `source_server × target_server`. Missing samples remain unknown, and a last sample
+older than `AVAILABILITY_STALE_AFTER_SECONDS` (300 seconds by default) is marked stale. The values
+are observed measurements, not contractual objectives, and no range samples are stored in SQLite.
+This endpoint remains available to purpose-built monitoring surfaces but is not rendered inside
+the Alerts catalog.
+
+The existing Prometheus response byte and sample limits apply independently to the rules response
+and every availability vector. Repeated `partial`, `unavailable`, `response_too_large`, or
+`too_many_samples` results should be investigated at the named datasource.
 
 ## Checks
 
@@ -198,10 +241,12 @@ synthetic_check_egress_match{check_id="checkout-flow",source="edge-a",scenario="
 The current `xray-e2e-prober` projection is joined safely before result keys are built. Its
 `synthetic_check_info{check_id,instance_id,source_id,entry_name,mode,target_set_id}` metadata enriches
 the status/state/last-run/target/assertion families that carry only `check_id` and `instance_id`.
-The join never matches on the complete raw label set. Source identity uses declared `source` first,
-then `instance_id`, then `source_id`; consequently two prober instances with the same configuration
-source do not collapse. Scenario uses `scenario` then `mode`, and Variant uses `variant` then
-`target_set_id`. Conflicting info metadata fails closed instead of creating a favourable result.
+The join never matches on the complete raw label set. Execution identity uses `instance_id` first,
+then the generic `source`, then `source_id`, so two prober processes never collapse merely because
+they share one subscription. Logical Source remains a separate dimension: declared `source`, then
+`source_id`, with the execution identity only as a compatibility fallback. Scenario uses `scenario`
+then `mode`, and Variant uses `variant` then `target_set_id`. Conflicting info metadata fails closed
+instead of creating a favourable result.
 
 `check_name` is the preferred display name, followed by the prober's safe `entry_name`. If neither
 is exported, Alert Hub humanizes safe exported identifiers; it keeps `check_id` separately and does
@@ -219,11 +264,11 @@ fail the Check.
 
 `source` is the executor-declared logical observation point, not proof of physical independence.
 Give genuinely independent points different stable values, and give replicas of one logical point
-the same value. For the richer compatible contract, a missing `source` deliberately falls back to
-the stable exported `instance_id`, then `source_id`; the unrelated Prometheus scrape `instance` and
-`job` labels are still ignored. If none of those declared identities exists, Alert Hub uses one
-private default source. Scenario, variant, target, assertion, and canary identities never create
-extra failure-quorum votes.
+the same value. For the richer compatible contract, `source_id` identifies the logical Source while
+`instance_id` identifies the concrete execution process. A missing logical Source deliberately
+falls back to that stable execution identity; the unrelated Prometheus scrape `instance` and `job`
+labels are still ignored. If none of those declared identities exists, Alert Hub uses one private
+default source. Multiple Instances of one Source never create extra failure-quorum votes.
 
 Publish `synthetic_check_info` for every expected `(check_id, source, scenario, variant)`, including
 before its first run. Without `info`, Alert Hub can discover only tuples present in the required
@@ -232,16 +277,18 @@ it, is unknowable. Previously observed tuples remain visible only for the life o
 in-memory registry; after restart they cannot be reconstructed. Prometheus retention and `info`,
 not the Alert Hub database, provide durable inventory.
 
-Executors that publish `info` may coexist with status-only executors. A valid `info` family removes
-an absent cached tuple only when that tuple was itself previously declared by `info`; the presence
-of an unrelated `info` series never erases a remembered status-only source. The public identifier
-`summary` is reserved by the API route and is rejected like internal sentinels, IP/UUID-bearing
-identifiers, and obvious credential markers.
+Executors that publish `info` may coexist with status-only executors. A previously observed Instance
+that disappears from the current `info` family remains in the bounded process-local inventory as
+incomplete and later stale; otherwise a regional outage would improve the displayed coverage. A
+current declaration for that same Instance may still replace a superseded Scenario/Variant tuple.
+The public identifier `summary` is reserved by the API route and is rejected like internal
+sentinels, IP/UUID-bearing identifiers, and obvious credential markers.
 
 ### Freshness, quorum, and aggregation
 
-One result is keyed by `(check_id, source, scenario, variant)`. Exactly matching duplicates are
-coalesced. Conflicting main values for one key make that result `unknown`; conflicting optional
+One result is keyed by `(check_id, instance, scenario, variant)` and carries its logical Source
+separately. Exactly matching duplicates are coalesced. Conflicting main values for one key make
+that result `unknown`; conflicting optional
 values remove only that optional field. Conflicting names fall back to `check_id`, conflicting
 optional metadata becomes `null`, and a diagnostic code records the reason. Malformed identifiers,
 non-`0`/`1` status values, NaN/infinite values, negative durations, missing timestamps, and
@@ -275,6 +322,9 @@ otherwise. An empty set is never up. `sources_total` counts distinct known logic
 `sources_up` counts sources whose every known result is fresh and successful. List latency is the
 maximum available duration among fresh successful results, not an average. `last_checked_at`,
 `oldest_checked_at`, `stale_results`, and `data_incomplete` make age and partial evidence explicit.
+The list/detail API also returns `instances_total`, `instances_up`, `instances_stale`, and a bounded
+per-Instance status list. The UI keeps `Sources N/N` and `Instances N/N` distinct and omits the
+extra Instance summary for ordinary single-instance installations.
 
 List filters (`status`, `group`, `source`, `target`, `scenario`, and bounded `search`) are combined
 with AND. A source filter selects complete Checks but never recomputes their status from a subset.
@@ -557,6 +607,8 @@ also flattened to one line before the message is constructed.
 ## Capacity and SQLite care
 
 - Keep the database on a local durable filesystem and ensure the volume supports fsync and file locking.
+- Keep `DATABASE_PUBLIC_READ_LIMIT` below `DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW`; startup rejects a value that leaves no reserved priority capacity. The defaults reserve seven connections and queue public reads outside the synchronous request workers for at most five seconds.
+- Scrape `alert_hub_db_pool_connections`, `alert_hub_db_pool_events_total`, `alert_hub_db_pool_acquire_seconds`, and `alert_hub_db_pool_acquire_timeouts_total`. A sustained checked-out/overflow plateau or any acquisition timeouts requires investigation; do not respond only by enlarging the pool.
 - Leave headroom for the DB, WAL, one online backup, a pulled image, and migration temporary space. The wrapper enforces at least 1 GiB on Docker storage and 1 GiB plus the current DB/WAL/SHM footprint on application data; site policy should be larger.
 - Do not copy a live `.db` file with ordinary `cp`; use the backup API.
 - Do not run two application containers against the same file.
@@ -568,6 +620,10 @@ also flattened to one line before the message is constructed.
 Container logs rotate at five 10 MiB files by default. `LOG_FORMAT=json` is the production default; `LOG_FORMAT=text` is intended for local development. `LOG_LEVEL` accepts `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` (case-insensitive). Invalid values fail settings validation rather than silently changing verbosity.
 
 JSON application records contain an RFC 3339 UTC timestamp, level, logger, stable event/message, and an explicit allowlist of scalar context such as request, node, source, incident, channel, route, outbox, and peer identifiers. Exception records include the exception type and a bounded redacted trace. Arbitrary `extra` values are dropped: authorization/cookie fields, request bodies, provider responses, peer URLs, and unapproved dictionaries are not serialized. Sensitive labelled values and bearer material are redacted as a second boundary; callers must still never pass secrets to a logger.
+
+`database_connection_acquire_timeout` identifies a bounded public-read queue or SQLAlchemy pool
+timeout and includes only the request ID, path, method, node, wait duration, and database lane. It
+never includes SQL text, parameters, credentials, or request content.
 
 The request boundary accepts a caller/proxy `X-Request-ID` only when it is 1–128 safe ASCII identifier characters; otherwise it generates a UUID. The same value is returned and logged for normal responses, pre-routing `400`/`413`/`429`/role-disabled responses, and unhandled application exceptions. The log uses the URL path without its query and never records request headers, cookies, authorization, or body. Uvicorn's separate plain access logger is disabled so the application emits one correlated API request event. The web Nginx access/error logs remain separate proxy evidence.
 

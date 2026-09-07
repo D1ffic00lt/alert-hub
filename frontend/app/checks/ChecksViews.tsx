@@ -194,7 +194,11 @@ export function CheckStatusBadge({
   const [russian, english, icon] = STATUS_COPY[status];
   const label = tx(language, russian, english);
   return (
-    <span className={`check-status check-status--${status}`} aria-label={label}>
+    <span
+      className={`check-status check-status--${status}`}
+      role={compact ? "img" : undefined}
+      aria-label={compact ? label : undefined}
+    >
       <Glyph>{icon}</Glyph>
       {!compact && <span>{label}</span>}
     </span>
@@ -952,7 +956,7 @@ function ChecksTable({
                 {tx(language, "Макс. latency", "Max latency")}
               </span>
             </th>
-            <th>{tx(language, "Sources", "Sources")}</th>
+            <th>{tx(language, "Покрытие", "Coverage")}</th>
             <th>{tx(language, "Алерты", "Alerts")}</th>
             <th>
               <span className="sr-only">{tx(language, "Открыть", "Open")}</span>
@@ -962,6 +966,7 @@ function ChecksTable({
         <tbody>
           {items.map((check) => {
             const identity = checkIdentity(check);
+            const showInstances = check.instances.length > 0 && check.instancesTotal > 1;
             const open = () => navigate(`/checks/${encodeURIComponent(check.checkId)}`);
             const onKeyDown = (event: ReactKeyboardEvent<HTMLTableRowElement>) => {
               if (event.key !== "Enter") return;
@@ -1022,11 +1027,26 @@ function ChecksTable({
                     ? "—"
                     : formatDuration(language, check.latencySeconds)}
                 </td>
-                <td data-label="Sources">
-                  <b>
-                    {check.sourcesUp}/{check.sourcesTotal}
-                  </b>
-                  <small>{tx(language, "полностью успешны", "fully successful")}</small>
+                <td data-label={tx(language, "Покрытие", "Coverage")}>
+                  <div className="check-coverage-counts">
+                    <span>
+                      <small>Sources</small>
+                      <b>
+                        {check.sourcesUp}/{check.sourcesTotal}
+                      </b>
+                    </span>
+                    {showInstances && (
+                      <span>
+                        <small>Instances</small>
+                        <b>
+                          {check.instancesUp}/{check.instancesTotal}
+                        </b>
+                      </span>
+                    )}
+                  </div>
+                  {showInstances && (
+                    <InstanceCoverageList check={check} language={language} compact />
+                  )}
                 </td>
                 <td data-label={tx(language, "Алерты", "Alerts")}>
                   {check.activeAlerts === null
@@ -1042,6 +1062,39 @@ function ChecksTable({
         </tbody>
       </table>
     </div>
+  );
+}
+
+function InstanceCoverageList({
+  check,
+  language,
+  compact = false,
+}: {
+  check: CheckListItem;
+  language: ChecksLanguage;
+  compact?: boolean;
+}) {
+  if (!check.instances.length) return null;
+  return (
+    <ul
+      className={`check-instance-coverage ${compact ? "check-instance-coverage--compact" : ""}`}
+      aria-label={tx(language, "Состояние инстансов", "Instance status")}
+    >
+      {check.instances.map((instance, index) => (
+        <li
+          key={`${instance.instanceId ?? instance.source ?? "instance"}-${index}`}
+          title={instance.statusReason ?? undefined}
+        >
+          <CheckStatusBadge status={instance.status} language={language} compact />
+          <code>
+            {instance.instanceId ?? instance.source ?? tx(language, "Основной", "Primary")}
+          </code>
+          {!compact && instance.source && instance.source !== instance.instanceId && (
+            <small>Source · {instance.source}</small>
+          )}
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -1079,6 +1132,7 @@ function ResultMetrics({ result, language }: { result: CheckResult; language: Ch
 function ResultContext({ result }: { result: CheckResult }) {
   const entries = [
     ["Source", result.source],
+    ["Instance", result.instanceId],
     ["Scenario", result.scenario],
     ["Variant", result.variant],
   ].filter((entry): entry is [string, string] => entry[1] !== null);
@@ -1312,12 +1366,12 @@ function ResultsMatrix({
       className="check-matrix-wrap"
       role="region"
       tabIndex={0}
-      aria-label={tx(language, "Матрица Source × Scenario", "Source by Scenario matrix")}
+      aria-label={tx(language, "Матрица Instance × Scenario", "Instance by Scenario matrix")}
     >
       <table className="check-matrix">
         <thead>
           <tr>
-            <th>Source ↓ / Scenario →</th>
+            <th>Instance ↓ / Scenario →</th>
             {matrix.scenarios.map((scenario, index) => (
               <th key={scenario ?? `scenario-${index}`}>
                 {scenario ?? tx(language, "Основной", "Primary")}
@@ -1626,13 +1680,28 @@ export function CheckDetailPage({
         </div>
       )}
 
-      <div className="check-detail-summary">
+      <div
+        className={`check-detail-summary ${
+          check.instances.length > 0 && check.instancesTotal > 1
+            ? "check-detail-summary--instances"
+            : ""
+        }`}
+      >
         <div>
           <span>{tx(language, "Успешные Sources", "Successful Sources")}</span>
           <b>
             {check.sourcesUp}/{check.sourcesTotal}
           </b>
         </div>
+        {check.instances.length > 0 && check.instancesTotal > 1 && (
+          <div>
+            <span>{tx(language, "Успешные Instances", "Successful Instances")}</span>
+            <b>
+              {check.instancesUp}/{check.instancesTotal}
+            </b>
+            <InstanceCoverageList check={check} language={language} />
+          </div>
+        )}
         <div>
           <span>{tx(language, "Последний запуск", "Latest run")}</span>
           <b>{formatTimestamp(language, check.lastCheckedAt)}</b>

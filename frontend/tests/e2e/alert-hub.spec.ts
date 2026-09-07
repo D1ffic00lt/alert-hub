@@ -25,6 +25,56 @@ async function fulfill(route: Route, body: unknown, status = 200) {
   });
 }
 
+async function installClientFailoverRuntime(page: Page, primary: string, reserve: string) {
+  await page.route("**/runtime-config.js", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: `Object.defineProperty(globalThis,"__ALERT_HUB_CONFIG__",{value:Object.freeze({"appName":"E2E Operations","apiHaMode":"client-failover","nodePublicApiUrl":"${primary}","publicApiCandidates":Object.freeze(["${primary}","${reserve}"])}),writable:false,configurable:false});`,
+    }),
+  );
+  await page.addInitScript(
+    ({ primaryOrigin, reserveOrigin }) => {
+      const browserFetch = window.fetch.bind(window);
+      Object.defineProperty(window, "__e2eApiRequests", {
+        configurable: true,
+        value: [] as Array<{ endpoint: string; method: string; path: string }>,
+      });
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const raw = input instanceof Request ? input.url : String(input);
+        const url = new URL(raw, window.location.origin);
+        if (url.origin !== primaryOrigin && url.origin !== reserveOrigin) {
+          return browserFetch(input, init);
+        }
+        const endpoint = url.origin === reserveOrigin ? "reserve" : "primary";
+        const method = (
+          init?.method ?? (input instanceof Request ? input.method : "GET")
+        ).toUpperCase();
+        (
+          window as typeof window & {
+            __e2eApiRequests: Array<{ endpoint: string; method: string; path: string }>;
+          }
+        ).__e2eApiRequests.push({ endpoint, method, path: `${url.pathname}${url.search}` });
+        if (url.pathname === "/health/ready") {
+          return new Response('{"status":"ready"}', {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        const headers = new Headers(
+          init?.headers ?? (input instanceof Request ? input.headers : {}),
+        );
+        headers.set("X-E2E-API-Endpoint", endpoint);
+        return browserFetch(`${window.location.origin}${url.pathname}${url.search}`, {
+          ...init,
+          headers,
+        });
+      };
+    },
+    { primaryOrigin: primary, reserveOrigin: reserve },
+  );
+}
+
 function deferredGate() {
   let release: () => void = () => undefined;
   const promise = new Promise<void>((resolve) => {
@@ -62,7 +112,9 @@ type MockState = {
   primaryUnavailable: boolean;
   refreshGate: Promise<void> | null;
   refreshRequests: number;
+  refreshResponseStatuses?: number[];
   refreshStarted: (() => void) | null;
+  transientUnauthorizedReads?: number;
   datasourcePatchRequest?: Record<string, unknown> | null;
   datasourceRequest?: Record<string, unknown> | null;
   sourceRequest: Record<string, unknown> | null;
@@ -117,6 +169,21 @@ async function installApi(page: Page, state: MockState) {
 
     if (method === "POST" && path === "/auth/refresh") {
       state.refreshRequests += 1;
+      const scriptedStatus = state.refreshResponseStatuses?.shift();
+      if (scriptedStatus !== undefined) {
+        await fulfill(
+          route,
+          scriptedStatus === 200
+            ? {
+                access_token: token("recovered-session"),
+                expires_in: 900,
+                user: { username: "second-admin" },
+              }
+            : { detail: "Transient session lookup failure" },
+          scriptedStatus,
+        );
+        return;
+      }
       if (state.refreshGate) {
         state.refreshStarted?.();
         await state.refreshGate;
@@ -259,11 +326,20 @@ async function installApi(page: Page, state: MockState) {
       return;
     }
 
+    if ((state.transientUnauthorizedReads ?? 0) > 0 && method === "GET") {
+      state.transientUnauthorizedReads = (state.transientUnauthorizedReads ?? 0) - 1;
+      await fulfill(route, { detail: "transient unauthorized" }, 401);
+      return;
+    }
     if (state.authoritativeUnauthorized && method === "GET") {
       await fulfill(route, { detail: "session revoked" }, 401);
       return;
     }
-    if (state.primaryUnavailable && method === "GET") {
+    if (
+      state.primaryUnavailable &&
+      method === "GET" &&
+      request.headers()["x-e2e-api-endpoint"] !== "reserve"
+    ) {
       await fulfill(route, { detail: "temporarily unavailable" }, 503);
       return;
     }
@@ -652,6 +728,183 @@ async function installApi(page: Page, state: MockState) {
       await fulfill(route, { items: items.slice(offset, offset + limit), total: items.length });
       return;
     }
+    if (method === "GET" && path === "/alert-rules") {
+      await fulfill(route, {
+        data_state: "partial",
+        generated_at: "2026-09-07T00:00:00Z",
+        last_successful_refresh: "2026-09-07T00:00:00Z",
+        totals: {
+          rules: 3,
+          firing_rules: 1,
+          pending_rules: 1,
+          error_rules: 1,
+          datasources: 3,
+          related_incidents: 2,
+        },
+        filtered_rules: 3,
+        categories: ["infrastructure", "tls"],
+        has_uncategorized: true,
+        rules: [
+          {
+            id: "rule-api-down",
+            name: "ApiDown",
+            category: "infrastructure",
+            state: "firing",
+            firing_instances: 2,
+            pending_instances: 1,
+            has_error: false,
+            datasource_count: 2,
+            related_incidents: 2,
+            replicas: [
+              {
+                id: "rule-api-down-primary",
+                datasource_id: "prom-1",
+                datasource_name: "Primary Prometheus",
+                group: "platform",
+                file: "platform.yml",
+                name: "ApiDown",
+                state: "firing",
+                health: "ok",
+                firing_instances: 2,
+                pending_instances: 0,
+                last_evaluation: "2026-09-07T00:00:00Z",
+                evaluation_time_seconds: 0.012,
+                last_error: null,
+                labels: { alert_category: "infrastructure", severity: "critical" },
+                annotations: { summary: "API down" },
+                related_incidents: 2,
+                incidents_href: "/incidents?alertname=ApiDown&datasource_id=prom-1",
+              },
+              {
+                id: "rule-api-down-secondary",
+                datasource_id: "prom-2",
+                datasource_name: "Secondary Prometheus",
+                group: "platform",
+                file: "platform.yml",
+                name: "ApiDown",
+                state: "pending",
+                health: "ok",
+                firing_instances: 0,
+                pending_instances: 1,
+                last_evaluation: "2026-09-07T00:00:00Z",
+                evaluation_time_seconds: 0.01,
+                last_error: null,
+                labels: { alert_category: "infrastructure", severity: "critical" },
+                annotations: { summary: "API down" },
+                related_incidents: 0,
+                incidents_href: "/incidents?alertname=ApiDown&datasource_id=prom-2",
+              },
+            ],
+          },
+          {
+            id: "rule-forecast",
+            name: "DiskForecast",
+            category: null,
+            state: "error",
+            firing_instances: 0,
+            pending_instances: 0,
+            has_error: true,
+            datasource_count: 1,
+            related_incidents: 0,
+            replicas: [
+              {
+                id: "rule-forecast-primary",
+                datasource_id: "prom-1",
+                datasource_name: "Primary Prometheus",
+                group: "storage",
+                file: "storage.yml",
+                name: "DiskForecast",
+                state: "inactive",
+                health: "error",
+                firing_instances: 0,
+                pending_instances: 0,
+                last_evaluation: "2026-09-07T00:00:00Z",
+                evaluation_time_seconds: 0.008,
+                last_error: "query evaluation failed",
+                labels: { severity: "warning" },
+                annotations: {},
+                related_incidents: 0,
+                incidents_href: null,
+              },
+            ],
+          },
+          {
+            id: "rule-tls",
+            name: "TlsCertificateExpiringSoon",
+            category: "tls",
+            state: "inactive",
+            firing_instances: 0,
+            pending_instances: 0,
+            has_error: false,
+            datasource_count: 1,
+            related_incidents: 0,
+            replicas: [
+              {
+                id: "rule-tls-primary",
+                datasource_id: "prom-1",
+                datasource_name: "Primary Prometheus",
+                group: "tls",
+                file: "tls.yml",
+                name: "TlsCertificateExpiringSoon",
+                state: "inactive",
+                health: "ok",
+                firing_instances: 0,
+                pending_instances: 0,
+                last_evaluation: "2026-09-07T00:00:00Z",
+                evaluation_time_seconds: 0.004,
+                last_error: null,
+                labels: { alert_category: "tls", severity: "warning" },
+                annotations: {},
+                related_incidents: 0,
+                incidents_href: null,
+              },
+            ],
+          },
+        ],
+        pagination: { page: 1, page_size: 25, total_items: 3, total_pages: 1 },
+        errors: [
+          {
+            datasource_id: "prom-3",
+            datasource_name: "Unavailable Prometheus",
+            code: "timeout",
+            detail: "Prometheus request timed out",
+          },
+        ],
+      });
+      return;
+    }
+    if (method === "GET" && path === "/availability") {
+      const window = url.searchParams.get("window") ?? "24h";
+      await fulfill(route, {
+        data_state: "partial",
+        generated_at: "2026-09-07T00:00:00Z",
+        window,
+        targets: [
+          {
+            datasource_id: "prom-1",
+            datasource_name: "Primary Prometheus",
+            source: "ru",
+            target: "api-core",
+            observed_availability_percent: window === "24h" ? 99.98 : 99.9,
+            samples_count: 100,
+            last_sample_at: "2026-09-07T00:00:00Z",
+            data_state: window === "7d" ? "stale" : "ok",
+          },
+          {
+            datasource_id: "prom-1",
+            datasource_name: "Primary Prometheus",
+            source: "de",
+            target: "portal",
+            observed_availability_percent: null,
+            samples_count: null,
+            last_sample_at: null,
+            data_state: "unknown",
+          },
+        ],
+        errors: [],
+      });
+      return;
+    }
     if (method === "GET" && path === "/metrics/reachability") {
       await fulfill(route, {
         status: "not_configured",
@@ -938,7 +1191,9 @@ async function signIn(page: Page) {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Запуск кластера" })).toBeVisible();
   await page.getByRole("button", { name: "Войти" }).first().click();
-  await page.getByLabel("Имя пользователя").fill("second-admin");
+  const username = page.getByLabel("Имя пользователя");
+  await expect(username).toHaveValue("");
+  await username.fill("second-admin");
   await page.getByLabel("Пароль", { exact: true }).fill("second-password");
   await page.getByRole("button", { name: "Войти" }).last().click();
   await expect(page.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
@@ -979,6 +1234,21 @@ function checksFixtures() {
       target: "Checkout",
       status: "degraded",
       status_reason: "mixed_results",
+      sources_total: 1,
+      sources_up: 0,
+      instances_total: 3,
+      instances_up: 1,
+      instances_stale: 1,
+      instances: [
+        { instance_id: "eu-west", source: "remnawave-service", status: "up" },
+        { instance_id: "us-east", source: "remnawave-service", status: "down" },
+        {
+          instance_id: "de-central",
+          source: "remnawave-service",
+          status: "stale",
+          stale: true,
+        },
+      ],
       active_alerts: 1,
       diagnostic_codes: ["conflicting_ttfb"],
     },
@@ -1060,7 +1330,8 @@ function checksFixtures() {
         ...items[1],
         results: [
           {
-            source: "eu-west",
+            source: "remnawave-service",
+            instance_id: "eu-west",
             scenario: "purchase",
             variant: "member",
             target: "Checkout",
@@ -1080,7 +1351,8 @@ function checksFixtures() {
             error_reasons: [],
           },
           {
-            source: "us-east",
+            source: "remnawave-service",
+            instance_id: "us-east",
             scenario: "purchase",
             variant: "guest",
             target: "Checkout",
@@ -1130,7 +1402,8 @@ function checksFixtures() {
             ],
           },
           {
-            source: "eu-west",
+            source: "remnawave-service",
+            instance_id: "eu-west",
             scenario: "refund",
             variant: null,
             target: "Checkout",
@@ -1144,6 +1417,27 @@ function checksFixtures() {
             stale: false,
             data_incomplete: false,
             diagnostic_codes: [],
+            canaries: [],
+            targets: [],
+            assertions: [],
+            error_reasons: [],
+          },
+          {
+            source: "remnawave-service",
+            instance_id: "de-central",
+            scenario: "purchase",
+            variant: "member",
+            target: "Checkout",
+            status: "stale",
+            status_reason: "expired_measurements",
+            state: "stale",
+            success: null,
+            last_run_at: "2026-09-05T11:30:00Z",
+            duration_seconds: null,
+            ttfb_seconds: null,
+            stale: true,
+            data_incomplete: true,
+            diagnostic_codes: ["missing_current_result"],
             canaries: [],
             targets: [],
             assertions: [],
@@ -1401,10 +1695,11 @@ test("incidents load once without waiting for metrics and report partial bulk re
   await expect(page.locator('a[href="/metrics"], a[href$="/metrics"]')).toHaveCount(0);
 });
 
-test("peer incident snapshots allow explicit IDs but never filter-wide bulk mutations", async ({
+test("client failover starts on a reserve API and keeps mutations on the selected endpoint", async ({
   page,
 }) => {
-  const peerBase = "https://trusted-peer.example.test";
+  const primaryBase = "https://api-de.alerts.example.test";
+  const reserveBase = "https://api-ru.alerts.example.test";
   const incidents = Array.from({ length: 52 }, (_, index) => ({
     id: `incident-peer-${index}`,
     title: `Peer incident ${index}`,
@@ -1421,19 +1716,6 @@ test("peer incident snapshots allow explicit IDs but never filter-wide bulk muta
   }));
   const state: MockState = {
     authoritativeUnauthorized: false,
-    clusterStatus: {
-      cluster_event_count: 1,
-      cursor: { peer: 1 },
-      nodes: [
-        {
-          id: "peer",
-          name: "Trusted peer",
-          region: "EU",
-          health: "healthy",
-          public_api_url: peerBase,
-        },
-      ],
-    },
     incidentBulkRequests: [],
     incidentListRequests: [],
     incidents,
@@ -1445,92 +1727,59 @@ test("peer incident snapshots allow explicit IDs but never filter-wide bulk muta
     refreshStarted: null,
     sourceRequest: null,
   };
+  await installClientFailoverRuntime(page, primaryBase, reserveBase);
   await installApi(page, state);
-  await page.route(
-    /^https:\/\/trusted-peer\.example\.test\/api\/v1\/incidents(?:\?.*)?$/,
-    async (route) => {
-      const request = route.request();
-      const origin = request.headers().origin ?? "*";
-      const corsHeaders = {
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Alert-Hub-Cache-Partition",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Origin": origin,
-      };
-      if (request.method() === "OPTIONS") {
-        await route.fulfill({ status: 204, headers: corsHeaders });
-        return;
-      }
-      const url = new URL(request.url());
-      const limit = Number(url.searchParams.get("limit") ?? 50);
-      const offset = Number(url.searchParams.get("offset") ?? 0);
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        headers: corsHeaders,
-        body: JSON.stringify({
-          items: incidents.slice(offset, offset + limit),
-          total: incidents.length,
-          limit,
-          offset,
-          counts: {
-            active: incidents.length,
-            open: incidents.filter((incident) => incident.status === "open").length,
-            acknowledged: incidents.filter((incident) => incident.status === "acknowledged").length,
-            resolved: 0,
-            silenced: 0,
-            all: incidents.length,
-          },
-          bulk_limit: 500,
-        }),
-      });
-    },
-  );
   await signIn(page);
-  await expect
-    .poll(() =>
-      page.evaluate((peer) => {
-        const saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
-        return Array.isArray(saved) && saved.includes(peer);
-      }, peerBase),
-    )
-    .toBe(true);
 
   state.primaryUnavailable = true;
   await page.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
   await expect(page.getByText("Peer incident 0", { exact: true })).toBeVisible();
   await page.getByLabel("Выбрать текущую страницу").check();
-  await expect(
-    page.getByText(/Выбор всех результатов доступен после свежего ответа/),
-  ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Выбрать все 52 результатов" })).toHaveCount(0);
-
+  await expect(page.getByRole("button", { name: "Выбрать все 52 результатов" })).toBeVisible();
+  await page.getByRole("button", { name: "Выбрать все 52 результатов" }).click();
+  await page.getByRole("combobox", { name: "Действие", exact: true }).selectOption("acknowledge");
   await page.getByRole("button", { name: "Применить", exact: true }).click();
   await expect.poll(() => state.incidentBulkRequests?.length ?? 0).toBe(1);
   expect(state.incidentBulkRequests?.[0]).toMatchObject({
     action: "acknowledge",
-    selection_mode: "ids",
+    selection_mode: "filter",
   });
-  expect(state.incidentBulkRequests?.[0]?.incident_ids).toHaveLength(50);
-  expect(state.incidentBulkRequests?.some((request) => request.selection_mode === "filter")).toBe(
-    false,
-  );
 
-  await expect(page.getByText(/Изменено: 50/)).toBeVisible();
-  await expect(page.locator(".incidents-page")).toHaveAttribute("aria-busy", "false");
-  await expect(page.getByText("Peer incident 0", { exact: true })).toBeVisible();
-  await page.getByLabel("Выбрать текущую страницу").check();
-  await expect(
-    page.getByText(/Выбор всех результатов доступен после свежего ответа/),
-  ).toBeVisible();
-  state.primaryUnavailable = false;
-  await page.getByRole("button", { name: "Обновить список" }).click();
-  await expect(page.getByRole("button", { name: "Выбрать все 52 результатов" })).toBeVisible();
-  await page.getByRole("button", { name: "Выбрать все 52 результатов" }).click();
-  await expect(page.getByText(/Выбраны все результаты фильтра/)).toBeVisible();
-  expect(state.incidentBulkRequests?.some((request) => request.selection_mode === "filter")).toBe(
-    false,
+  const requests = await page.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __e2eApiRequests: Array<{ endpoint: string; method: string; path: string }>;
+        }
+      ).__e2eApiRequests,
   );
+  expect(
+    requests.some(
+      ({ endpoint, method, path }) =>
+        endpoint === "primary" && method === "GET" && path.startsWith("/api/v1/incidents"),
+    ),
+  ).toBe(true);
+  expect(
+    requests.some(
+      ({ endpoint, method, path }) =>
+        endpoint === "reserve" && method === "GET" && path.startsWith("/api/v1/incidents"),
+    ),
+  ).toBe(true);
+  expect(
+    requests.filter(
+      ({ method, path }) => method === "POST" && path === "/api/v1/incidents/bulk-action",
+    ),
+  ).toEqual([
+    {
+      endpoint: "reserve",
+      method: "POST",
+      path: "/api/v1/incidents/bulk-action",
+    },
+  ]);
+
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Настройки" }).click();
+  await expect(page.getByText(`Активный API: ${reserveBase}`)).toBeVisible();
+  await expect(page.getByText(/Режим client-failover/)).toBeVisible();
 });
 
 test("incident filters and SSE refresh keep bulk actions aligned with the visible snapshot", async ({
@@ -1584,6 +1833,7 @@ test("incident filters and SSE refresh keep bulk actions aligned with the visibl
   await signIn(page);
   await page.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
   await expect(page.getByText("Filter one", { exact: true })).toBeVisible();
+  await expect(page.locator(".incidents-page")).toHaveAttribute("aria-busy", "false");
 
   const search = page.getByPlaceholder("Название, описание, источник или метка…");
   const requestsBeforeEquivalentSearch = state.incidentListRequests?.length ?? 0;
@@ -1819,6 +2069,16 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
   state.checksGate = null;
   await expect(page.getByRole("heading", { name: "customer-paths" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Без группы" })).toBeVisible();
+  const complexCoverage = page.getByRole("link", {
+    name: "Открыть Check Complex customer path",
+  });
+  await expect(
+    complexCoverage.locator(".check-coverage-counts > span").filter({ hasText: "Sources" }),
+  ).toContainText("0/1");
+  await expect(
+    complexCoverage.locator(".check-coverage-counts > span").filter({ hasText: "Instances" }),
+  ).toContainText("1/3");
+  await expect(complexCoverage.locator(".check-instance-coverage")).toContainText("de-central");
 
   await page.setViewportSize({ width: 390, height: 844 });
   const longIdRow = page.getByRole("link", { name: "Открыть Check Simple check" });
@@ -1876,7 +2136,10 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
   await page.getByRole("link", { name: "Открыть Check Complex customer path" }).click();
 
   await expect(page.getByRole("heading", { name: "Complex customer path" })).toBeVisible();
-  await expect(page.getByRole("region", { name: "Матрица Source × Scenario" })).toBeVisible();
+  await expect(page.getByText("Успешные Instances")).toBeVisible();
+  await expect(page.locator(".check-detail-summary")).toContainText("1/3");
+  await expect(page.locator(".check-detail-summary")).toContainText("de-central");
+  await expect(page.getByRole("region", { name: "Матрица Instance × Scenario" })).toBeVisible();
   const variantSummary = page.locator("summary").filter({ hasText: "Variant · guest" });
   await variantSummary.focus();
   await expect(variantSummary).toBeFocused();
@@ -1949,9 +2212,7 @@ test("Checks disabled route is explicit and a refresh failure clears the previou
   };
   await installApi(page, state);
   await signIn(page);
-  await expect(page.locator(".sidebar__nav").getByRole("button", { name: "Checks" })).toHaveCount(
-    0,
-  );
+  await expect(page.locator(".sidebar__nav").getByRole("button", { name: "Checks" })).toBeVisible();
   await page.evaluate(() => {
     history.pushState({}, "", "/checks");
     dispatchEvent(new PopStateEvent("popstate"));
@@ -1977,6 +2238,96 @@ test("Checks disabled route is explicit and a refresh failure clears the previou
   await expect(page.locator(".check-detail-hero")).toHaveCount(0);
   await expect(page.getByText(/Прежний успешный результат скрыт/)).toBeVisible();
   await expect(page.getByText("check_ttfb_unavailable")).toBeVisible();
+});
+
+test("Alerts groups HA rules by dynamic category, preserves datasource state, and stays responsive", async ({
+  page,
+}) => {
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    incidents: [],
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Алерты" }).click();
+  await expect(page).toHaveURL(/\/alerts$/);
+  await expect(page.getByRole("heading", { name: "Алерты", exact: true })).toBeVisible();
+  const cards = page.locator(".alerts-kpi");
+  await expect(cards).toHaveCount(5);
+  await expect(cards.nth(0)).toContainText("3");
+  await expect(cards.nth(1)).toContainText("1");
+  await expect(cards.nth(2)).toContainText("1");
+  await expect(cards.nth(3)).toContainText("1");
+  await expect(cards.nth(4)).toContainText("3");
+  await expect(page.getByText("Данные получены частично", { exact: true })).toBeVisible();
+  await expect(page.getByText("ApiDown", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("DiskForecast", { exact: true })).toBeVisible();
+  await expect(
+    page.locator(".alert-category > summary b").filter({ hasText: /^infrastructure$/ }),
+  ).toBeVisible();
+  await expect(
+    page.locator(".alert-category > summary b").filter({ hasText: /^Без категории$/ }),
+  ).toBeVisible();
+  await expect(page.getByRole("option", { name: "tls" })).toHaveCount(1);
+  await expect(page.getByRole("option", { name: "Без категории" })).toHaveCount(1);
+  await expect(page.getByText("Наблюдаемая доступность", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Primary Prometheus", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Secondary Prometheus", { exact: true })).toBeVisible();
+  await expect(page.getByText("Unavailable Prometheus", { exact: true })).toBeVisible();
+  await expect(
+    page.locator(".alert-category").filter({ hasText: "infrastructure" }),
+  ).toHaveAttribute("open", "");
+  await expect(page.locator(".alert-category").filter({ hasText: "tls" })).not.toHaveAttribute(
+    "open",
+    "",
+  );
+
+  const search = page.getByPlaceholder("Поиск по имени правила");
+  await search.focus();
+  await expect(search).toBeFocused();
+  const apiRule = page.locator(".alert-rule").filter({ hasText: "ApiDown" });
+  const primaryReplica = apiRule
+    .locator(".alert-replica")
+    .filter({ hasText: "Primary Prometheus" });
+  await primaryReplica.locator(".alert-labels > summary").click();
+  await expect(primaryReplica.getByText("alert_category", { exact: true })).toBeVisible();
+  await primaryReplica.getByRole("button", { name: "Открыть инциденты · 2" }).click();
+  await expect(page).toHaveURL(/\/incidents\?alertname=ApiDown&datasource_id=prom-1$/);
+  await expect(page.getByText("Точный фильтр правила", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("alertname=ApiDown · datasource=prom-1", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("textbox", { name: /Поиск инцидентов/ })).toHaveValue("");
+
+  await page.getByRole("button", { name: "Алерты", exact: true }).click();
+  for (const viewport of [
+    { width: 1280, height: 900 },
+    { width: 820, height: 1050 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await expect(page.locator(".alert-category").first()).toBeVisible();
+    for (const theme of ["light", "dark"] as const) {
+      await page.evaluate(
+        (value) => document.documentElement.setAttribute("data-theme", value),
+        theme,
+      );
+      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      const overflow = await page.evaluate(() => ({
+        clientWidth: document.documentElement.clientWidth,
+        scrollWidth: document.documentElement.scrollWidth,
+      }));
+      expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
+    }
+  }
 });
 
 test("Web Push surfaces node errors, rotates stale keys, and binds the login device", async ({
@@ -2191,6 +2542,36 @@ test("Web Push cancels a delayed subscription when silent refresh replaces the s
     .toBe(1);
   await expect(dialog.getByRole("alert")).toContainText("изменилась активная сессия");
   expect(state.pushSubscriptionRequest).toBeNull();
+});
+
+test("a backgrounded session revalidates and recovers from a transient 401", async ({ page }) => {
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+
+  const refreshesBeforeRecovery = state.refreshRequests;
+  state.transientUnauthorizedReads = 1;
+  state.refreshResponseStatuses = [401, 200];
+  await page.getByRole("button", { name: "Обновить данные кластера" }).click();
+
+  await expect.poll(() => state.refreshRequests).toBe(refreshesBeforeRecovery + 2);
+  await expect(page.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Вход в систему" })).toHaveCount(0);
+
+  const refreshesBeforeActivation = state.refreshRequests;
+  state.refreshResponseStatuses = [200];
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect.poll(() => state.refreshRequests).toBe(refreshesBeforeActivation + 1);
+  await expect(page.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
 });
 
 test("bootstrap, deep-link navigation, live source creation, failover trust, and logout isolation", async ({
@@ -2624,28 +3005,116 @@ test("configures per-node API-down alerts and enables every selected node", asyn
   await page.locator(".sidebar__nav").getByRole("button", { name: "Кластер" }).click();
 
   await expect(page.getByRole("heading", { name: "Алерты о падении API" })).toBeVisible();
-  await expect(page.getByText("Включено: 0/3")).toBeVisible();
+  const alertPanel = page.locator(".cluster-api-alerts");
+  await expect(alertPanel.locator(".cluster-api-alerts__count")).toContainText("Включено: 0/3");
+  const [panelHeaderBox, panelBodyBox, introBox, actionsBox] = await Promise.all([
+    alertPanel.locator(".panel__header").boundingBox(),
+    alertPanel.locator(".cluster-api-alerts__body").boundingBox(),
+    alertPanel.locator(".cluster-api-alerts__intro").boundingBox(),
+    alertPanel.locator(".cluster-api-alerts__actions").boundingBox(),
+  ]);
+  expect(panelHeaderBox).not.toBeNull();
+  expect(panelBodyBox).not.toBeNull();
+  expect(introBox).not.toBeNull();
+  expect(actionsBox).not.toBeNull();
+  expect(panelBodyBox!.y).toBeGreaterThanOrEqual(panelHeaderBox!.y + panelHeaderBox!.height - 1);
+  expect(actionsBox!.y).toBeGreaterThanOrEqual(introBox!.y + introBox!.height - 1);
+
+  const deSwitch = page.getByRole("switch", { name: "Алерт о падении API для DE" });
+  const deControl = deSwitch.locator("xpath=..");
+  await expect(deControl).toContainText("выключен");
+  const offSwitchColor = await deSwitch.evaluate(
+    (element) => window.getComputedStyle(element).backgroundColor,
+  );
+  const offThumbTransform = await deSwitch
+    .locator(".toggle__thumb")
+    .evaluate((element) => window.getComputedStyle(element).transform);
+  const offThumbColor = await deSwitch
+    .locator(".toggle__thumb")
+    .evaluate((element) => window.getComputedStyle(element).backgroundColor);
+  const switchBox = await deSwitch.boundingBox();
+  expect(switchBox?.width).toBe(42);
+  expect(switchBox?.height).toBe(24);
+  expect(offThumbColor).toBe("rgb(139, 139, 149)");
   await page.getByRole("button", { name: "Выбрать все" }).click();
   await expect(page.getByText("Выбрано: 3")).toBeVisible();
   await page.getByRole("button", { name: "Включить выбранным" }).click();
 
-  await expect(page.getByText("Включено: 3/3")).toBeVisible();
+  await expect(alertPanel.locator(".cluster-api-alerts__count")).toContainText("Включено: 3/3");
   await expect(page.getByRole("switch")).toHaveCount(3);
   for (const control of await page.getByRole("switch").all()) {
     await expect(control).toHaveAttribute("aria-checked", "true");
   }
+  await expect(deControl).toContainText("включён");
+  const onSwitchColor = await deSwitch.evaluate(
+    (element) => window.getComputedStyle(element).backgroundColor,
+  );
+  const onThumbTransform = await deSwitch
+    .locator(".toggle__thumb")
+    .evaluate((element) => window.getComputedStyle(element).transform);
+  expect(onSwitchColor).toBe(offSwitchColor);
+  await expect(deSwitch.locator(".toggle__thumb")).toHaveCSS(
+    "background-color",
+    "rgb(34, 197, 94)",
+  );
+  expect(onThumbTransform).not.toBe(offThumbTransform);
   expect(state.clusterApiAlertRequests?.[0]).toEqual({
     node_ids: ["ru", "nl", "de"],
     enabled: true,
   });
 
-  await page.getByRole("switch", { name: "Алерт о падении API для DE" }).click();
-  await expect(page.getByText("Включено: 2/3")).toBeVisible();
-  await expect(page.getByRole("switch", { name: "Алерт о падении API для DE" })).toHaveAttribute(
-    "aria-checked",
-    "false",
-  );
+  await deSwitch.click();
+  await expect(alertPanel.locator(".cluster-api-alerts__count")).toContainText("Включено: 2/3");
+  await expect(deSwitch).toHaveAttribute("aria-checked", "false");
+  await expect(deControl).toContainText("выключен");
   expect(state.clusterApiAlertRequests?.[1]).toEqual({ node_ids: ["de"], enabled: false });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(alertPanel).toBeVisible();
+  const [mobileIntroBox, mobileActionsBox] = await Promise.all([
+    alertPanel.locator(".cluster-api-alerts__intro").boundingBox(),
+    alertPanel.locator(".cluster-api-alerts__actions").boundingBox(),
+  ]);
+  expect(mobileIntroBox).not.toBeNull();
+  expect(mobileActionsBox).not.toBeNull();
+  expect(mobileActionsBox!.y).toBeGreaterThanOrEqual(
+    mobileIntroBox!.y + mobileIntroBox!.height - 1,
+  );
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+
+  for (const visualCase of [
+    { theme: "dark", width: 1440, height: 900 },
+    { theme: "light", width: 1440, height: 900 },
+    { theme: "dark", width: 820, height: 1000 },
+    { theme: "light", width: 820, height: 1000 },
+    { theme: "dark", width: 390, height: 844 },
+    { theme: "light", width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize({ width: visualCase.width, height: visualCase.height });
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.theme = theme;
+    }, visualCase.theme);
+    const layout = await alertPanel.evaluate((panel) => {
+      const bounds = panel.getBoundingClientRect();
+      const intro = panel.querySelector<HTMLElement>(".cluster-api-alerts__intro > p");
+      const header = panel.querySelector<HTMLElement>(".panel__header");
+      return {
+        headerBackgroundImage: header ? window.getComputedStyle(header).backgroundImage : "",
+        introFontSize: intro ? Number.parseFloat(window.getComputedStyle(intro).fontSize) : 0,
+        noHorizontalOverflow: document.documentElement.scrollWidth <= window.innerWidth,
+        panelLeft: bounds.left,
+        panelRight: bounds.right,
+        viewportWidth: window.innerWidth,
+      };
+    });
+    expect(layout.noHorizontalOverflow).toBe(true);
+    expect(layout.panelLeft).toBeGreaterThanOrEqual(0);
+    expect(layout.panelRight).toBeLessThanOrEqual(layout.viewportWidth + 1);
+    expect(layout.headerBackgroundImage).toBe("none");
+    expect(layout.introFontSize).toBeGreaterThanOrEqual(14);
+  }
 });
 
 test("rebases pure audit prepends and safely resets for an interior insertion", async ({
@@ -3007,7 +3476,8 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
     "background-color",
     "rgb(248, 250, 252)",
   );
-  await page.locator(".mobile-nav").getByRole("button", { name: "Кластер" }).click();
+  await page.locator(".mobile-nav").getByRole("button", { name: "Ещё" }).click();
+  await page.getByRole("button", { name: "Кластер", exact: true }).click();
   await expect(page.locator(".cluster-summary-bar")).toHaveCSS(
     "background-color",
     "rgb(248, 250, 252)",

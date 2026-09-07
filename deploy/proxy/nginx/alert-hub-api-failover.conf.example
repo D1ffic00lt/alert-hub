@@ -1,0 +1,41 @@
+# Same-origin API failover fragment for API_HA_MODE=proxy-failover. Import the
+# locations into the existing public UI server block. Upstreams are exact
+# private/WireGuard API addresses; no peer listener or /internal operation is
+# included. The non-idempotent retry option is deliberately absent, so Nginx
+# retries only methods it considers idempotent.
+
+upstream alert_hub_public_api_pool {
+    zone alert_hub_public_api_pool 64k;
+    # Put the local node first. Keep the list bounded and server-owned.
+    server __API_RU_UPSTREAM__ max_fails=2 fail_timeout=10s;
+    server __API_NL_UPSTREAM__ max_fails=2 fail_timeout=10s backup;
+    server __API_DE_UPSTREAM__ max_fails=2 fail_timeout=10s backup;
+    keepalive 32;
+}
+
+location = /api/v1/stream {
+    proxy_pass http://alert_hub_public_api_pool;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 1h;
+}
+
+location ^~ /api/v1/ {
+    proxy_pass http://alert_hub_public_api_pool;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Request-ID $request_id;
+    proxy_connect_timeout 2s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_next_upstream error timeout http_502 http_503 http_504;
+    proxy_next_upstream_tries 3;
+}
+
+location ^~ /internal/ {
+    return 404;
+}

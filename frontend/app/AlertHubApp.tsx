@@ -12,6 +12,9 @@ import {
 } from "react";
 import { useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
 
+import { AlertsPage } from "./alerts/AlertsPage";
+import { createAsyncRequestLimiter } from "./api/concurrency";
+import { apiEndpointManager, type ApiEndpointSnapshot } from "./api/endpoints";
 import { CheckDetailPage, ChecksPage, ChecksWidget } from "./checks/ChecksViews";
 import {
   type ChecksOverviewState,
@@ -24,6 +27,7 @@ import {
   incidentListPath,
   mergeIncidentSummariesWithHistory,
   normalizeIncidentSearch,
+  sseReconnectDelay,
 } from "./incidents";
 import {
   applicationServerKeyMatches,
@@ -48,7 +52,6 @@ import {
   type ThemePreference,
 } from "./theme";
 
-const API_BASE = "/api/v1";
 const AppNameContext = createContext("Alert Hub");
 type UiLanguage = "ru" | "en";
 const LANGUAGE_STORAGE_KEY = "alert-hub-ui-language";
@@ -86,14 +89,24 @@ let refreshBlocked = false;
 let bootstrapSuggested = false;
 let demoModeActive = false;
 let offlineReadOnlyActive = false;
-const verifiedPeerBases = new Set<string>();
-const apiResponseSource = new WeakMap<Response, "origin" | "peer">();
+const authoritativeApiResponses = new WeakSet<Response>();
 const SESSION_EXPIRED_EVENT = "alert-hub:session-expired";
 const SESSION_RESTORED_EVENT = "alert-hub:session-restored";
 const SESSION_HINT_KEY = "alert-hub-session-partition-v1";
 const LOGOUT_TOMBSTONE_KEY = "alert-hub-local-logout-v1";
 const AUTH_BROADCAST_CHANNEL = "alert-hub-auth-v1";
 const SESSION_HINT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_REVALIDATE_MIN_INTERVAL_MS = 5000;
+const REFRESH_REJECTION_RETRY_MS = 250;
+
+try {
+  apiEndpointManager.setFailoverEnabled(
+    typeof localStorage === "undefined" ||
+      localStorage.getItem("alert-hub-auto-failover") !== "false",
+  );
+} catch {
+  apiEndpointManager.setFailoverEnabled(true);
+}
 
 class PushSetupCancelledError extends Error {
   constructor() {
@@ -1078,6 +1091,14 @@ const NAV_ITEMS = [
     icon: "incidents",
   },
   {
+    id: "alerts",
+    get label() {
+      return tr("Алерты", "Alerts");
+    },
+    path: "/alerts",
+    icon: "alerts",
+  },
+  {
     id: "reachability",
     get label() {
       return tr("Доступность", "Regional reachability");
@@ -1413,25 +1434,6 @@ function asFiniteNumber(value: unknown): number | null {
   if (value == null || value === "") return null;
   const result = Number(value);
   return Number.isFinite(result) ? result : null;
-}
-
-function normalizePeerBase(value: unknown): string | null {
-  if (typeof value !== "string" || !value) return null;
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
-      return null;
-    }
-    return url.href.replace(/\/$/, "");
-  } catch {
-    return null;
-  }
-}
-
-function rememberVerifiedPeerBase(value: unknown): string | null {
-  const normalized = normalizePeerBase(value);
-  if (normalized) verifiedPeerBases.add(normalized);
-  return normalized;
 }
 
 function listFrom(payload: unknown, key: string): unknown[] {
@@ -1934,7 +1936,6 @@ function forgetAccessToken(clearCachedData = false) {
   memoryAccessExpiresAt = 0;
   offlineReadOnlyActive = false;
   if (clearCachedData) {
-    verifiedPeerBases.clear();
     pruneReadCaches(null);
     if (typeof localStorage !== "undefined") localStorage.removeItem(SESSION_HINT_KEY);
   }
@@ -1994,7 +1995,6 @@ function restoreOfflineSession(): Record<string, unknown> | null {
     memorySessionId = partition;
     offlineReadOnlyActive = true;
     demoModeActive = false;
-    verifiedPeerBases.clear();
     pruneReadCaches(partition);
     return { username: "offline-operator", offline: true };
   } catch {
@@ -2042,36 +2042,50 @@ async function refreshAccessToken(): Promise<boolean> {
   if (refreshInFlight) return refreshInFlight;
   const generation = authGeneration;
   const pending = (async () => {
-    const headers = new Headers({ Accept: "application/json" });
-    const csrf = readCookie("alert_hub_csrf") || readCookie("csrf_token") || readCookie("csrf");
-    if (csrf) headers.set("X-CSRF-Token", csrf);
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 8000);
-    try {
-      const response = await fetch(`${API_BASE}/auth/refresh`, {
-        method: "POST",
-        credentials: "include",
-        headers,
-        signal: controller.signal,
-      });
-      if (refreshBlocked || generation !== authGeneration) return false;
-      if (!response.ok) {
-        if (response.status === 401 || response.status === 403) {
-          forgetAccessToken(true);
-          window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const headers = new Headers({ Accept: "application/json" });
+      const csrf = readCookie("alert_hub_csrf") || readCookie("csrf_token") || readCookie("csrf");
+      if (csrf) headers.set("X-CSRF-Token", csrf);
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 8000);
+      try {
+        const response = await apiEndpointManager.fetchApi(
+          "/auth/refresh",
+          {
+            method: "POST",
+            credentials: "include",
+            headers,
+            signal: controller.signal,
+          },
+          { replayRefresh: true },
+        );
+        if (refreshBlocked || generation !== authGeneration) return false;
+        if (!response.ok) {
+          if ((response.status === 401 || response.status === 403) && attempt === 0) {
+            await new Promise<void>((resolve) => {
+              window.setTimeout(resolve, REFRESH_REJECTION_RETRY_MS);
+            });
+            if (refreshBlocked || generation !== authGeneration) return false;
+            continue;
+          }
+          if (response.status === 401 || response.status === 403) {
+            forgetAccessToken(true);
+            window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+          }
+          return false;
         }
+        const payload = await response.json();
+        if (refreshBlocked || generation !== authGeneration) return false;
+        const restored = Boolean(rememberAccessToken(payload));
+        if (restored) window.dispatchEvent(new Event(SESSION_RESTORED_EVENT));
+        return restored;
+      } catch {
         return false;
+      } finally {
+        window.clearTimeout(timer);
       }
-      const payload = await response.json();
-      if (refreshBlocked || generation !== authGeneration) return false;
-      const restored = Boolean(rememberAccessToken(payload));
-      if (restored) window.dispatchEvent(new Event(SESSION_RESTORED_EVENT));
-      return restored;
-    } catch {
-      return false;
-    } finally {
-      window.clearTimeout(timer);
     }
+    return false;
   })();
   refreshInFlight = pending;
   try {
@@ -2120,69 +2134,24 @@ async function apiFetch(
   if (typeof init.body === "string" && !headers.has("Content-Type"))
     headers.set("Content-Type", "application/json");
   const requestInit = { ...init, credentials: "include" as RequestCredentials, headers };
-  let primary: Response | null = null;
-  let primaryError: unknown = null;
-  try {
-    primary = await fetch(`${API_BASE}${path}`, requestInit);
-    assertExpectedAuthContext();
-    if (primary.status === 401 && !path.startsWith("/auth/")) {
-      const refreshed =
-        Boolean(memoryAccessToken && memoryAccessToken !== attemptedToken) ||
-        (await refreshAccessToken());
-      assertExpectedAuthContext();
-      if (refreshed && memoryAccessToken) {
-        headers.set("Authorization", `Bearer ${memoryAccessToken}`);
-        if (memorySessionId) headers.set("X-Alert-Hub-Cache-Partition", memorySessionId);
-        primary = await fetch(`${API_BASE}${path}`, requestInit);
-        assertExpectedAuthContext();
-      }
-    }
-  } catch (error) {
-    primaryError = error;
-  }
+  let response = await apiEndpointManager.fetchApi(path, requestInit, {
+    replayRefresh: path === "/auth/refresh",
+  });
   assertExpectedAuthContext();
-  const failoverEnabled =
-    typeof localStorage === "undefined" ||
-    localStorage.getItem("alert-hub-auto-failover") !== "false";
-  const canFailOver =
-    method === "GET" && !path.startsWith("/auth/") && failoverEnabled && Boolean(memoryAccessToken);
-  const shouldFailOver =
-    !primary || primary.status >= 500 || primary.headers.get("X-Alert-Hub-Cache") === "hit";
-  if (canFailOver && shouldFailOver && typeof localStorage !== "undefined") {
-    let saved: unknown;
-    try {
-      saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
-    } catch {
-      saved = [];
-    }
-    for (const value of Array.isArray(saved) ? saved.slice(0, 8) : []) {
-      try {
-        assertExpectedAuthContext();
-        const normalized = normalizePeerBase(value);
-        if (!normalized || !verifiedPeerBases.has(normalized)) continue;
-        const base = new URL(normalized);
-        const response = await fetch(
-          `${base.href.replace(/\/$/, "")}${API_BASE}${path}`,
-          requestInit,
-        );
-        assertExpectedAuthContext();
-        if (response.ok) {
-          apiResponseSource.set(response, "peer");
-          return response;
-        }
-      } catch {
-        assertExpectedAuthContext();
-        // Move to the next saved peer without hiding the original response.
-      }
+  if (response.status === 401 && !path.startsWith("/auth/")) {
+    const refreshed =
+      Boolean(memoryAccessToken && memoryAccessToken !== attemptedToken) ||
+      (await refreshAccessToken());
+    assertExpectedAuthContext();
+    if (refreshed && memoryAccessToken) {
+      headers.set("Authorization", `Bearer ${memoryAccessToken}`);
+      if (memorySessionId) headers.set("X-Alert-Hub-Cache-Partition", memorySessionId);
+      response = await apiEndpointManager.fetchApi(path, requestInit);
+      assertExpectedAuthContext();
     }
   }
-  if (primary) {
-    apiResponseSource.set(primary, "origin");
-    return primary;
-  }
-  throw primaryError instanceof Error
-    ? primaryError
-    : new Error(tr("Ни один узел API не ответил", "No API node responded"));
+  authoritativeApiResponses.add(response);
+  return response;
 }
 
 async function apiError(response: Response, fallback: string) {
@@ -2209,22 +2178,25 @@ async function mutationJson(path: string, init: RequestInit) {
   return (await response.json()) as unknown;
 }
 
+const hubReadLimiter = createAsyncRequestLimiter(4);
+
 async function getJson(path: string, signal?: AbortSignal) {
-  const response = await apiFetch(path, { signal });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  const cached = response.headers.get("X-Alert-Hub-Cache") === "hit";
-  return {
-    payload: (await response.json()) as unknown,
-    cached,
-    // Mutations always execute on the authenticated origin. A peer or service-
-    // worker snapshot can safely drive explicit-ID actions, but it must never
-    // define an origin-side filter-wide mutation under eventual consistency.
-    mutationAuthoritative:
-      apiResponseSource.get(response) === "origin" &&
-      !cached &&
-      Boolean(memoryAccessToken) &&
-      !offlineReadOnlyActive,
-  };
+  return hubReadLimiter.run(async () => {
+    const response = await apiFetch(path, { signal });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const cached = response.headers.get("X-Alert-Hub-Cache") === "hit";
+    return {
+      payload: (await response.json()) as unknown,
+      cached,
+      // A live response from the selected API can define a filter-wide mutation
+      // on that same endpoint. A service-worker snapshot cannot do so safely.
+      mutationAuthoritative:
+        authoritativeApiResponses.has(response) &&
+        !cached &&
+        Boolean(memoryAccessToken) &&
+        !offlineReadOnlyActive,
+    };
+  }, signal);
 }
 
 function useOverviewStatistics(demo: boolean): {
@@ -2290,6 +2262,7 @@ function useAuthSession() {
   }, [state]);
   useEffect(() => {
     let active = true;
+    let lastActivationRevalidation = 0;
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 4500);
     const sessionExpired = () => {
@@ -2297,7 +2270,6 @@ function useAuthSession() {
       authGeneration += 1;
       forgetAccessToken(true);
       demoModeActive = false;
-      verifiedPeerBases.clear();
       bootstrapSuggested = false;
       queryClient.clear();
       setState({ status: "required", user: null });
@@ -2318,9 +2290,34 @@ function useAuthSession() {
         offlineReadOnlyActive = true;
       }
     };
-    const sessionRestored = () => void recoverOfflineIdentity();
+    const sessionRestored = () => {
+      if (stateRef.current.status === "offline") {
+        void recoverOfflineIdentity();
+      } else if (stateRef.current.status === "authenticated") {
+        void queryClient.invalidateQueries();
+      }
+    };
+    const revalidateActiveSession = () => {
+      if (
+        document.hidden ||
+        stateRef.current.status !== "authenticated" ||
+        refreshBlocked ||
+        hasLogoutTombstone()
+      )
+        return;
+      const now = Date.now();
+      if (now - lastActivationRevalidation < SESSION_REVALIDATE_MIN_INTERVAL_MS) return;
+      lastActivationRevalidation = now;
+      void apiEndpointManager.prepare(true).then(() => refreshAccessToken());
+    };
+    const visibilityChanged = () => {
+      if (!document.hidden) revalidateActiveSession();
+    };
     const reconnectOfflineSession = () => {
-      if (stateRef.current.status === "offline") void refreshAccessToken();
+      void apiEndpointManager.prepare(true).then(() => {
+        if (stateRef.current.status === "offline") return refreshAccessToken();
+        return undefined;
+      });
     };
     const storageChanged = (event: StorageEvent) => {
       if (event.key === LOGOUT_TOMBSTONE_KEY && event.newValue !== null) sessionExpired();
@@ -2336,6 +2333,8 @@ function useAuthSession() {
     window.addEventListener(SESSION_RESTORED_EVENT, sessionRestored);
     window.addEventListener("storage", storageChanged);
     window.addEventListener("online", reconnectOfflineSession);
+    window.addEventListener("focus", revalidateActiveSession);
+    document.addEventListener("visibilitychange", visibilityChanged);
     const restore = async () => {
       try {
         forgetAccessToken(false);
@@ -2407,6 +2406,8 @@ function useAuthSession() {
       window.removeEventListener(SESSION_RESTORED_EVENT, sessionRestored);
       window.removeEventListener("storage", storageChanged);
       window.removeEventListener("online", reconnectOfflineSession);
+      window.removeEventListener("focus", revalidateActiveSession);
+      document.removeEventListener("visibilitychange", visibilityChanged);
       channel?.close();
     };
   }, [queryClient]);
@@ -2422,14 +2423,12 @@ function useAuthSession() {
       clearLocalLogout();
       demoModeActive = false;
       bootstrapSuggested = false;
-      verifiedPeerBases.clear();
       queryClient.clear();
       rememberAccessToken(payload);
       setState({ status: "authenticated", user });
     },
     useDemo: () => {
       demoModeActive = true;
-      verifiedPeerBases.clear();
       queryClient.clear();
       forgetAccessToken(true);
       setState({ status: "demo", user: null });
@@ -2450,12 +2449,16 @@ function useAuthSession() {
           const controller = new AbortController();
           const timer = window.setTimeout(() => controller.abort(), 5000);
           try {
-            await fetch(`${API_BASE}/auth/logout`, {
-              method: "POST",
-              credentials: "include",
-              headers,
-              signal: controller.signal,
-            });
+            await apiEndpointManager.fetchApi(
+              "/auth/logout",
+              {
+                method: "POST",
+                credentials: "include",
+                headers,
+                signal: controller.signal,
+              },
+              { revalidateBeforeMutation: false },
+            );
           } catch {
             // The local tombstone prevents an offline or failed logout from
             // silently restoring the HttpOnly session on the next startup.
@@ -2465,7 +2468,6 @@ function useAuthSession() {
         }
       } finally {
         demoModeActive = false;
-        verifiedPeerBases.clear();
         queryClient.clear();
         forgetAccessToken(true);
         setState({ status: "required", user: null });
@@ -2580,31 +2582,9 @@ function useHubData(
               const cluster = normalizeClusterSnapshot(nodes.value.payload, !nodes.value.cached);
               next.nodes = cluster.nodes;
               next.clusterMeta = cluster.meta;
-              const discovered = cluster.rawNodes
-                .map((item) => rememberVerifiedPeerBase(asRecord(item).public_api_url))
-                .filter((item): item is string => Boolean(item));
-              if (discovered.length) {
-                try {
-                  const saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
-                  const disabled = JSON.parse(
-                    localStorage.getItem("alert-hub-disabled-api-endpoints") ?? "[]",
-                  );
-                  const disabledSet = new Set(Array.isArray(disabled) ? disabled : []);
-                  localStorage.setItem(
-                    "alert-hub-api-endpoints",
-                    JSON.stringify(
-                      [
-                        ...new Set([
-                          ...(Array.isArray(saved) ? saved : []),
-                          ...discovered.filter((item) => !disabledSet.has(item)),
-                        ]),
-                      ].slice(0, 8),
-                    ),
-                  );
-                } catch {
-                  // Endpoint discovery is a device-local optimization only.
-                }
-              }
+              apiEndpointManager.addVerifiedCandidates(
+                cluster.rawNodes.map((item) => asRecord(item).public_api_url),
+              );
             } else if (nodes?.status === "rejected") {
               next.nodes = unavailableNodeTelemetry(next.nodes);
             }
@@ -3050,6 +3030,9 @@ function useHubData(
       setOnline(true);
       void refreshVisibleData();
     };
+    const onSessionRestored = () => {
+      void refreshVisibleData(true);
+    };
     const onOffline = () => {
       fullRefreshEpoch.current += 1;
       clusterRequestEpoch.current += 1;
@@ -3075,6 +3058,7 @@ function useHubData(
     };
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
+    window.addEventListener(SESSION_RESTORED_EVENT, onSessionRestored);
     return () => {
       mounted.current = false;
       fullRefreshEpoch.current += 1;
@@ -3084,6 +3068,7 @@ function useHubData(
       window.clearTimeout(initialRefresh);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
+      window.removeEventListener(SESSION_RESTORED_EVENT, onSessionRestored);
     };
   }, [demo, enabled, localizedDataVersion, refresh, refreshVisibleData]);
 
@@ -3105,6 +3090,7 @@ function useHubData(
     let renewalTimer: number | undefined;
     let stream: EventSource | undefined;
     let renewal: Promise<void> | null = null;
+    let reconnectAttempt = 0;
     const eventRefresh = createRefreshBurstCoalescer(async () => {
       if (!stopped) await refreshVisibleData(true);
     });
@@ -3131,8 +3117,11 @@ function useHubData(
         const refreshed = await refreshAccessToken();
         if (stopped) return;
         stream?.close();
-        if (refreshed) scheduleRetry(connect, 250);
-        else {
+        if (refreshed) {
+          const delay = sseReconnectDelay(reconnectAttempt);
+          reconnectAttempt += 1;
+          scheduleRetry(connect, delay);
+        } else {
           startPolling();
           scheduleRetry(connect, 30000);
         }
@@ -3157,11 +3146,14 @@ function useHubData(
       stream?.close();
       // EventSource cannot attach a bearer header. The backend's short-lived,
       // HttpOnly stream cookie is renewed together with the access token.
-      stream = new EventSource(`${API_BASE}/stream`, { withCredentials: true });
+      stream = new EventSource(apiEndpointManager.apiUrl("/stream"), {
+        withCredentials: true,
+      });
       stream.onopen = () => {
         if (stopped) return;
         if (poller) window.clearInterval(poller);
         poller = undefined;
+        reconnectAttempt = 0;
         setLiveUpdates(true);
         scheduleRenewal();
       };
@@ -3170,7 +3162,14 @@ function useHubData(
         if (stopped) return;
         setLiveUpdates(false);
         stream?.close();
-        void renewStream();
+        startPolling();
+        if (memoryAccessExpiresAt && memoryAccessExpiresAt - Date.now() <= 30_000) {
+          void renewStream();
+          return;
+        }
+        const delay = sseReconnectDelay(reconnectAttempt);
+        reconnectAttempt += 1;
+        scheduleRetry(connect, delay);
       };
     };
     connect();
@@ -3254,6 +3253,13 @@ function iconArtwork(name: string): ReactNode | null {
           <path d="M12 17h.01" />
         </>
       );
+    case "alerts":
+      return (
+        <>
+          <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+          <path d="M10 21h4" />
+        </>
+      );
     case "reachability":
       return <path d="M3 12h3l2.2-5 3.4 10 2.6-7 1.8 2h5" />;
     case "checks":
@@ -3330,8 +3336,8 @@ function iconArtwork(name: string): ReactNode | null {
     case "refresh":
       return (
         <>
-          <path d="M20 7v5h-5" />
-          <path d="M18.5 16a8 8 0 1 1 .8-8L20 12" />
+          <path d="M19 6v5h-5" />
+          <path d="M17.7 16.6a7.5 7.5 0 1 1 .8-9L19 11" />
         </>
       );
     case "bell":
@@ -3528,7 +3534,7 @@ function AuthGate({
   const [mode, setMode] = useState<"login" | "bootstrap">(
     bootstrapSuggested ? "bootstrap" : "login",
   );
-  const [username, setUsername] = useState("admin");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [bootstrapToken, setBootstrapToken] = useState("");
@@ -3799,7 +3805,6 @@ function Sidebar({
   incidents,
   nodes,
   operator,
-  checksVisible,
 }: {
   route: RouteId;
   navigate: (path: string) => void;
@@ -3808,7 +3813,6 @@ function Sidebar({
   incidents: Incident[];
   nodes: ClusterNode[];
   operator: string;
-  checksVisible: boolean;
 }) {
   const activeIncidents = incidents.filter((item) => item.status !== "resolved").length;
   const healthyNodes = nodes.filter((item) => item.health === "healthy").length;
@@ -3834,28 +3838,26 @@ function Sidebar({
       </div>
       <nav className="sidebar__nav" aria-label={tr("Основная навигация", "Primary navigation")}>
         <span className="sidebar__section-label">{tr("Мониторинг", "Operations")}</span>
-        {NAV_ITEMS.slice(0, 6)
-          .filter((item) => item.id !== "checks" || checksVisible)
-          .map((item) => (
-            <button
-              key={item.id}
-              className={
-                route === item.id ||
-                (route === "incident" && item.id === "incidents") ||
-                (route === "check" && item.id === "checks")
-                  ? "active"
-                  : ""
-              }
-              onClick={() => navigate(item.path)}
-              title={collapsed ? item.label : undefined}
-            >
-              <Icon symbol={item.icon} />
-              <span>{item.label}</span>
-              {item.id === "incidents" && <em>{activeIncidents}</em>}
-            </button>
-          ))}
+        {NAV_ITEMS.slice(0, 7).map((item) => (
+          <button
+            key={item.id}
+            className={
+              route === item.id ||
+              (route === "incident" && item.id === "incidents") ||
+              (route === "check" && item.id === "checks")
+                ? "active"
+                : ""
+            }
+            onClick={() => navigate(item.path)}
+            title={collapsed ? item.label : undefined}
+          >
+            <Icon symbol={item.icon} />
+            <span>{item.label}</span>
+            {item.id === "incidents" && <em>{activeIncidents}</em>}
+          </button>
+        ))}
         <span className="sidebar__section-label">{tr("Управление", "Manage")}</span>
-        {NAV_ITEMS.slice(6).map((item) => (
+        {NAV_ITEMS.slice(7).map((item) => (
           <button
             key={item.id}
             className={route === item.id ? "active" : ""}
@@ -3910,27 +3912,19 @@ function MobileNav({
   route,
   navigate,
   onMore,
-  checksVisible,
 }: {
   route: RouteId;
   navigate: (path: string) => void;
   onMore: () => void;
-  checksVisible: boolean;
 }) {
-  const items = checksVisible
-    ? [NAV_ITEMS[0], NAV_ITEMS[1], NAV_ITEMS[2], NAV_ITEMS[3]]
-    : [NAV_ITEMS[0], NAV_ITEMS[1], NAV_ITEMS[2], NAV_ITEMS[7]];
+  const items = [NAV_ITEMS[0], NAV_ITEMS[1], NAV_ITEMS[2], NAV_ITEMS[3]];
   return (
     <nav className="mobile-nav" aria-label={tr("Мобильная навигация", "Mobile navigation")}>
       {items.map((item) => (
         <button
           key={item.id}
           className={
-            route === item.id ||
-            (route === "incident" && item.id === "incidents") ||
-            (route === "check" && item.id === "checks")
-              ? "active"
-              : ""
+            route === item.id || (route === "incident" && item.id === "incidents") ? "active" : ""
           }
           onClick={() => navigate(item.path)}
         >
@@ -3951,13 +3945,11 @@ function MobileDrawer({
   route,
   navigate,
   onClose,
-  checksVisible,
 }: {
   open: boolean;
   route: RouteId;
   navigate: (path: string) => void;
   onClose: () => void;
-  checksVisible: boolean;
 }) {
   if (!open) return null;
   return (
@@ -3978,7 +3970,7 @@ function MobileDrawer({
           </button>
         </div>
         <nav>
-          {NAV_ITEMS.filter((item) => item.id !== "checks" || checksVisible).map((item) => (
+          {NAV_ITEMS.map((item) => (
             <button
               key={item.id}
               className={
@@ -4375,6 +4367,7 @@ function AlertHubRuntime() {
   const hubPageReady = (() => {
     switch (route.id) {
       case "incidents":
+      case "alerts":
       case "checks":
       case "check":
       case "incident":
@@ -4423,6 +4416,24 @@ function AlertHubRuntime() {
               readOnly={readOnly}
               externalRefreshVersion={incidentsVersion}
               onStatusesChanged={updateIncidentStatuses}
+            />
+          );
+        case "alerts":
+          return (
+            <AlertsPage
+              request={getJson}
+              runtimeMode={
+                auth.state.status === "demo"
+                  ? "demo"
+                  : auth.state.status === "offline"
+                    ? "unavailable"
+                    : "active"
+              }
+              language={language}
+              datasources={data.datasources}
+              grafanaUrl={data.summary.grafanaUrl}
+              navigate={navigate}
+              externalRefreshVersion={incidentsVersion}
             />
           );
         case "incident":
@@ -4533,7 +4544,6 @@ function AlertHubRuntime() {
         case "settings":
           return (
             <SettingsPage
-              nodes={data.nodes}
               summary={data.summary}
               readOnly={readOnly}
               setData={setData}
@@ -4574,7 +4584,6 @@ function AlertHubRuntime() {
               ? tr("офлайн · только чтение", "offline · read-only")
               : tr("демо-режим", "demo-preview")
         }
-        checksVisible={checksVisible}
       />
       <div className="app-frame">
         <AppHeader
@@ -4599,18 +4608,12 @@ function AlertHubRuntime() {
           {view}
         </main>
       </div>
-      <MobileNav
-        route={route.id}
-        navigate={navigate}
-        onMore={() => setMobileMenu(true)}
-        checksVisible={checksVisible}
-      />
+      <MobileNav route={route.id} navigate={navigate} onMore={() => setMobileMenu(true)} />
       <MobileDrawer
         open={mobileMenu}
         route={route.id}
         navigate={navigate}
         onClose={() => setMobileMenu(false)}
-        checksVisible={checksVisible}
       />
       {sourceWizard && (
         <SourceWizard
@@ -5334,9 +5337,16 @@ function IncidentsPage({
   externalRefreshVersion: number;
   onStatusesChanged: (updates: Record<string, IncidentStatus>) => void;
 }) {
-  const [query, setQuery] = useState("");
-  const [debouncedQuery, setDebouncedQuery] = useState("");
-  const [status, setStatus] = useState<"active" | "all" | IncidentStatus>("active");
+  const location = useLocation();
+  const initialSearchParams = new URLSearchParams(location.search);
+  const initialQuery = initialSearchParams.get("q")?.trim().slice(0, 200) ?? "";
+  const exactAlertname = initialSearchParams.get("alertname")?.trim().slice(0, 200) ?? "";
+  const exactDatasourceId = initialSearchParams.get("datasource_id")?.trim().slice(0, 36) ?? "";
+  const [query, setQuery] = useState(initialQuery);
+  const [debouncedQuery, setDebouncedQuery] = useState(initialQuery);
+  const [status, setStatus] = useState<"active" | "all" | IncidentStatus>(
+    initialQuery ? "all" : "active",
+  );
   const [severity, setSeverity] = useState<"all" | Severity>("all");
   const [offset, setOffset] = useState(0);
   const [remote, setRemote] = useState<RemoteIncidentPageSnapshot>({
@@ -5369,10 +5379,12 @@ function IncidentsPage({
         status,
         severity,
         query: debouncedQuery,
+        alertname: exactAlertname,
+        datasourceId: exactDatasourceId,
         limit: INCIDENT_PAGE_SIZE,
         offset,
       }),
-    [debouncedQuery, offset, severity, status],
+    [debouncedQuery, exactAlertname, exactDatasourceId, offset, severity, status],
   );
   const requestKey = `${externalRefreshVersion}:${reloadVersion}:${requestPath}`;
   const loading =
@@ -5497,6 +5509,9 @@ function IncidentsPage({
     const counts = { ...EMPTY_INCIDENT_COUNTS };
     for (const incident of incidents) {
       if (severity !== "all" && incident.severity !== severity) continue;
+      if (exactAlertname && incident.labels.alertname !== exactAlertname) continue;
+      if (exactDatasourceId && incident.labels.prometheus_datasource_id !== exactDatasourceId)
+        continue;
       if (
         needle &&
         !`${incident.title} ${incident.description} ${incident.source} ${Object.values(
@@ -5523,7 +5538,7 @@ function IncidentsPage({
       counts,
       bulkLimit: 500,
     };
-  }, [incidents, offset, query, severity, status]);
+  }, [exactAlertname, exactDatasourceId, incidents, offset, query, severity, status]);
 
   const snapshot = requestList
     ? remote.requestPath === requestPath
@@ -5622,6 +5637,8 @@ function IncidentsPage({
     if (status !== "all") filters.status = status;
     if (severity !== "all") filters.severity = severity;
     if (debouncedQuery) filters.q = debouncedQuery;
+    if (exactAlertname) filters.alertname = exactAlertname;
+    if (exactDatasourceId) filters.prometheus_datasource_id = exactDatasourceId;
     try {
       const response = await mutationJson("/incidents/bulk-action", {
         method: "POST",
@@ -5756,6 +5773,28 @@ function IncidentsPage({
         </button>
       </div>
       <Panel className="incident-table-panel">
+        {(exactAlertname || exactDatasourceId) && (
+          <div className="incident-exact-filter" role="status">
+            <span>
+              <b>{tr("Точный фильтр правила", "Exact rule filter")}</b>
+              <small>
+                {exactAlertname && `alertname=${exactAlertname}`}
+                {exactAlertname && exactDatasourceId && " · "}
+                {exactDatasourceId && `datasource=${exactDatasourceId}`}
+              </small>
+            </span>
+            <button
+              className="button button--quiet"
+              type="button"
+              onClick={() => {
+                resetPageAndSelection();
+                navigate("/incidents");
+              }}
+            >
+              {tr("Снять фильтр", "Clear filter")}
+            </button>
+          </div>
+        )}
         <div className="filter-bar">
           <label className="search-field">
             <Icon symbol="⌕" />
@@ -8150,6 +8189,7 @@ function ClusterPage({
   const reportedLags = nodes.flatMap((node) => node.syncLag ?? []);
   const selectedNodes = nodes.filter((node) => selectedNodeIds.has(node.id));
   const allNodesSelected = nodes.length > 0 && selectedNodes.length === nodes.length;
+  const enabledApiAlerts = nodes.filter((node) => node.apiDownAlertEnabled).length;
   const updateApiDownAlerts = async (nodeIds: string[], enabled: boolean) => {
     if (readOnly || alertBusy || !nodeIds.length) return;
     setAlertBusy(true);
@@ -8247,18 +8287,31 @@ function ClusterPage({
         title={tr("Алерты о падении API", "API-down alerts")}
         action={
           <span className="cluster-api-alerts__count">
-            {tr("Включено", "Enabled")}: {nodes.filter((node) => node.apiDownAlertEnabled).length}/
-            {nodes.length}
+            <StatusDot
+              health={
+                nodes.length > 0 && enabledApiAlerts === nodes.length
+                  ? "healthy"
+                  : enabledApiAlerts > 0
+                    ? "degraded"
+                    : "unknown"
+              }
+            />
+            {tr("Включено", "Enabled")}:{" "}
+            <b>
+              {enabledApiAlerts}/{nodes.length}
+            </b>
           </span>
         }
       >
         <div className="cluster-api-alerts__body">
-          <p>
-            {tr(
-              "После трёх подряд ошибок живой peer создаст critical-инцидент и отправит его по обычным маршрутам уведомлений. Для мониторинга нужен хотя бы один другой настроенный узел.",
-              "After three consecutive failures, a live peer creates a critical incident and sends it through the normal notification routes. Monitoring requires at least one other configured node.",
-            )}
-          </p>
+          <div className="cluster-api-alerts__intro">
+            <p>
+              {tr(
+                "После трёх подряд ошибок живой peer создаст critical-инцидент и отправит его по обычным маршрутам уведомлений. Для мониторинга нужен хотя бы один другой настроенный узел.",
+                "After three consecutive failures, a live peer creates a critical incident and sends it through the normal notification routes. Monitoring requires at least one other configured node.",
+              )}
+            </p>
+          </div>
           <div className="cluster-api-alerts__actions">
             <button
               className="button button--quiet button--small"
@@ -8275,37 +8328,39 @@ function ClusterPage({
                 ? tr("Снять выбор", "Clear selection")
                 : tr("Выбрать все", "Select all")}
             </button>
-            <span>
+            <span className="cluster-api-alerts__selected-count" aria-live="polite">
               {tr("Выбрано", "Selected")}: <b>{selectedNodes.length}</b>
             </span>
-            <button
-              className="button button--primary button--small"
-              type="button"
-              disabled={readOnly || alertBusy || !selectedNodes.length}
-              onClick={() =>
-                void updateApiDownAlerts(
-                  selectedNodes.map((node) => node.id),
-                  true,
-                )
-              }
-            >
-              {alertBusy
-                ? tr("Сохраняем…", "Saving…")
-                : tr("Включить выбранным", "Enable selected")}
-            </button>
-            <button
-              className="button button--quiet button--small"
-              type="button"
-              disabled={readOnly || alertBusy || !selectedNodes.length}
-              onClick={() =>
-                void updateApiDownAlerts(
-                  selectedNodes.map((node) => node.id),
-                  false,
-                )
-              }
-            >
-              {tr("Выключить выбранным", "Disable selected")}
-            </button>
+            <span className="cluster-api-alerts__bulk-actions">
+              <button
+                className="button button--primary button--small"
+                type="button"
+                disabled={readOnly || alertBusy || !selectedNodes.length}
+                onClick={() =>
+                  void updateApiDownAlerts(
+                    selectedNodes.map((node) => node.id),
+                    true,
+                  )
+                }
+              >
+                {alertBusy
+                  ? tr("Сохраняем…", "Saving…")
+                  : tr("Включить выбранным", "Enable selected")}
+              </button>
+              <button
+                className="button button--quiet button--small"
+                type="button"
+                disabled={readOnly || alertBusy || !selectedNodes.length}
+                onClick={() =>
+                  void updateApiDownAlerts(
+                    selectedNodes.map((node) => node.id),
+                    false,
+                  )
+                }
+              >
+                {tr("Выключить выбранным", "Disable selected")}
+              </button>
+            </span>
           </div>
         </div>
       </Panel>
@@ -8321,7 +8376,7 @@ function ClusterPage({
         {nodes.map((node) => (
           <Panel
             key={node.id}
-            className={`node-card ${focusedNodeId === node.id ? "node-card--selected" : ""}`}
+            className={`node-card ${focusedNodeId === node.id ? "node-card--selected" : ""} ${selectedNodeIds.has(node.id) ? "node-card--checked" : ""}`}
           >
             <button
               className="node-card__select"
@@ -8375,7 +8430,9 @@ function ClusterPage({
                 {tr("Выбрать", "Select")}
               </label>
               <code>{node.version}</code>
-              <span className="node-api-alert-control">
+              <span
+                className={`node-api-alert-control ${node.apiDownAlertEnabled ? "node-api-alert-control--enabled" : ""}`}
+              >
                 <span>
                   <b>{tr("Алерт API", "API alert")}</b>
                   <small>
@@ -8384,17 +8441,12 @@ function ClusterPage({
                       : tr("выключен", "disabled")}
                   </small>
                 </span>
-                <button
-                  className={`toggle ${node.apiDownAlertEnabled ? "toggle--on" : ""}`}
-                  type="button"
-                  role="switch"
-                  aria-checked={node.apiDownAlertEnabled}
-                  aria-label={`${tr("Алерт о падении API для", "API-down alert for")} ${node.name}`}
+                <Toggle
+                  checked={node.apiDownAlertEnabled}
+                  label={`${tr("Алерт о падении API для", "API-down alert for")} ${node.name}`}
                   disabled={readOnly || alertBusy}
-                  onClick={() => void updateApiDownAlerts([node.id], !node.apiDownAlertEnabled)}
-                >
-                  <span />
-                </button>
+                  onChange={(checked) => void updateApiDownAlerts([node.id], checked)}
+                />
               </span>
             </div>
           </Panel>
@@ -8733,13 +8785,14 @@ function Toggle({
   return (
     <button
       className={`toggle ${checked ? "toggle--on" : ""}`}
+      type="button"
       role="switch"
       aria-checked={checked}
       aria-label={label}
       onClick={() => onChange(!checked)}
       disabled={disabled}
     >
-      <span />
+      <span className="toggle__thumb" aria-hidden="true" />
     </button>
   );
 }
@@ -8758,13 +8811,11 @@ function parseJobGlobs(value: string) {
 }
 
 function SettingsPage({
-  nodes,
   summary,
   readOnly,
   setData,
   onRefresh,
 }: {
-  nodes: ClusterNode[];
   summary: HubSummary;
   readOnly: boolean;
   setData: React.Dispatch<React.SetStateAction<HubData>>;
@@ -8781,6 +8832,37 @@ function SettingsPage({
       ? true
       : localStorage.getItem("alert-hub-auto-failover") !== "false",
   );
+  const [apiSnapshot, setApiSnapshot] = useState<ApiEndpointSnapshot>(() =>
+    apiEndpointManager.snapshot(),
+  );
+  useEffect(
+    () => apiEndpointManager.subscribe(() => setApiSnapshot(apiEndpointManager.snapshot())),
+    [],
+  );
+  const healthyApiCount = apiSnapshot.endpoints.filter(
+    (endpoint) => endpoint.health === "healthy",
+  ).length;
+  const unavailableApiCount = apiSnapshot.endpoints.filter(
+    (endpoint) => endpoint.health === "backoff",
+  ).length;
+  const uncheckedApiCount = apiSnapshot.endpoints.length - healthyApiCount - unavailableApiCount;
+  const apiDiagnosticReason =
+    apiSnapshot.warning === "duplicate-origins"
+      ? tr(
+          "Несколько узлов кластера объявили один и тот же публичный API-адрес.",
+          "Several cluster nodes advertised the same public API origin.",
+        )
+      : apiSnapshot.reason === "A health probe selected a healthy API endpoint"
+        ? tr(
+            "Проверка доступности выбрала исправный API-узел.",
+            "A health probe selected a healthy API endpoint.",
+          )
+        : apiSnapshot.reason === "A request failed over after a network or server error"
+          ? tr(
+              "Запрос переключён после сетевой или серверной ошибки.",
+              "A request failed over after a network or server error.",
+            )
+          : apiSnapshot.reason;
   const [cacheMessage, setCacheMessage] = useState<string | null>(null);
   const [monitoringDraft, setMonitoringDraft] = useState<{
     grafanaUrl: string;
@@ -8792,25 +8874,6 @@ function SettingsPage({
     tone: "success" | "warning";
     text: string;
   } | null>(null);
-  const [endpoints, setEndpoints] = useState<string[]>(() => {
-    if (typeof window === "undefined") return [];
-    try {
-      const saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
-      return Array.isArray(saved)
-        ? saved.filter((item): item is string => typeof item === "string")
-        : [];
-    } catch {
-      return [];
-    }
-  });
-  const availableEndpoints = [
-    ...new Set(
-      nodes
-        .map((node) => normalizePeerBase(node.publicApiUrl))
-        .filter((item): item is string => Boolean(item)),
-    ),
-  ];
-  const enabledEndpoints = endpoints.filter((item) => availableEndpoints.includes(item));
   const grafanaUrl = monitoringDraft?.grafanaUrl ?? summary.grafanaUrl ?? "";
   const keyJobGlobs = monitoringDraft?.keyJobGlobs ?? summary.keyJobGlobs.join(", ");
   const alertHubJobGlobs = monitoringDraft?.alertHubJobGlobs ?? summary.alertHubJobGlobs.join(", ");
@@ -8905,27 +8968,6 @@ function SettingsPage({
       setMonitoringBusy(false);
     }
   };
-  const toggleEndpoint = (item: string) => {
-    const enabled = enabledEndpoints.includes(item);
-    const next = enabled
-      ? enabledEndpoints.filter((entry) => entry !== item)
-      : [...new Set([...enabledEndpoints, item])].slice(0, 8);
-    let disabled: string[];
-    try {
-      const saved = JSON.parse(localStorage.getItem("alert-hub-disabled-api-endpoints") ?? "[]");
-      disabled = Array.isArray(saved)
-        ? saved.filter((value): value is string => typeof value === "string")
-        : [];
-    } catch {
-      disabled = [];
-    }
-    const nextDisabled = enabled
-      ? [...new Set([...disabled, item])]
-      : disabled.filter((entry) => entry !== item);
-    setEndpoints(next);
-    localStorage.setItem("alert-hub-api-endpoints", JSON.stringify(next));
-    localStorage.setItem("alert-hub-disabled-api-endpoints", JSON.stringify(nextDisabled));
-  };
   return (
     <div className="page-stack settings-page">
       <PageHeading
@@ -8993,59 +9035,69 @@ function SettingsPage({
             </div>
           </Panel>
           <Panel
-            eyebrow={tr("Отказоустойчивый клиент", "Failover-aware client")}
-            title={tr("Сохранённые адреса API", "Saved API endpoints")}
+            eyebrow={tr("Маршрутизация API", "API routing")}
+            title={
+              apiSnapshot.degraded
+                ? tr("Работа через резервный узел", "Using a fallback node")
+                : tr("Подключение активно", "Connection active")
+            }
           >
             <p className="settings-intro">
               {tr(
-                "Если текущий узел недоступен, PWA может прочитать данные через другой доверенный адрес кластера.",
-                "If the current node is unavailable, the PWA can read through another trusted cluster endpoint.",
+                `Режим ${apiSnapshot.mode}. Активный API: ${apiSnapshot.displayActiveOrigin}. Адреса задаются оператором до запуска интерфейса.`,
+                `Mode: ${apiSnapshot.mode}. Active API: ${apiSnapshot.displayActiveOrigin}. Endpoints are supplied by the operator before the UI starts.`,
               )}
             </p>
+            <p className="settings-intro">
+              {tr(
+                `Всего: ${apiSnapshot.endpoints.length} · исправны: ${healthyApiCount} · недоступны: ${unavailableApiCount} · не проверены: ${uncheckedApiCount}.`,
+                `Total: ${apiSnapshot.endpoints.length} · healthy: ${healthyApiCount} · unavailable: ${unavailableApiCount} · unchecked: ${uncheckedApiCount}.`,
+              )}
+              {apiDiagnosticReason
+                ? ` ${apiDiagnosticReason}${
+                    apiSnapshot.lastSwitchAt
+                      ? tr(
+                          ` Последнее переключение: ${formatDate(new Date(apiSnapshot.lastSwitchAt).toISOString(), true)}.`,
+                          ` Last switch: ${formatDate(new Date(apiSnapshot.lastSwitchAt).toISOString(), true)}.`,
+                        )
+                      : ""
+                  }`
+                : ""}
+            </p>
             <div className="endpoint-list">
-              {availableEndpoints.map((item, index) => (
-                <div key={item}>
+              {apiSnapshot.endpoints.map((endpoint, index) => (
+                <div key={endpoint.origin || "same-origin"}>
                   <span className="endpoint-order">{index + 1}</span>
                   <span>
-                    <b>{item}</b>
+                    <b>{endpoint.displayOrigin}</b>
                     <small>
-                      {tr(
-                        "Подтверждено авторизованным ответом кластера",
-                        "Verified by an authenticated cluster response",
-                      )}
+                      {endpoint.active
+                        ? tr("Активный адрес", "Active endpoint")
+                        : endpoint.health === "backoff"
+                          ? tr("Пауза после ошибки", "Backoff after failure")
+                          : tr("Готов к переключению", "Ready for failover")}
                     </small>
                   </span>
-                  <StatusDot health={enabledEndpoints.includes(item) ? "unknown" : "paused"} />
-                  <button
-                    className="button button--quiet button--small"
-                    onClick={() => toggleEndpoint(item)}
-                    disabled={readOnly}
-                    aria-label={`${enabledEndpoints.includes(item) ? tr("Отключить", "Disable") : tr("Включить", "Enable")} ${tr("переключение на", "failover to")} ${item}`}
-                  >
-                    {enabledEndpoints.includes(item)
-                      ? tr("Отключить", "Disable")
-                      : tr("Включить", "Enable")}
-                  </button>
+                  <StatusDot
+                    health={
+                      endpoint.health === "healthy"
+                        ? "healthy"
+                        : endpoint.health === "backoff"
+                          ? "offline"
+                          : "unknown"
+                    }
+                  />
+                  <code>{endpoint.active ? tr("активен", "active") : endpoint.health}</code>
                 </div>
               ))}
-              {!availableEndpoints.length && (
-                <EmptyState
-                  icon="⇄"
-                  title={tr("Нет сохранённых адресов узлов", "No saved node endpoints")}
-                  message={tr(
-                    "Здесь появятся публичные HTTPS-адреса API, подтверждённые данными кластера.",
-                    "Public HTTPS API endpoints verified by cluster data appear here.",
-                  )}
-                />
-              )}
             </div>
             <div className="setting-row setting-row--border">
               <span>
-                <b>{tr("Автоматическое переключение чтения", "Automatic read failover")}</b>
+                <b>{tr("Автоматическое переключение API", "Automatic API failover")}</b>
                 <small>
                   {tr(
-                    "Использовать активные авторизованные адреса кластера, если текущий API-узел недоступен.",
-                    "Use active authenticated cluster endpoints when the current API node is unavailable.",
+                    "Выбирать исправный адрес до записи и переключать безопасные запросы чтения, если текущий API-узел недоступен.",
+                    "Select a healthy endpoint before writes and fail over safe reads when the current API node is unavailable.",
                   )}
                 </small>
               </span>
@@ -9054,8 +9106,9 @@ function SettingsPage({
                 onChange={(checked) => {
                   setAutoFailover(checked);
                   localStorage.setItem("alert-hub-auto-failover", String(checked));
+                  apiEndpointManager.setFailoverEnabled(checked);
                 }}
-                label={tr("Автоматическое переключение чтения", "Automatic read failover")}
+                label={tr("Автоматическое переключение API", "Automatic API failover")}
                 disabled={readOnly}
               />
             </div>

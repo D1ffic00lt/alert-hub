@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal, cast
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from alert_hub.infrastructure.db.models import PrometheusDatasource
 from alert_hub.infrastructure.encryption import EncryptionError, EnvelopeCipher
 from alert_hub.infrastructure.prometheus import (
+    AlertRule,
     FixedQueryName,
     PrometheusClient,
     PrometheusQueryError,
@@ -42,7 +43,7 @@ def decrypt_credentials(
 class DatasourceQueryResult:
     datasource_id: str
     datasource_name: str
-    reachability_label_mode: str
+    reachability_label_mode: Literal["canonical", "server"]
     samples: list[VectorSample]
 
 
@@ -59,8 +60,15 @@ class DatasourceQueryTarget:
     datasource_id: str
     datasource_name: str
     url: str
-    reachability_label_mode: str
+    reachability_label_mode: Literal["canonical", "server"]
     credentials: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class DatasourceRulesResult:
+    datasource_id: str
+    datasource_name: str
+    rules: list[AlertRule]
 
 
 def prepare_enabled_datasources(
@@ -108,7 +116,10 @@ def prepare_enabled_datasources(
                 datasource.id,
                 datasource.name,
                 datasource.url,
-                datasource.reachability_label_mode,
+                cast(
+                    Literal["canonical", "server"],
+                    datasource.reachability_label_mode,
+                ),
                 credentials,
             )
         )
@@ -129,6 +140,16 @@ async def query_datasource_targets(
         target: DatasourceQueryTarget,
     ) -> DatasourceQueryResult | DatasourceQueryFailure:
         async def execute() -> list[VectorSample]:
+            if query_name == "reachability":
+                return await client.query(
+                    target.url,
+                    target.credentials,
+                    query_name,
+                    job_globs=job_globs,
+                    reachability_label_mode=target.reachability_label_mode,
+                    evaluated_at=evaluated_at,
+                    allow_non_finite_values=allow_non_finite_values,
+                )
             return await client.query(
                 target.url,
                 target.credentials,
@@ -160,5 +181,29 @@ async def query_datasource_targets(
 
     raw_results = await asyncio.gather(*(query_one(target) for target in targets))
     successes = [item for item in raw_results if isinstance(item, DatasourceQueryResult)]
+    failures = [item for item in raw_results if isinstance(item, DatasourceQueryFailure)]
+    return successes, failures
+
+
+async def query_datasource_rules_targets(
+    targets: list[DatasourceQueryTarget],
+    client: PrometheusClient,
+) -> tuple[list[DatasourceRulesResult], list[DatasourceQueryFailure]]:
+    async def query_one(
+        target: DatasourceQueryTarget,
+    ) -> DatasourceRulesResult | DatasourceQueryFailure:
+        try:
+            rules = await client.alert_rules(target.url, target.credentials)
+        except PrometheusQueryError as exc:
+            return DatasourceQueryFailure(
+                target.datasource_id,
+                target.datasource_name,
+                exc.code,
+                exc.detail,
+            )
+        return DatasourceRulesResult(target.datasource_id, target.datasource_name, rules)
+
+    raw_results = await asyncio.gather(*(query_one(target) for target in targets))
+    successes = [item for item in raw_results if isinstance(item, DatasourceRulesResult)]
     failures = [item for item in raw_results if isinstance(item, DatasourceQueryFailure)]
     return successes, failures

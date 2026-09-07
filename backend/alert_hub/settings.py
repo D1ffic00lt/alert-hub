@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from alert_hub.domain.monitoring import normalize_grafana_url
@@ -98,12 +98,23 @@ class Settings(BaseSettings):
     backend_port: int = Field(default=8080, ge=1, le=65_535)
     database_url: str = "sqlite:///./data/alert-hub.db"
     sqlite_busy_timeout_ms: int = Field(default=5_000, ge=1, le=120_000)
+    database_pool_size: int = Field(default=5, ge=1, le=64)
+    database_max_overflow: int = Field(default=10, ge=0, le=128)
+    database_pool_timeout_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
+    database_public_read_limit: int = Field(default=8, ge=1, le=128)
+    database_public_queue_timeout_seconds: float = Field(default=5.0, ge=0.1, le=30.0)
     auto_create_schema: bool = False
 
     node_id: str = "local-node"
     node_name: str = "Local node"
     node_region: str = "local"
-    public_api_url: str | None = None
+    api_ha_mode: Literal["single", "client-failover", "proxy-failover", "external"] = "single"
+    public_ui_url: str | None = None
+    public_api_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("NODE_PUBLIC_API_URL", "PUBLIC_API_URL"),
+    )
+    public_ingest_url: str | None = None
     private_peer_url: str | None = Field(
         default=None,
         validation_alias=AliasChoices("PEER_PUBLIC_URL", "PRIVATE_PEER_URL"),
@@ -200,6 +211,7 @@ class Settings(BaseSettings):
     prometheus_query_timeout_seconds: float = Field(default=8.0, ge=0.1, le=120.0)
     prometheus_max_response_bytes: int = Field(default=2_097_152, ge=1_024, le=20_971_520)
     prometheus_max_samples: int = Field(default=10_000, ge=1, le=100_000)
+    availability_stale_after_seconds: int = Field(default=300, ge=1, le=86_400)
     heartbeat_scan_seconds: float = Field(default=10.0, ge=0.0, le=300.0)
     notification_poll_seconds: float = Field(default=1.0, ge=0.1, le=60.0)
     notification_lock_seconds: float = Field(default=60.0, ge=5.0, le=3_600.0)
@@ -335,6 +347,14 @@ class Settings(BaseSettings):
         path = parsed.path.rstrip("/")
         return urlunsplit((parsed.scheme.lower(), netloc.lower(), path, "", ""))
 
+    @field_validator("public_ui_url", "public_ingest_url")
+    @classmethod
+    def validate_public_origins(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        field_name = (info.field_name or "public URL").upper()
+        return _normalize_peer_origin(value, label=field_name)
+
     @field_validator("private_peer_url")
     @classmethod
     def validate_peer_public_url(cls, value: str | None) -> str | None:
@@ -383,6 +403,15 @@ class Settings(BaseSettings):
             if canonical not in normalized:
                 normalized.append(canonical)
         return normalized
+
+    @model_validator(mode="after")
+    def validate_database_concurrency(self) -> Settings:
+        pool_capacity = self.database_pool_size + self.database_max_overflow
+        if self.database_public_read_limit >= pool_capacity:
+            raise ValueError(
+                "DATABASE_PUBLIC_READ_LIMIT must be smaller than the configured pool capacity"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_sync_backoff(self) -> Settings:
