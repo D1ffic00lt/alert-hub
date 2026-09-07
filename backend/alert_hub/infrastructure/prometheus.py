@@ -50,10 +50,16 @@ type AvailabilityQueryName = Literal[
     "availability_last_sample_30d",
 ]
 type FixedQueryName = PublicQueryName | CheckQueryName | AvailabilityQueryName
+type ReachabilityLabelMode = Literal["canonical", "server"]
+
+REACHABILITY_PROMQL: dict[ReachabilityLabelMode, str] = {
+    "canonical": 'probe_success{source_region!="",target_name!=""}',
+    "server": 'probe_success{source_server!="",target_server!=""}',
+}
 
 FIXED_PROMQL: dict[FixedQueryName, str] = {
     "connection_test": "vector(1)",
-    "reachability": "probe_success",
+    "reachability": REACHABILITY_PROMQL["canonical"],
     "firing_alerts": 'ALERTS{alertstate="firing"}',
     "key_jobs_up": 'up{job=~"prometheus|alertmanager|blackbox.*"}',
     "alert_hub_health": 'up{job=~"alert[-_]?hub.*"}',
@@ -102,7 +108,18 @@ AVAILABILITY_QUERY_NAMES: dict[
 }
 
 
-def fixed_promql(query_name: FixedQueryName, job_globs: Sequence[str] | None = None) -> str:
+def fixed_promql(
+    query_name: FixedQueryName,
+    job_globs: Sequence[str] | None = None,
+    *,
+    reachability_label_mode: ReachabilityLabelMode | None = None,
+) -> str:
+    if query_name == "reachability":
+        if job_globs is not None:
+            raise ValueError("reachability does not accept job patterns")
+        return REACHABILITY_PROMQL[reachability_label_mode or "canonical"]
+    if reachability_label_mode is not None:
+        raise ValueError(f"{query_name} does not accept a reachability label mode")
     if job_globs is None:
         return FIXED_PROMQL[query_name]
     if query_name not in {"key_jobs_up", "alert_hub_health"}:
@@ -151,6 +168,7 @@ class PrometheusClient(Protocol):
         query_name: FixedQueryName,
         *,
         job_globs: Sequence[str] | None = None,
+        reachability_label_mode: ReachabilityLabelMode | None = None,
         evaluated_at: datetime | None = None,
         allow_non_finite_values: bool = False,
     ) -> list[VectorSample]: ...
@@ -494,11 +512,16 @@ class PrometheusHTTPClient:
         query_name: FixedQueryName,
         *,
         job_globs: Sequence[str] | None = None,
+        reachability_label_mode: ReachabilityLabelMode | None = None,
         evaluated_at: datetime | None = None,
         allow_non_finite_values: bool = False,
     ) -> list[VectorSample]:
         params = {
-            "query": fixed_promql(query_name, job_globs),
+            "query": fixed_promql(
+                query_name,
+                job_globs,
+                reachability_label_mode=reachability_label_mode,
+            ),
             "timeout": f"{self.settings.prometheus_query_timeout_seconds:g}s",
         }
         if evaluated_at is not None:

@@ -21,6 +21,7 @@ from alert_hub.infrastructure.db.models import (
 )
 from alert_hub.infrastructure.prometheus import (
     FIXED_PROMQL,
+    REACHABILITY_PROMQL,
     PrometheusHTTPClient,
     PrometheusQueryError,
     basic_authorization_value,
@@ -723,7 +724,7 @@ def test_reachability_server_label_mode_is_explicit(
     app,
 ) -> None:
     def prometheus(request: httpx.Request) -> httpx.Response:
-        assert request.url.params["query"] == FIXED_PROMQL["reachability"]
+        assert request.url.params["query"] == REACHABILITY_PROMQL["server"]
         return httpx.Response(
             200,
             request=request,
@@ -762,6 +763,56 @@ def test_reachability_server_label_mode_is_explicit(
         (cell["source"], cell["target"], cell["probe_success"]) for cell in payload["cells"]
     ] == [("nl-2", "de-2", 1.0)]
     assert payload["errors"] == []
+
+
+def test_reachability_queries_each_datasource_by_its_own_label_mode(
+    client: TestClient,
+    auth: dict[str, str],
+    app,
+) -> None:
+    queries: dict[str, str] = {}
+
+    def prometheus(request: httpx.Request) -> httpx.Response:
+        query = request.url.params["query"]
+        queries[str(request.url.host)] = query
+        if query == REACHABILITY_PROMQL["canonical"]:
+            sample = ({"source_region": "ru", "target_name": "api"}, 1, 200)
+        elif query == REACHABILITY_PROMQL["server"]:
+            sample = ({"source_server": "nl", "target_server": "api"}, 1, 201)
+        else:
+            raise AssertionError(f"unexpected reachability query: {query}")
+        return httpx.Response(200, request=request, json=_vector(sample))
+
+    app.state.prometheus_http_transport = httpx.MockTransport(prometheus)
+    canonical = client.post(
+        "/api/v1/prometheus-datasources",
+        headers=auth,
+        json={"name": "Canonical Prometheus", "url": "https://1.1.1.1:9090"},
+    )
+    server = client.post(
+        "/api/v1/prometheus-datasources",
+        headers=auth,
+        json={
+            "name": "Server Prometheus",
+            "url": "https://8.8.8.8:9090",
+            "reachability_label_mode": "server",
+        },
+    )
+    assert canonical.status_code == 201, canonical.text
+    assert server.status_code == 201, server.text
+
+    response = client.get("/api/v1/metrics/reachability", headers=auth)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["errors"] == []
+    assert {
+        (cell["source"], cell["target"], cell["probe_success"]) for cell in payload["cells"]
+    } == {("ru", "api", 1.0), ("nl", "api", 1.0)}
+    assert queries == {
+        "1.1.1.1": REACHABILITY_PROMQL["canonical"],
+        "8.8.8.8": REACHABILITY_PROMQL["server"],
+    }
 
 
 def test_prometheus_datasource_cluster_projection_and_tombstone(tmp_path: Path) -> None:
