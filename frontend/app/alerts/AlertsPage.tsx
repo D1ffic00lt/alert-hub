@@ -3,15 +3,11 @@ import { useEffect, useMemo, useState } from "react";
 import {
   type AlertRule,
   type AlertRuleFilter,
+  type AlertRuleReplica,
   type AlertRulesSnapshot,
-  type AvailabilityRow,
-  type AvailabilitySnapshot,
-  type AvailabilityTarget,
-  type AvailabilityWindow,
+  UNCATEGORIZED_FILTER,
   buildAlertRulesPath,
-  mergeAvailability,
   normalizeAlertRules,
-  normalizeAvailability,
 } from "./model";
 
 type Language = "ru" | "en";
@@ -19,7 +15,6 @@ type RuntimeMode = "active" | "demo" | "unavailable";
 type Request = (path: string, signal: AbortSignal) => Promise<{ payload: unknown }>;
 
 const PAGE_SIZE = 25;
-const WINDOWS: AvailabilityWindow[] = ["24h", "7d", "30d"];
 
 function tx(language: Language, russian: string, english: string) {
   return language === "ru" ? russian : english;
@@ -29,90 +24,170 @@ function demoRules(): AlertRulesSnapshot {
   return normalizeAlertRules({
     data_state: "ok",
     generated_at: "2026-09-07T00:00:00Z",
+    last_successful_refresh: "2026-09-07T00:00:00Z",
     totals: {
-      rules: 3,
-      firing_instances: 2,
-      pending_instances: 1,
-      unhealthy_rules: 1,
+      rules: 4,
+      firing_rules: 1,
+      pending_rules: 1,
+      error_rules: 1,
+      datasources: 3,
       related_incidents: 2,
     },
+    filtered_rules: 4,
+    categories: ["infrastructure", "tls", "xray"],
+    has_uncategorized: true,
     rules: [
       {
         id: "demo-api-down",
-        datasource_id: "prom-demo",
-        datasource_name: "Demo Prometheus",
-        group: "platform",
-        file: "platform.yml",
         name: "ApiDown",
+        category: "infrastructure",
         state: "firing",
-        health: "ok",
         firing_instances: 2,
         pending_instances: 0,
-        last_evaluation: "2026-09-07T00:00:00Z",
-        evaluation_time_seconds: 0.012,
-        last_error: null,
+        has_error: false,
+        datasource_count: 2,
         related_incidents: 2,
-        incidents_href: "/incidents?q=ApiDown",
-      },
-      {
-        id: "demo-latency",
-        datasource_id: "prom-demo",
-        datasource_name: "Demo Prometheus",
-        group: "platform",
-        file: "platform.yml",
-        name: "LatencyHigh",
-        state: "pending",
-        health: "ok",
-        firing_instances: 0,
-        pending_instances: 1,
-        last_evaluation: "2026-09-07T00:00:00Z",
-        evaluation_time_seconds: 0.008,
-        last_error: null,
-        related_incidents: 0,
-      },
-      {
-        id: "demo-broken",
-        datasource_id: "prom-demo",
-        datasource_name: "Demo Prometheus",
-        group: "storage",
-        file: "storage.yml",
-        name: "DiskForecast",
-        state: "inactive",
-        health: "error",
-        firing_instances: 0,
-        pending_instances: 0,
-        last_evaluation: "2026-09-07T00:00:00Z",
-        evaluation_time_seconds: 0.004,
-        last_error: "query evaluation failed",
-        related_incidents: 0,
-      },
-    ],
-    pagination: { page: 1, page_size: PAGE_SIZE, total_items: 3, total_pages: 1 },
-    errors: [],
-  });
-}
-
-function demoAvailability(): AvailabilitySnapshot[] {
-  return WINDOWS.map((window, index) =>
-    normalizeAvailability(
-      {
-        data_state: "ok",
-        targets: [
+        replicas: [
           {
-            datasource_id: "prom-demo",
-            datasource_name: "Demo Prometheus",
-            source: "ru",
-            target: "api-core",
-            observed_availability_percent: [99.96, 99.91, 99.88][index],
-            samples_count: [1440, 10080, 43200][index],
-            last_sample_at: "2026-09-07T00:00:00Z",
-            data_state: "ok",
+            id: "demo-api-down-ru",
+            datasource_id: "prom-ru",
+            datasource_name: "RU Prometheus",
+            group: "platform",
+            file: "platform.yml",
+            name: "ApiDown",
+            state: "firing",
+            health: "ok",
+            firing_instances: 2,
+            pending_instances: 0,
+            last_evaluation: "2026-09-07T00:00:00Z",
+            evaluation_time_seconds: 0.012,
+            last_error: null,
+            labels: { alert_category: "infrastructure", severity: "critical" },
+            annotations: { summary: "API is unavailable" },
+            related_incidents: 2,
+            incidents_href: "/incidents?alertname=ApiDown&datasource_id=prom-ru",
+          },
+          {
+            id: "demo-api-down-de",
+            datasource_id: "prom-de",
+            datasource_name: "DE Prometheus",
+            group: "platform",
+            file: "platform.yml",
+            name: "ApiDown",
+            state: "inactive",
+            health: "ok",
+            firing_instances: 0,
+            pending_instances: 0,
+            last_evaluation: "2026-09-07T00:00:00Z",
+            evaluation_time_seconds: 0.009,
+            last_error: null,
+            labels: { alert_category: "infrastructure", severity: "critical" },
+            annotations: { summary: "API is unavailable" },
+            related_incidents: 0,
+            incidents_href: null,
           },
         ],
       },
-      window,
-    ),
-  );
+      {
+        id: "demo-latency",
+        name: "XrayLatencyHigh",
+        category: "xray",
+        state: "pending",
+        firing_instances: 0,
+        pending_instances: 1,
+        has_error: false,
+        datasource_count: 1,
+        related_incidents: 0,
+        replicas: [
+          {
+            id: "demo-latency-nl",
+            datasource_id: "prom-nl",
+            datasource_name: "NL Prometheus",
+            group: "xray",
+            file: "xray.yml",
+            name: "XrayLatencyHigh",
+            state: "pending",
+            health: "ok",
+            firing_instances: 0,
+            pending_instances: 1,
+            last_evaluation: "2026-09-07T00:00:00Z",
+            evaluation_time_seconds: 0.008,
+            last_error: null,
+            labels: { alert_category: "xray", severity: "warning" },
+            annotations: {},
+            related_incidents: 0,
+            incidents_href: "/incidents?alertname=XrayLatencyHigh&datasource_id=prom-nl",
+          },
+        ],
+      },
+      {
+        id: "demo-broken",
+        name: "DiskForecast",
+        category: null,
+        state: "error",
+        firing_instances: 0,
+        pending_instances: 0,
+        has_error: true,
+        datasource_count: 1,
+        related_incidents: 0,
+        replicas: [
+          {
+            id: "demo-broken-ru",
+            datasource_id: "prom-ru",
+            datasource_name: "RU Prometheus",
+            group: "storage",
+            file: "storage.yml",
+            name: "DiskForecast",
+            state: "inactive",
+            health: "error",
+            firing_instances: 0,
+            pending_instances: 0,
+            last_evaluation: "2026-09-07T00:00:00Z",
+            evaluation_time_seconds: 0.004,
+            last_error: "query evaluation failed",
+            labels: { severity: "warning" },
+            annotations: {},
+            related_incidents: 0,
+            incidents_href: null,
+          },
+        ],
+      },
+      {
+        id: "demo-tls",
+        name: "TlsCertificateExpiringSoon",
+        category: "tls",
+        state: "inactive",
+        firing_instances: 0,
+        pending_instances: 0,
+        has_error: false,
+        datasource_count: 1,
+        related_incidents: 0,
+        replicas: [
+          {
+            id: "demo-tls-ru",
+            datasource_id: "prom-ru",
+            datasource_name: "RU Prometheus",
+            group: "tls",
+            file: "tls.yml",
+            name: "TlsCertificateExpiringSoon",
+            state: "inactive",
+            health: "ok",
+            firing_instances: 0,
+            pending_instances: 0,
+            last_evaluation: "2026-09-07T00:00:00Z",
+            evaluation_time_seconds: 0.006,
+            last_error: null,
+            labels: { alert_category: "tls", severity: "warning" },
+            annotations: {},
+            related_incidents: 0,
+            incidents_href: null,
+          },
+        ],
+      },
+    ],
+    pagination: { page: 1, page_size: PAGE_SIZE, total_items: 4, total_pages: 1 },
+    errors: [],
+  });
 }
 
 function formatDate(language: Language, value: string | null) {
@@ -125,36 +200,15 @@ function formatDate(language: Language, value: string | null) {
   }).format(date);
 }
 
-function ruleStateLabel(language: Language, rule: AlertRule) {
-  if (rule.health !== "ok") return tx(language, "Ошибка", "Error");
-  if (rule.state === "firing") return "Firing";
-  if (rule.state === "pending") return "Pending";
+function stateLabel(language: Language, state: AlertRule["state"]) {
+  if (state === "firing") return "Firing";
+  if (state === "pending") return "Pending";
+  if (state === "error") return tx(language, "Ошибка", "Error");
   return tx(language, "Неактивно", "Inactive");
 }
 
-function RuleBadge({ rule, language }: { rule: AlertRule; language: Language }) {
-  const state = rule.health !== "ok" ? "error" : rule.state;
-  return (
-    <span className={`alert-state alert-state--${state}`}>{ruleStateLabel(language, rule)}</span>
-  );
-}
-
-function AvailabilityValue({
-  target,
-  language,
-}: {
-  target?: AvailabilityTarget;
-  language: Language;
-}) {
-  if (!target || target.dataState === "unknown" || target.observedAvailabilityPercent === null) {
-    return <span className="availability-value availability-value--unknown">—</span>;
-  }
-  return (
-    <span className={`availability-value availability-value--${target.dataState}`}>
-      <b>{target.observedAvailabilityPercent.toFixed(3)}%</b>
-      {target.dataState === "stale" && <small>{tx(language, "Устарело", "Stale")}</small>}
-    </span>
-  );
+function RuleBadge({ state, language }: { state: AlertRule["state"]; language: Language }) {
+  return <span className={`alert-state alert-state--${state}`}>{stateLabel(language, state)}</span>;
 }
 
 function StateNotice({
@@ -166,7 +220,7 @@ function StateNotice({
   language: Language;
   onConfigure: () => void;
 }) {
-  if (state === "ok") return null;
+  if (state === "ok" || state === "empty") return null;
   if (state === "not_configured") {
     return (
       <div className="alerts-notice" role="status">
@@ -175,8 +229,8 @@ function StateNotice({
           <small>
             {tx(
               language,
-              "Добавьте активный datasource, чтобы загрузить правила и доступность.",
-              "Add an enabled datasource to load rules and availability.",
+              "Добавьте активный datasource, чтобы загрузить правила.",
+              "Add an enabled datasource to load alert rules.",
             )}
           </small>
         </span>
@@ -198,13 +252,215 @@ function StateNotice({
           {state === "partial"
             ? tx(
                 language,
-                "Доступные источники показаны; ошибки перечислены ниже.",
-                "Available datasources are shown; failures are listed below.",
+                "Успешно полученные правила сохранены; ошибки источников перечислены ниже.",
+                "Successfully fetched rules remain visible; datasource failures are listed below.",
               )
             : tx(language, "Повторите запрос позже.", "Retry the request later.")}
         </small>
       </span>
     </div>
+  );
+}
+
+function Labels({ labels, language }: { labels: Record<string, string>; language: Language }) {
+  const entries = Object.entries(labels).sort(([left], [right]) => left.localeCompare(right));
+  return (
+    <details className="alert-labels">
+      <summary>
+        {tx(language, "Labels", "Labels")} <span>{entries.length}</span>
+      </summary>
+      {entries.length ? (
+        <dl>
+          {entries.map(([key, value]) => (
+            <div key={key}>
+              <dt>{key}</dt>
+              <dd>{value}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : (
+        <p>{tx(language, "Labels отсутствуют", "No labels")}</p>
+      )}
+    </details>
+  );
+}
+
+function ReplicaCard({
+  replica,
+  language,
+  navigate,
+}: {
+  replica: AlertRuleReplica;
+  language: Language;
+  navigate: (path: string) => void;
+}) {
+  const displayState = replica.health !== "ok" || replica.lastError ? "error" : replica.state;
+  return (
+    <article className={`alert-replica alert-replica--${displayState}`}>
+      <header>
+        <span>
+          <b>{replica.datasourceName}</b>
+          <code>{replica.datasourceId}</code>
+        </span>
+        <RuleBadge state={displayState} language={language} />
+      </header>
+      <div className="alert-replica__counts">
+        <span>
+          <small>Firing</small>
+          <b>{replica.firingInstances}</b>
+        </span>
+        <span>
+          <small>Pending</small>
+          <b>{replica.pendingInstances}</b>
+        </span>
+        <span>
+          <small>Health</small>
+          <code>{replica.health}</code>
+        </span>
+      </div>
+      <dl className="alert-replica__meta">
+        <div>
+          <dt>{tx(language, "Группа", "Group")}</dt>
+          <dd>{replica.group || "—"}</dd>
+        </div>
+        <div>
+          <dt>{tx(language, "Файл", "File")}</dt>
+          <dd title={replica.file}>{replica.file || "—"}</dd>
+        </div>
+        <div>
+          <dt>{tx(language, "Последнее вычисление", "Last evaluation")}</dt>
+          <dd>
+            {formatDate(language, replica.lastEvaluation)}
+            {replica.evaluationTimeSeconds !== null
+              ? ` · ${(replica.evaluationTimeSeconds * 1000).toFixed(1)} ms`
+              : ""}
+          </dd>
+        </div>
+        <div>
+          <dt>{tx(language, "Последняя ошибка", "Last error")}</dt>
+          <dd className={replica.lastError ? "alert-rule-error" : ""}>
+            {replica.lastError || "—"}
+          </dd>
+        </div>
+      </dl>
+      <footer>
+        <Labels labels={replica.labels} language={language} />
+        {replica.incidentsHref ? (
+          <button
+            className="button button--quiet alert-incidents-link"
+            type="button"
+            onClick={() => navigate(replica.incidentsHref ?? "/incidents")}
+          >
+            {tx(language, "Открыть инциденты", "Open incidents")}
+            {replica.relatedIncidents > 0 ? ` · ${replica.relatedIncidents}` : ""}
+          </button>
+        ) : null}
+      </footer>
+    </article>
+  );
+}
+
+function RuleDisclosure({
+  rule,
+  language,
+  navigate,
+}: {
+  rule: AlertRule;
+  language: Language;
+  navigate: (path: string) => void;
+}) {
+  const problematic = rule.state !== "inactive" || rule.hasError;
+  const [open, setOpen] = useState(problematic);
+
+  return (
+    <details
+      className={`alert-rule alert-rule--${rule.state}`}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <span className="alert-rule__identity">
+          <b>{rule.name}</b>
+          <small>
+            {tx(
+              language,
+              `${rule.datasourceCount} datasource`,
+              `${rule.datasourceCount} datasource${rule.datasourceCount === 1 ? "" : "s"}`,
+            )}
+          </small>
+        </span>
+        <span className="alert-rule__summary">
+          <RuleBadge state={rule.state} language={language} />
+          <span>Firing&nbsp;{rule.firingInstances}</span>
+          <span>Pending&nbsp;{rule.pendingInstances}</span>
+        </span>
+      </summary>
+      <div className="alert-replicas">
+        {rule.replicas.map((replica) => (
+          <ReplicaCard replica={replica} language={language} navigate={navigate} key={replica.id} />
+        ))}
+      </div>
+    </details>
+  );
+}
+
+type CategoryGroup = {
+  key: string;
+  category: string | null;
+  rules: AlertRule[];
+  problematic: boolean;
+};
+
+function CategoryDisclosure({
+  group,
+  language,
+  navigate,
+}: {
+  group: CategoryGroup;
+  language: Language;
+  navigate: (path: string) => void;
+}) {
+  const [open, setOpen] = useState(group.problematic);
+  const firing = group.rules.filter((rule) => rule.state === "firing").length;
+  const pending = group.rules.filter((rule) => rule.state === "pending").length;
+  const errors = group.rules.filter((rule) => rule.hasError).length;
+
+  return (
+    <details
+      className={`alert-category ${group.problematic ? "alert-category--problem" : ""}`}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <span>
+          <b>{group.category ?? tx(language, "Без категории", "Uncategorized")}</b>
+          <small>
+            {tx(language, `Правил: ${group.rules.length}`, `Rules: ${group.rules.length}`)}
+          </small>
+        </span>
+        <span className="alert-category__counts">
+          {firing > 0 && <span className="alert-state alert-state--firing">Firing {firing}</span>}
+          {pending > 0 && (
+            <span className="alert-state alert-state--pending">Pending {pending}</span>
+          )}
+          {errors > 0 && (
+            <span className="alert-state alert-state--error">
+              {tx(language, "Ошибки", "Errors")} {errors}
+            </span>
+          )}
+        </span>
+      </summary>
+      <div className="alert-category__rules">
+        {group.rules.map((rule) => (
+          <RuleDisclosure
+            rule={rule}
+            language={language}
+            navigate={navigate}
+            key={`${rule.id}:${rule.state}:${String(rule.hasError)}`}
+          />
+        ))}
+      </div>
+    </details>
   );
 }
 
@@ -226,6 +482,7 @@ export function AlertsPage({
   externalRefreshVersion: number;
 }) {
   const [datasourceId, setDatasourceId] = useState("");
+  const [category, setCategory] = useState("");
   const [stateFilter, setStateFilter] = useState<AlertRuleFilter>("all");
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
@@ -236,11 +493,6 @@ export function AlertsPage({
   );
   const [rulesLoading, setRulesLoading] = useState(runtimeMode === "active");
   const [rulesError, setRulesError] = useState<string | null>(null);
-  const [availability, setAvailability] = useState<AvailabilitySnapshot[]>(() =>
-    runtimeMode === "demo" ? demoAvailability() : [],
-  );
-  const [availabilityLoading, setAvailabilityLoading] = useState(runtimeMode === "active");
-  const [availabilityError, setAvailabilityError] = useState<string | null>(null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 250);
@@ -255,6 +507,7 @@ export function AlertsPage({
     });
     const path = buildAlertRulesPath({
       datasourceId,
+      category,
       state: stateFilter,
       query: debouncedQuery,
       page,
@@ -284,6 +537,7 @@ export function AlertsPage({
       });
     return () => controller.abort();
   }, [
+    category,
     datasourceId,
     debouncedQuery,
     externalRefreshVersion,
@@ -295,53 +549,33 @@ export function AlertsPage({
     stateFilter,
   ]);
 
-  useEffect(() => {
-    if (runtimeMode !== "active") return undefined;
-    const controller = new AbortController();
-    queueMicrotask(() => {
-      if (!controller.signal.aborted) setAvailabilityLoading(true);
-    });
-    void Promise.allSettled(
-      WINDOWS.map(async (window) => {
-        const result = await request(`/availability?window=${window}`, controller.signal);
-        return normalizeAvailability(result.payload, window);
-      }),
-    ).then((results) => {
-      if (controller.signal.aborted) return;
-      const successful = results.flatMap((result) =>
-        result.status === "fulfilled" ? [result.value] : [],
-      );
-      setAvailability(successful);
-      setAvailabilityError(
-        successful.length === WINDOWS.length
-          ? null
-          : tx(
-              language,
-              "Часть окон доступности не загрузилась.",
-              "Some availability windows could not be loaded.",
-            ),
-      );
-      setAvailabilityLoading(false);
-    });
-    return () => controller.abort();
-  }, [externalRefreshVersion, language, refreshVersion, request, runtimeMode]);
+  const groups = useMemo<CategoryGroup[]>(() => {
+    const byCategory = new Map<string, CategoryGroup>();
+    for (const rule of rules?.rules ?? []) {
+      const key = rule.category ?? UNCATEGORIZED_FILTER;
+      const existing = byCategory.get(key) ?? {
+        key,
+        category: rule.category,
+        rules: [],
+        problematic: false,
+      };
+      existing.rules.push(rule);
+      existing.problematic ||= rule.state !== "inactive" || rule.hasError;
+      byCategory.set(key, existing);
+    }
+    return [...byCategory.values()].sort(
+      (left, right) =>
+        Number(right.problematic) - Number(left.problematic) ||
+        Number(left.category === null) - Number(right.category === null) ||
+        (left.category ?? "").localeCompare(right.category ?? ""),
+    );
+  }, [rules]);
 
-  const rows = useMemo<AvailabilityRow[]>(() => mergeAvailability(availability), [availability]);
-  const allErrors = useMemo(
-    () =>
-      [...(rules?.errors ?? []), ...availability.flatMap((snapshot) => snapshot.errors)].filter(
-        (error, index, items) =>
-          items.findIndex(
-            (candidate) =>
-              candidate.datasourceId === error.datasourceId && candidate.code === error.code,
-          ) === index,
-      ),
-    [availability, rules],
-  );
   const unavailable = runtimeMode === "unavailable";
   const showTotals = rules !== null && rules.dataState !== "unavailable" && !unavailable;
   const resetFilters = () => {
     setDatasourceId("");
+    setCategory("");
     setStateFilter("all");
     setQuery("");
     setDebouncedQuery("");
@@ -350,16 +584,16 @@ export function AlertsPage({
   const refresh = () => setRefreshVersion((value) => value + 1);
 
   return (
-    <div className="page-stack alerts-page">
+    <div className="page-stack alerts-page" aria-busy={rulesLoading}>
       <header className="alerts-heading">
         <span>
-          <small>{tx(language, "Данные Prometheus", "Prometheus evidence")}</small>
+          <small>{tx(language, "Каталог Prometheus", "Prometheus catalog")}</small>
           <h1>{tx(language, "Алерты", "Alerts")}</h1>
           <p>
             {tx(
               language,
-              "Правила, активные срабатывания и фактическая доступность целей.",
-              "Rules, active alert instances, and observed target availability.",
+              "Техническое состояние правил по категориям и datasources. Реакция на события — во вкладке «Инциденты».",
+              "Technical rule state by category and datasource. Event response stays in Incidents.",
             )}
           </p>
         </span>
@@ -373,7 +607,7 @@ export function AlertsPage({
             className="button button--quiet"
             type="button"
             onClick={refresh}
-            disabled={unavailable}
+            disabled={unavailable || rulesLoading}
           >
             {tx(language, "Обновить", "Refresh")}
           </button>
@@ -392,8 +626,8 @@ export function AlertsPage({
             <small>
               {tx(
                 language,
-                "Актуальные правила и временные ряды не могут быть подтверждены.",
-                "Current rules and time-series evidence cannot be verified.",
+                "Актуальное состояние правил не может быть подтверждено.",
+                "Current rule state cannot be verified.",
               )}
             </small>
           </span>
@@ -410,17 +644,18 @@ export function AlertsPage({
       <section className="alerts-kpis" aria-label={tx(language, "Сводка правил", "Rule summary")}>
         {[
           [
-            tx(language, "Всего правил", "Total rules"),
+            tx(language, "Уникальные правила", "Unique rules"),
             showTotals ? rules?.totals.rules : "—",
             "neutral",
           ],
-          ["Firing", showTotals ? rules?.totals.firingInstances : "—", "danger"],
-          ["Pending", showTotals ? rules?.totals.pendingInstances : "—", "warning"],
+          ["Firing", showTotals ? rules?.totals.firingRules : "—", "danger"],
+          ["Pending", showTotals ? rules?.totals.pendingRules : "—", "warning"],
           [
-            tx(language, "Ошибки правил", "Rule errors"),
-            showTotals ? rules?.totals.unhealthyRules : "—",
+            tx(language, "Ошибки вычисления", "Evaluation errors"),
+            showTotals ? rules?.totals.errorRules : "—",
             "danger",
           ],
+          ["Datasources", showTotals ? rules?.totals.datasources : "—", "neutral"],
         ].map(([label, value, tone]) => (
           <article className={`alerts-kpi alerts-kpi--${tone}`} key={label}>
             <small>{label}</small>
@@ -432,10 +667,26 @@ export function AlertsPage({
       <section className="alerts-panel" aria-labelledby="alert-rules-title">
         <header className="alerts-panel__head">
           <span>
-            <small>{tx(language, "Alert rules", "Alert rules")}</small>
+            <small>Alert rules</small>
             <h2 id="alert-rules-title">{tx(language, "Правила Prometheus", "Prometheus rules")}</h2>
           </span>
-          {rules?.generatedAt && <time>{formatDate(language, rules.generatedAt)}</time>}
+          <span className="alerts-panel__status">
+            {rules && showTotals ? (
+              <small>
+                {tx(
+                  language,
+                  `Показано ${rules.filteredRules} из ${rules.totals.rules}`,
+                  `Showing ${rules.filteredRules} of ${rules.totals.rules}`,
+                )}
+              </small>
+            ) : null}
+            {rules?.lastSuccessfulRefresh ? (
+              <time>
+                {tx(language, "Обновлено", "Updated")}{" "}
+                {formatDate(language, rules.lastSuccessfulRefresh)}
+              </time>
+            ) : null}
+          </span>
         </header>
         <div className="alerts-filters" role="search">
           <label className="alerts-search">
@@ -450,6 +701,29 @@ export function AlertsPage({
               placeholder={tx(language, "Поиск по имени правила", "Search rule name")}
               disabled={unavailable}
             />
+          </label>
+          <label>
+            <span className="sr-only">{tx(language, "Категория", "Category")}</span>
+            <select
+              value={category}
+              onChange={(event) => {
+                setCategory(event.target.value);
+                setPage(1);
+              }}
+              disabled={unavailable}
+            >
+              <option value="">{tx(language, "Все категории", "All categories")}</option>
+              {rules?.categories.map((value) => (
+                <option value={value} key={value}>
+                  {value}
+                </option>
+              ))}
+              {rules?.hasUncategorized ? (
+                <option value={UNCATEGORIZED_FILTER}>
+                  {tx(language, "Без категории", "Uncategorized")}
+                </option>
+              ) : null}
+            </select>
           </label>
           <label>
             <span className="sr-only">Datasource</span>
@@ -484,8 +758,8 @@ export function AlertsPage({
               <option value="all">{tx(language, "Все состояния", "All states")}</option>
               <option value="firing">Firing</option>
               <option value="pending">Pending</option>
-              <option value="inactive">{tx(language, "Неактивные", "Inactive")}</option>
               <option value="error">{tx(language, "С ошибкой", "Error")}</option>
+              <option value="inactive">{tx(language, "Неактивные", "Inactive")}</option>
             </select>
           </label>
           <button
@@ -502,7 +776,7 @@ export function AlertsPage({
           <div className="alerts-loading" role="status">
             {tx(language, "Загружаем правила…", "Loading alert rules…")}
           </div>
-        ) : rulesError ? (
+        ) : rulesError && !rules ? (
           <div className="alerts-empty" role="alert">
             <b>{tx(language, "Правила недоступны", "Alert rules unavailable")}</b>
             <span>{rulesError}</span>
@@ -510,72 +784,16 @@ export function AlertsPage({
               {tx(language, "Повторить", "Retry")}
             </button>
           </div>
-        ) : rules?.rules.length ? (
-          <div className={`alerts-table-wrap ${rulesLoading ? "is-refreshing" : ""}`}>
-            <table className="alerts-table">
-              <thead>
-                <tr>
-                  <th>{tx(language, "Правило", "Rule")}</th>
-                  <th>Datasource</th>
-                  <th>{tx(language, "Группа", "Group")}</th>
-                  <th>{tx(language, "Состояние", "State")}</th>
-                  <th>Firing</th>
-                  <th>Pending</th>
-                  <th>Health</th>
-                  <th>{tx(language, "Последнее вычисление", "Last evaluation")}</th>
-                  <th>{tx(language, "Ошибка", "Error")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rules.rules.map((rule) => (
-                  <tr key={rule.id}>
-                    <td data-label={tx(language, "Правило", "Rule")}>
-                      <span className="alert-rule-name">
-                        <b>{rule.name}</b>
-                        {rule.incidentsHref && (
-                          <button
-                            type="button"
-                            onClick={() => navigate(rule.incidentsHref ?? "/incidents")}
-                          >
-                            {tx(
-                              language,
-                              `Инциденты: ${rule.relatedIncidents}`,
-                              `Incidents: ${rule.relatedIncidents}`,
-                            )}
-                          </button>
-                        )}
-                      </span>
-                    </td>
-                    <td data-label="Datasource">{rule.datasourceName}</td>
-                    <td data-label={tx(language, "Группа", "Group")}>
-                      <span className="alert-rule-group">
-                        <b>{rule.group || "—"}</b>
-                        <small>{rule.file}</small>
-                      </span>
-                    </td>
-                    <td data-label={tx(language, "Состояние", "State")}>
-                      <RuleBadge rule={rule} language={language} />
-                    </td>
-                    <td data-label="Firing">{rule.firingInstances}</td>
-                    <td data-label="Pending">{rule.pendingInstances}</td>
-                    <td data-label="Health">
-                      <code>{rule.health}</code>
-                    </td>
-                    <td data-label={tx(language, "Последнее вычисление", "Last evaluation")}>
-                      <span className="alert-rule-evaluation">
-                        <time>{formatDate(language, rule.lastEvaluation)}</time>
-                        {rule.evaluationTimeSeconds !== null && (
-                          <small>{(rule.evaluationTimeSeconds * 1000).toFixed(1)} ms</small>
-                        )}
-                      </span>
-                    </td>
-                    <td data-label={tx(language, "Ошибка", "Error")} className="alert-rule-error">
-                      {rule.lastError ?? "—"}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+        ) : groups.length ? (
+          <div className={`alert-categories ${rulesLoading ? "is-refreshing" : ""}`}>
+            {groups.map((group) => (
+              <CategoryDisclosure
+                group={group}
+                language={language}
+                navigate={navigate}
+                key={`${group.key}:${String(group.problematic)}`}
+              />
+            ))}
           </div>
         ) : (
           <div className="alerts-empty" role="status">
@@ -587,14 +805,25 @@ export function AlertsPage({
                     "Подключите Prometheus datasource.",
                     "Connect a Prometheus datasource.",
                   )
-                : tx(
-                    language,
-                    "Измените фильтры или добавьте правила в Prometheus.",
-                    "Change filters or add rules in Prometheus.",
-                  )}
+                : rules?.dataState === "empty"
+                  ? tx(
+                      language,
+                      "Prometheus не вернул alert rules.",
+                      "Prometheus returned no alert rules.",
+                    )
+                  : tx(
+                      language,
+                      "Измените фильтры или добавьте правила в Prometheus.",
+                      "Change filters or add rules in Prometheus.",
+                    )}
             </span>
           </div>
         )}
+        {rulesError && rules ? (
+          <p className="alerts-inline-warning" role="status">
+            {rulesError}
+          </p>
+        ) : null}
         {rules && rules.pagination.totalPages > 1 && (
           <nav
             className="alerts-pagination"
@@ -627,99 +856,7 @@ export function AlertsPage({
         )}
       </section>
 
-      <section className="alerts-panel" aria-labelledby="observed-availability-title">
-        <header className="alerts-panel__head">
-          <span>
-            <small>probe_success</small>
-            <h2 id="observed-availability-title">
-              {tx(language, "Наблюдаемая доступность", "Observed availability")}
-            </h2>
-          </span>
-        </header>
-        {availabilityLoading && !availability.length ? (
-          <div className="alerts-loading" role="status">
-            {tx(language, "Рассчитываем доступность…", "Calculating availability…")}
-          </div>
-        ) : availabilityError && !rows.length ? (
-          <div className="alerts-empty" role="alert">
-            <b>{tx(language, "Доступность не рассчитана", "Availability unavailable")}</b>
-            <span>{availabilityError}</span>
-          </div>
-        ) : rows.length ? (
-          <div className={`alerts-table-wrap ${availabilityLoading ? "is-refreshing" : ""}`}>
-            <table className="alerts-table alerts-availability-table">
-              <thead>
-                <tr>
-                  <th>{tx(language, "Цель", "Target")}</th>
-                  <th>{tx(language, "Источник / регион", "Source / region")}</th>
-                  <th>24h</th>
-                  <th>7d</th>
-                  <th>30d</th>
-                  <th>{tx(language, "Актуальность", "Freshness")}</th>
-                  <th>{tx(language, "Последний sample", "Last sample")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row) => {
-                  const evidence = row.windows["24h"] ?? row.windows["7d"] ?? row.windows["30d"];
-                  const states = Object.values(row.windows).map((item) => item?.dataState);
-                  const freshness = states.includes("unknown")
-                    ? "unknown"
-                    : states.includes("stale")
-                      ? "stale"
-                      : "ok";
-                  return (
-                    <tr key={row.key}>
-                      <td data-label={tx(language, "Цель", "Target")}>
-                        <b>{row.target}</b>
-                        <small className="alerts-cell-note">{row.datasourceName}</small>
-                      </td>
-                      <td data-label={tx(language, "Источник / регион", "Source / region")}>
-                        {row.source}
-                      </td>
-                      {WINDOWS.map((window) => (
-                        <td data-label={window} key={window}>
-                          <AvailabilityValue target={row.windows[window]} language={language} />
-                        </td>
-                      ))}
-                      <td data-label={tx(language, "Актуальность", "Freshness")}>
-                        <span className={`alert-state alert-state--${freshness}`}>
-                          {freshness === "ok"
-                            ? tx(language, "Актуально", "Current")
-                            : freshness === "stale"
-                              ? tx(language, "Устарело", "Stale")
-                              : tx(language, "Нет данных", "Unknown")}
-                        </span>
-                      </td>
-                      <td data-label={tx(language, "Последний sample", "Last sample")}>
-                        <time>{formatDate(language, evidence?.lastSampleAt ?? null)}</time>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <div className="alerts-empty" role="status">
-            <b>{tx(language, "Нет данных о доступности", "No availability data")}</b>
-            <span>
-              {tx(
-                language,
-                "Отсутствующие samples не считаются нулевой или полной доступностью.",
-                "Missing samples are not treated as zero or full availability.",
-              )}
-            </span>
-          </div>
-        )}
-        {availabilityError && rows.length > 0 && (
-          <p className="alerts-inline-warning" role="status">
-            {availabilityError}
-          </p>
-        )}
-      </section>
-
-      {allErrors.length > 0 && (
+      {(rules?.errors.length ?? 0) > 0 && (
         <section className="alerts-panel" aria-labelledby="alerts-errors-title">
           <header className="alerts-panel__head">
             <span>
@@ -730,7 +867,7 @@ export function AlertsPage({
             </span>
           </header>
           <ul className="alerts-errors">
-            {allErrors.map((error) => (
+            {rules?.errors.map((error) => (
               <li key={`${error.datasourceId}-${error.code}`}>
                 <b>{error.datasourceName}</b>
                 <code>{error.code}</code>

@@ -98,9 +98,11 @@ Alert on at least:
 
 `GET /api/v1/incidents` performs filtering and pagination on the serving node. It accepts
 `status` (`active`, `open`, `acknowledged`, `resolved`, or `silenced`), `severity`, `source_id`,
-`q`, `limit`, and `offset`. The response `total` applies the complete filter, while `counts`
-applies the severity/source/search filters and reports every status so the UI can change status
-tabs without downloading the journal. `status=active` means open, acknowledged, or silenced.
+`q`, exact `alertname`, exact Prometheus `datasource_id`, `limit`, and `offset`. The response `total`
+applies the complete filter, while `counts` applies every filter except status and reports every
+status so the UI can change status tabs without downloading the journal. `status=active` means
+open, acknowledged, or silenced. Alerts catalog links use the two exact label filters rather than a
+broad title search.
 
 Use `view=compact` for list screens. Compact rows retain identity, status, timestamps, source,
 region/target hints, and bounded Check relations, set `summary_only: true`, and omit the potentially
@@ -113,9 +115,9 @@ in-flight refresh plus one trailing refresh.
 `POST /api/v1/incidents/bulk-action` supports one of two explicit selection modes:
 
 - `ids`: up to 500 unique `incident_ids` selected across visible pages;
-- `filter`: the same status/severity/source/search filter as the list, plus up to 500 explicit
-  `excluded_incident_ids`. The server rejects a matching population above 500 instead of silently
-  truncating it.
+- `filter`: the same status/severity/source/search/exact-rule filter as the list, plus up to 500
+  explicit `excluded_incident_ids`. The server rejects a matching population above 500 instead of
+  silently truncating it.
 
 The actions are `acknowledge`, `resolve`, and `silence`. Every changed incident produces the same
 append-only replicated incident event and audit record as its single-item operation. Repeating an
@@ -126,20 +128,25 @@ invalid transitions such as acknowledging a resolved incident are reported per i
 so clients must display its per-item failures. The UI keeps that result visible after clearing the
 successful selection and asks for confirmation before bulk resolve.
 
-## Alerts and observed availability
+## Alert catalog and observed availability API
 
-The `/alerts` screen reads alerting rules from every enabled Prometheus datasource and shows rule
-counts separately from firing and pending alert-instance counts. `GET /api/v1/alert-rules` supports
-stable server pagination plus `datasource_id`, `state`, and rule-name `q` filters. A rule links to
-incidents only when an ingested incident carries both the exact `alertname` and the rule's
-`prometheus_datasource_id`; Alert Hub does not guess a datasource relationship from a shared rule
-name.
+The `/alerts` screen is a technical catalog, not a second active-incident queue. It reads alerting
+rules from every enabled Prometheus datasource, groups them by arbitrary `alert_category`, puts
+rules without that label under an uncategorized group, and merges matching category/name HA rules
+while retaining a card for every datasource replica. Problem categories and rules open
+automatically; healthy groups may stay collapsed. Global counters use unique logical rules rather
+than summing replicas. `GET /api/v1/alert-rules` supports stable server pagination plus exact
+category/uncategorized, `datasource_id`, `state`, and rule-name `q` filters. Firing and pending
+replicas link to Incidents with exact `alertname` and `prometheus_datasource_id`; acknowledge,
+resolve, silence, and bulk actions remain only in Incidents.
 
 `GET /api/v1/availability?window=24h|7d|30d` evaluates backend-owned expressions over
 `probe_success`. Canonical datasources use `source_region × target_name`; datasource configured in
 server mode use `source_server × target_server`. Missing samples remain unknown, and a last sample
 older than `AVAILABILITY_STALE_AFTER_SECONDS` (300 seconds by default) is marked stale. The values
 are observed measurements, not contractual objectives, and no range samples are stored in SQLite.
+This endpoint remains available to purpose-built monitoring surfaces but is not rendered inside
+the Alerts catalog.
 
 The existing Prometheus response byte and sample limits apply independently to the rules response
 and every availability vector. Repeated `partial`, `unavailable`, `response_too_large`, or

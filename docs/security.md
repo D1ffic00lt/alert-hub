@@ -96,12 +96,13 @@ unrelated address, verify the peer hostname fails closed.
 ### Checks data boundary
 
 The `/api/v1/alert-rules` and `/api/v1/availability` operations reuse the same authenticated,
-SSRF-checked Prometheus transport. The browser can select only a datasource filter, rule state,
-rule-name search, pagination, and one of the three fixed availability windows; it cannot provide an
-upstream URL or PromQL. Rule labels and annotations are count- and length-bounded, last evaluation
-errors are stripped of URLs and credential-shaped values, and datasource failures are mapped to a
-small public code/detail allowlist. Prometheus response bodies and raw exceptions never enter these
-responses.
+SSRF-checked Prometheus transport. The browser can select only datasource, exact dynamic category,
+uncategorized, rule state, rule-name search, pagination, and one of the three fixed availability
+windows; it cannot provide an upstream URL or PromQL. Categories come only from the bounded
+`alert_category` label returned by Prometheus and are never inferred from a rule name. Rule labels
+and annotations are count- and length-bounded, last evaluation errors are stripped of URLs and
+credential-shaped values, and datasource failures are mapped to a small public code/detail
+allowlist. Prometheus response bodies and raw exceptions never enter these responses.
 
 Checks reuses the validated Prometheus datasource transport and cannot select an upstream URL,
 metric name, or PromQL from request parameters. All twelve query expressions are fixed on the

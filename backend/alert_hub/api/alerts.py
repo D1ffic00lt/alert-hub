@@ -60,9 +60,14 @@ _PUBLIC_FAILURE_DETAILS = {
 }
 
 
-def _stable_rule_id(datasource_id: str, rule: AlertRule) -> str:
-    identity = "\0".join((datasource_id, rule.file, rule.group, rule.name)).encode()
+def _stable_rule_id(category: str | None, name: str) -> str:
+    identity = "\0".join((category or "", name)).encode()
     return f"ar_{hashlib.sha256(identity).hexdigest()}"
+
+
+def _stable_replica_id(datasource_id: str, rule: AlertRule) -> str:
+    identity = "\0".join((datasource_id, rule.file, rule.group, rule.name)).encode()
+    return f"arr_{hashlib.sha256(identity).hexdigest()}"
 
 
 def _failure_response(failure: DatasourceQueryFailure) -> dict[str, str]:
@@ -79,15 +84,18 @@ def _failure_response(failure: DatasourceQueryFailure) -> dict[str, str]:
 def _data_state(
     datasource_count: int,
     *,
-    has_data: bool,
+    has_success: bool,
+    has_rules: bool,
     failures: list[DatasourceQueryFailure],
-) -> Literal["ok", "partial", "unavailable", "not_configured"]:
+) -> Literal["ok", "partial", "empty", "unavailable", "not_configured"]:
     if datasource_count == 0:
         return "not_configured"
-    if failures and has_data:
+    if failures and has_success:
         return "partial"
     if failures:
         return "unavailable"
+    if not has_rules:
+        return "empty"
     return "ok"
 
 
@@ -106,14 +114,19 @@ def _incident_counts(db: Session) -> dict[tuple[str, str], int]:
     }
 
 
-def _rule_response(
+def _rule_category(rule: AlertRule) -> str | None:
+    category = rule.labels.get("alert_category", "").strip()
+    return category or None
+
+
+def _replica_response(
     result: DatasourceRulesResult,
     rule: AlertRule,
     incident_counts: dict[tuple[str, str], int],
 ) -> dict[str, Any]:
     related_incidents = incident_counts.get((result.datasource_id, rule.name), 0)
     return {
-        "id": _stable_rule_id(result.datasource_id, rule),
+        "id": _stable_replica_id(result.datasource_id, rule),
         "datasource_id": result.datasource_id,
         "datasource_name": result.datasource_name,
         "group": rule.group,
@@ -130,15 +143,98 @@ def _rule_response(
         "annotations": rule.annotations,
         "related_incidents": related_incidents,
         "incidents_href": (
-            f"/incidents?q={quote(rule.name, safe='')}" if related_incidents > 0 else None
+            "/incidents?"
+            f"alertname={quote(rule.name, safe='')}&"
+            f"datasource_id={quote(result.datasource_id, safe='')}"
+            if rule.state in {"firing", "pending"}
+            else None
         ),
     }
+
+
+def _replica_has_error(replica: dict[str, Any]) -> bool:
+    return replica["health"] != "ok" or bool(replica["last_error"])
+
+
+def _replica_is_firing(replica: dict[str, Any]) -> bool:
+    return replica["state"] == "firing" or int(replica["firing_instances"]) > 0
+
+
+def _replica_is_pending(replica: dict[str, Any]) -> bool:
+    return replica["state"] == "pending" or int(replica["pending_instances"]) > 0
+
+
+def _rule_state(replicas: list[dict[str, Any]]) -> AlertRuleFilter:
+    if any(_replica_is_firing(replica) for replica in replicas):
+        return "firing"
+    if any(_replica_is_pending(replica) for replica in replicas):
+        return "pending"
+    if any(_replica_has_error(replica) for replica in replicas):
+        return "error"
+    return "inactive"
+
+
+def _grouped_rule_response(
+    category: str | None,
+    name: str,
+    replicas: list[dict[str, Any]],
+) -> dict[str, Any]:
+    replicas.sort(
+        key=lambda item: (
+            str(item["datasource_name"]).casefold(),
+            str(item["datasource_id"]),
+            str(item["file"]),
+            str(item["group"]).casefold(),
+            str(item["id"]),
+        )
+    )
+    return {
+        "id": _stable_rule_id(category, name),
+        "name": name,
+        "category": category,
+        "state": _rule_state(replicas),
+        "firing_instances": sum(int(replica["firing_instances"]) for replica in replicas),
+        "pending_instances": sum(int(replica["pending_instances"]) for replica in replicas),
+        "has_error": any(_replica_has_error(replica) for replica in replicas),
+        "datasource_count": len({str(replica["datasource_id"]) for replica in replicas}),
+        "related_incidents": sum(int(replica["related_incidents"]) for replica in replicas),
+        "replicas": replicas,
+    }
+
+
+def _group_rules(
+    results: list[DatasourceRulesResult],
+    incident_counts: dict[tuple[str, str], int],
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str | None, str], list[dict[str, Any]]] = {}
+    for result in results:
+        for rule in result.rules:
+            category = _rule_category(rule)
+            grouped.setdefault((category, rule.name), []).append(
+                _replica_response(result, rule, incident_counts)
+            )
+    return [
+        _grouped_rule_response(category, name, replicas)
+        for (category, name), replicas in grouped.items()
+    ]
+
+
+def _rule_sort_key(item: dict[str, Any]) -> tuple[int, str, str, str]:
+    rank = {"firing": 0, "pending": 1, "error": 2, "inactive": 3}
+    return (
+        rank[str(item["state"])],
+        str(item["category"] or "").casefold(),
+        str(item["name"]).casefold(),
+        str(item["id"]),
+    )
 
 
 @router.get("/alert-rules")
 async def alert_rules(
     request: Request,
     datasource_id: str | None = Query(default=None, max_length=36),
+    category: str | None = Query(default=None, max_length=2_048),
+    uncategorized: bool = False,
     state: AlertRuleFilter | None = None,
     q: str | None = Query(default=None, max_length=200),
     page: int = Query(default=1, ge=1),
@@ -155,48 +251,67 @@ async def alert_rules(
     results, transport_failures = await query_datasource_rules_targets(targets, prometheus)
     failures.extend(transport_failures)
 
-    all_rules = [
-        _rule_response(result, rule, incident_counts) for result in results for rule in result.rules
-    ]
-    all_rules.sort(
-        key=lambda item: (
-            str(item["datasource_name"]).casefold(),
-            str(item["datasource_id"]),
-            str(item["file"]),
-            str(item["group"]).casefold(),
-            str(item["name"]).casefold(),
-            str(item["id"]),
-        )
-    )
+    all_rules = _group_rules(results, incident_counts)
+    all_rules.sort(key=_rule_sort_key)
     totals = {
         "rules": len(all_rules),
-        "firing_instances": sum(int(item["firing_instances"]) for item in all_rules),
-        "pending_instances": sum(int(item["pending_instances"]) for item in all_rules),
-        "unhealthy_rules": sum(item["health"] != "ok" for item in all_rules),
+        "firing_rules": sum(item["state"] == "firing" for item in all_rules),
+        "pending_rules": sum(
+            any(_replica_is_pending(replica) for replica in item["replicas"]) for item in all_rules
+        ),
+        "error_rules": sum(bool(item["has_error"]) for item in all_rules),
+        "datasources": datasource_count,
         "related_incidents": sum(int(item["related_incidents"]) for item in all_rules),
     }
+    categories = sorted(
+        {str(item["category"]) for item in all_rules if item["category"] is not None},
+        key=str.casefold,
+    )
+    has_uncategorized = any(item["category"] is None for item in all_rules)
 
     needle = q.strip().casefold() if q else ""
-    filtered = [
-        item
-        for item in all_rules
-        if (datasource_id is None or item["datasource_id"] == datasource_id)
-        and (not needle or needle in str(item["name"]).casefold())
-        and (
-            state is None
-            or (state == "error" and item["health"] != "ok")
-            or (state != "error" and item["state"] == state)
-        )
-    ]
+    filtered: list[dict[str, Any]] = []
+    for item in all_rules:
+        if category is not None and item["category"] != category:
+            continue
+        if uncategorized and item["category"] is not None:
+            continue
+        if needle and needle not in str(item["name"]).casefold():
+            continue
+        replicas = item["replicas"]
+        if datasource_id is not None:
+            replicas = [
+                replica for replica in replicas if replica["datasource_id"] == datasource_id
+            ]
+            if not replicas:
+                continue
+            item = _grouped_rule_response(item["category"], str(item["name"]), replicas)
+        if state == "error" and not item["has_error"]:
+            continue
+        if state in {"firing", "pending"} and not any(
+            (_replica_is_firing(replica) if state == "firing" else _replica_is_pending(replica))
+            for replica in item["replicas"]
+        ):
+            continue
+        if state == "inactive" and item["state"] != "inactive":
+            continue
+        filtered.append(item)
+    filtered.sort(key=_rule_sort_key)
     offset = (page - 1) * page_size
+    generated_at = utc_now()
     return {
         "data_state": _data_state(
             datasource_count,
-            has_data=bool(results),
+            has_success=bool(results),
+            has_rules=bool(all_rules),
             failures=failures,
         ),
-        "generated_at": utc_now(),
+        "generated_at": generated_at,
+        "last_successful_refresh": generated_at if results else None,
         "totals": totals,
+        "filtered_rules": len(filtered),
+        "categories": categories,
+        "has_uncategorized": has_uncategorized,
         "rules": filtered[offset : offset + page_size],
         "pagination": {
             "page": page,
@@ -341,7 +456,8 @@ async def availability(
     return {
         "data_state": _data_state(
             datasource_count,
-            has_data=bool(average_results or count_results or last_results),
+            has_success=bool(average_results or count_results or last_results),
+            has_rules=bool(rows),
             failures=public_failures,
         ),
         "generated_at": generated_at,

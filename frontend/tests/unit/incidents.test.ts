@@ -140,12 +140,14 @@ describe("incident list request", () => {
       status: "active",
       severity: "critical",
       query: " api % ",
+      alertname: "ApiDown",
+      datasourceId: "prom-ru",
       limit: 50,
       offset: 100,
     });
 
     expect(path).toBe(
-      "/incidents?limit=50&offset=100&view=compact&status=active&severity=critical&q=api+%25",
+      "/incidents?limit=50&offset=100&view=compact&status=active&severity=critical&q=api+%25&alertname=ApiDown&datasource_id=prom-ru",
     );
   });
 });

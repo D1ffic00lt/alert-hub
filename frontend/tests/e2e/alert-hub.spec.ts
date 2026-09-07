@@ -732,54 +732,140 @@ async function installApi(page: Page, state: MockState) {
       await fulfill(route, {
         data_state: "partial",
         generated_at: "2026-09-07T00:00:00Z",
+        last_successful_refresh: "2026-09-07T00:00:00Z",
         totals: {
-          rules: 2,
-          firing_instances: 2,
-          pending_instances: 1,
-          unhealthy_rules: 1,
+          rules: 3,
+          firing_rules: 1,
+          pending_rules: 1,
+          error_rules: 1,
+          datasources: 3,
           related_incidents: 2,
         },
+        filtered_rules: 3,
+        categories: ["infrastructure", "tls"],
+        has_uncategorized: true,
         rules: [
           {
             id: "rule-api-down",
-            datasource_id: "prom-1",
-            datasource_name: "Primary Prometheus",
-            group: "platform",
-            file: "platform.yml",
             name: "ApiDown",
+            category: "infrastructure",
             state: "firing",
-            health: "ok",
             firing_instances: 2,
-            pending_instances: 0,
-            last_evaluation: "2026-09-07T00:00:00Z",
-            evaluation_time_seconds: 0.012,
-            last_error: null,
+            pending_instances: 1,
+            has_error: false,
+            datasource_count: 2,
             related_incidents: 2,
-            incidents_href: "/incidents?q=ApiDown",
+            replicas: [
+              {
+                id: "rule-api-down-primary",
+                datasource_id: "prom-1",
+                datasource_name: "Primary Prometheus",
+                group: "platform",
+                file: "platform.yml",
+                name: "ApiDown",
+                state: "firing",
+                health: "ok",
+                firing_instances: 2,
+                pending_instances: 0,
+                last_evaluation: "2026-09-07T00:00:00Z",
+                evaluation_time_seconds: 0.012,
+                last_error: null,
+                labels: { alert_category: "infrastructure", severity: "critical" },
+                annotations: { summary: "API down" },
+                related_incidents: 2,
+                incidents_href: "/incidents?alertname=ApiDown&datasource_id=prom-1",
+              },
+              {
+                id: "rule-api-down-secondary",
+                datasource_id: "prom-2",
+                datasource_name: "Secondary Prometheus",
+                group: "platform",
+                file: "platform.yml",
+                name: "ApiDown",
+                state: "pending",
+                health: "ok",
+                firing_instances: 0,
+                pending_instances: 1,
+                last_evaluation: "2026-09-07T00:00:00Z",
+                evaluation_time_seconds: 0.01,
+                last_error: null,
+                labels: { alert_category: "infrastructure", severity: "critical" },
+                annotations: { summary: "API down" },
+                related_incidents: 0,
+                incidents_href: "/incidents?alertname=ApiDown&datasource_id=prom-2",
+              },
+            ],
           },
           {
             id: "rule-forecast",
-            datasource_id: "prom-1",
-            datasource_name: "Primary Prometheus",
-            group: "storage",
-            file: "storage.yml",
             name: "DiskForecast",
-            state: "pending",
-            health: "error",
+            category: null,
+            state: "error",
             firing_instances: 0,
-            pending_instances: 1,
-            last_evaluation: "2026-09-07T00:00:00Z",
-            evaluation_time_seconds: 0.008,
-            last_error: "query evaluation failed",
+            pending_instances: 0,
+            has_error: true,
+            datasource_count: 1,
             related_incidents: 0,
-            incidents_href: null,
+            replicas: [
+              {
+                id: "rule-forecast-primary",
+                datasource_id: "prom-1",
+                datasource_name: "Primary Prometheus",
+                group: "storage",
+                file: "storage.yml",
+                name: "DiskForecast",
+                state: "inactive",
+                health: "error",
+                firing_instances: 0,
+                pending_instances: 0,
+                last_evaluation: "2026-09-07T00:00:00Z",
+                evaluation_time_seconds: 0.008,
+                last_error: "query evaluation failed",
+                labels: { severity: "warning" },
+                annotations: {},
+                related_incidents: 0,
+                incidents_href: null,
+              },
+            ],
+          },
+          {
+            id: "rule-tls",
+            name: "TlsCertificateExpiringSoon",
+            category: "tls",
+            state: "inactive",
+            firing_instances: 0,
+            pending_instances: 0,
+            has_error: false,
+            datasource_count: 1,
+            related_incidents: 0,
+            replicas: [
+              {
+                id: "rule-tls-primary",
+                datasource_id: "prom-1",
+                datasource_name: "Primary Prometheus",
+                group: "tls",
+                file: "tls.yml",
+                name: "TlsCertificateExpiringSoon",
+                state: "inactive",
+                health: "ok",
+                firing_instances: 0,
+                pending_instances: 0,
+                last_evaluation: "2026-09-07T00:00:00Z",
+                evaluation_time_seconds: 0.004,
+                last_error: null,
+                labels: { alert_category: "tls", severity: "warning" },
+                annotations: {},
+                related_incidents: 0,
+                incidents_href: null,
+              },
+            ],
           },
         ],
-        pagination: { page: 1, page_size: 25, total_items: 2, total_pages: 1 },
+        pagination: { page: 1, page_size: 25, total_items: 3, total_pages: 1 },
         errors: [
           {
-            datasource_id: "prom-2",
-            datasource_name: "Secondary Prometheus",
+            datasource_id: "prom-3",
+            datasource_name: "Unavailable Prometheus",
             code: "timeout",
             detail: "Prometheus request timed out",
           },
@@ -2154,7 +2240,7 @@ test("Checks disabled route is explicit and a refresh failure clears the previou
   await expect(page.getByText("check_ttfb_unavailable")).toBeVisible();
 });
 
-test("Alerts separates rules and instances, surfaces partial and stale data, and stays responsive", async ({
+test("Alerts groups HA rules by dynamic category, preserves datasource state, and stays responsive", async ({
   page,
 }) => {
   const state: MockState = {
@@ -2175,38 +2261,73 @@ test("Alerts separates rules and instances, surfaces partial and stale data, and
   await expect(page).toHaveURL(/\/alerts$/);
   await expect(page.getByRole("heading", { name: "Алерты", exact: true })).toBeVisible();
   const cards = page.locator(".alerts-kpi");
-  await expect(cards).toHaveCount(4);
-  await expect(cards.nth(0)).toContainText("2");
-  await expect(cards.nth(1)).toContainText("2");
+  await expect(cards).toHaveCount(5);
+  await expect(cards.nth(0)).toContainText("3");
+  await expect(cards.nth(1)).toContainText("1");
   await expect(cards.nth(2)).toContainText("1");
   await expect(cards.nth(3)).toContainText("1");
+  await expect(cards.nth(4)).toContainText("3");
   await expect(page.getByText("Данные получены частично", { exact: true })).toBeVisible();
-  await expect(page.getByText("ApiDown", { exact: true })).toBeVisible();
+  await expect(page.getByText("ApiDown", { exact: true })).toHaveCount(1);
   await expect(page.getByText("DiskForecast", { exact: true })).toBeVisible();
-  await expect(page.getByText("Устарело", { exact: true }).first()).toBeVisible();
-  await expect(page.locator(".availability-value--unknown").first()).toHaveText("—");
+  await expect(
+    page.locator(".alert-category > summary b").filter({ hasText: /^infrastructure$/ }),
+  ).toBeVisible();
+  await expect(
+    page.locator(".alert-category > summary b").filter({ hasText: /^Без категории$/ }),
+  ).toBeVisible();
+  await expect(page.getByRole("option", { name: "tls" })).toHaveCount(1);
+  await expect(page.getByRole("option", { name: "Без категории" })).toHaveCount(1);
+  await expect(page.getByText("Наблюдаемая доступность", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Primary Prometheus", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Secondary Prometheus", { exact: true })).toBeVisible();
+  await expect(page.getByText("Unavailable Prometheus", { exact: true })).toBeVisible();
+  await expect(
+    page.locator(".alert-category").filter({ hasText: "infrastructure" }),
+  ).toHaveAttribute("open", "");
+  await expect(page.locator(".alert-category").filter({ hasText: "tls" })).not.toHaveAttribute(
+    "open",
+    "",
+  );
 
   const search = page.getByPlaceholder("Поиск по имени правила");
   await search.focus();
   await expect(search).toBeFocused();
-  await page.getByRole("button", { name: "Инциденты: 2" }).click();
-  await expect(page).toHaveURL(/\/incidents\?q=ApiDown$/);
-  await expect(page.getByRole("textbox", { name: /Поиск инцидентов/ })).toHaveValue("ApiDown");
+  const apiRule = page.locator(".alert-rule").filter({ hasText: "ApiDown" });
+  const primaryReplica = apiRule
+    .locator(".alert-replica")
+    .filter({ hasText: "Primary Prometheus" });
+  await primaryReplica.locator(".alert-labels > summary").click();
+  await expect(primaryReplica.getByText("alert_category", { exact: true })).toBeVisible();
+  await primaryReplica.getByRole("button", { name: "Открыть инциденты · 2" }).click();
+  await expect(page).toHaveURL(/\/incidents\?alertname=ApiDown&datasource_id=prom-1$/);
+  await expect(page.getByText("Точный фильтр правила", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("alertname=ApiDown · datasource=prom-1", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("textbox", { name: /Поиск инцидентов/ })).toHaveValue("");
 
-  await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole("button", { name: "Алерты", exact: true }).click();
-  await expect(page.locator(".alerts-table").first().locator("tbody tr").first()).toBeVisible();
-  const overflow = await page.evaluate(() => ({
-    clientWidth: document.documentElement.clientWidth,
-    scrollWidth: document.documentElement.scrollWidth,
-  }));
-  expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
-
-  await page.evaluate(() => document.documentElement.setAttribute("data-theme", "light"));
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
-  await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  for (const viewport of [
+    { width: 1280, height: 900 },
+    { width: 820, height: 1050 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await expect(page.locator(".alert-category").first()).toBeVisible();
+    for (const theme of ["light", "dark"] as const) {
+      await page.evaluate(
+        (value) => document.documentElement.setAttribute("data-theme", value),
+        theme,
+      );
+      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      const overflow = await page.evaluate(() => ({
+        clientWidth: document.documentElement.clientWidth,
+        scrollWidth: document.documentElement.scrollWidth,
+      }));
+      expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
+    }
+  }
 });
 
 test("Web Push surfaces node errors, rotates stale keys, and binds the login device", async ({

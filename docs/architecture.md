@@ -20,10 +20,13 @@ continue to own detailed infrastructure time-series.
 The authenticated Alerts read model uses the same outbound Prometheus boundary. Rule inventory is
 read directly from `/api/v1/rules?type=alert`; observed availability is calculated on demand with
 fixed `avg_over_time`, `count_over_time`, and `last_over_time` expressions for exactly `24h`, `7d`,
-or `30d`. Neither result is persisted in SQLite. Rules retain datasource identity and a stable hash
-of datasource, file, group, and rule name, so similarly named rules from different Prometheus
-instances are never merged. A datasource failure produces an explicit partial result when another
-datasource answered.
+or `30d`. Neither result is persisted in SQLite. The Alerts catalog groups rules by the arbitrary
+Prometheus label `alert_category`, with a separate uncategorized group when the label is absent.
+Replicas with the same category and alert name are one logical rule while their datasource, file,
+group, state, instance counts, evaluation health, error, labels, and annotations remain separate.
+Availability evidence is not mixed into that catalog; the regional matrix and Checks remain their
+own screens. A datasource failure produces an explicit partial result when another datasource
+answered.
 
 ```mermaid
 flowchart LR
