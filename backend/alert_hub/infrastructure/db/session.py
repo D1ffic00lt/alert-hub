@@ -6,10 +6,11 @@ from pathlib import Path
 from sqlalchemy import Engine, create_engine, event, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool, StaticPool
 
 from alert_hub.infrastructure.db.base import Base, utc_now
 from alert_hub.infrastructure.db.models import Node
+from alert_hub.metrics import DB_POOL_CONNECTIONS, DB_POOL_EVENTS
 from alert_hub.settings import Settings
 
 
@@ -28,7 +29,56 @@ def create_db_engine(settings: Settings) -> Engine:
         kwargs["connect_args"] = {"check_same_thread": False}
         if url.database in {None, "", ":memory:"}:
             kwargs["poolclass"] = StaticPool
+        else:
+            kwargs.update(
+                pool_size=settings.database_pool_size,
+                max_overflow=settings.database_max_overflow,
+                pool_timeout=settings.database_pool_timeout_seconds,
+                pool_use_lifo=True,
+            )
     engine = create_engine(settings.database_url, **kwargs)
+
+    pool_node_id = settings.node_id
+
+    def update_queue_pool_metrics() -> None:
+        if not isinstance(engine.pool, QueuePool):
+            return
+        DB_POOL_CONNECTIONS.labels(node_id=pool_node_id, state="checked_out").set(
+            engine.pool.checkedout()
+        )
+        DB_POOL_CONNECTIONS.labels(node_id=pool_node_id, state="overflow").set(
+            max(0, engine.pool.overflow())
+        )
+
+    @event.listens_for(engine, "connect")
+    def record_pool_connect(dbapi_connection: object, connection_record: object) -> None:
+        del dbapi_connection, connection_record
+        DB_POOL_EVENTS.labels(node_id=pool_node_id, event="connect").inc()
+        DB_POOL_CONNECTIONS.labels(node_id=pool_node_id, state="open").inc()
+        update_queue_pool_metrics()
+
+    @event.listens_for(engine, "close")
+    def record_pool_close(dbapi_connection: object, connection_record: object) -> None:
+        del dbapi_connection, connection_record
+        DB_POOL_EVENTS.labels(node_id=pool_node_id, event="close").inc()
+        DB_POOL_CONNECTIONS.labels(node_id=pool_node_id, state="open").dec()
+        update_queue_pool_metrics()
+
+    @event.listens_for(engine, "checkout")
+    def record_pool_checkout(
+        dbapi_connection: object,
+        connection_record: object,
+        connection_proxy: object,
+    ) -> None:
+        del dbapi_connection, connection_record, connection_proxy
+        DB_POOL_EVENTS.labels(node_id=pool_node_id, event="checkout").inc()
+        update_queue_pool_metrics()
+
+    @event.listens_for(engine, "checkin")
+    def record_pool_checkin(dbapi_connection: object, connection_record: object) -> None:
+        del dbapi_connection, connection_record
+        DB_POOL_EVENTS.labels(node_id=pool_node_id, event="checkin").inc()
+        update_queue_pool_metrics()
 
     if url.get_backend_name() == "sqlite":
 

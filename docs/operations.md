@@ -600,6 +600,8 @@ also flattened to one line before the message is constructed.
 ## Capacity and SQLite care
 
 - Keep the database on a local durable filesystem and ensure the volume supports fsync and file locking.
+- Keep `DATABASE_PUBLIC_READ_LIMIT` below `DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW`; startup rejects a value that leaves no reserved priority capacity. The defaults reserve seven connections and queue public reads outside the synchronous request workers for at most five seconds.
+- Scrape `alert_hub_db_pool_connections`, `alert_hub_db_pool_events_total`, `alert_hub_db_pool_acquire_seconds`, and `alert_hub_db_pool_acquire_timeouts_total`. A sustained checked-out/overflow plateau or any acquisition timeouts requires investigation; do not respond only by enlarging the pool.
 - Leave headroom for the DB, WAL, one online backup, a pulled image, and migration temporary space. The wrapper enforces at least 1 GiB on Docker storage and 1 GiB plus the current DB/WAL/SHM footprint on application data; site policy should be larger.
 - Do not copy a live `.db` file with ordinary `cp`; use the backup API.
 - Do not run two application containers against the same file.
@@ -611,6 +613,10 @@ also flattened to one line before the message is constructed.
 Container logs rotate at five 10 MiB files by default. `LOG_FORMAT=json` is the production default; `LOG_FORMAT=text` is intended for local development. `LOG_LEVEL` accepts `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` (case-insensitive). Invalid values fail settings validation rather than silently changing verbosity.
 
 JSON application records contain an RFC 3339 UTC timestamp, level, logger, stable event/message, and an explicit allowlist of scalar context such as request, node, source, incident, channel, route, outbox, and peer identifiers. Exception records include the exception type and a bounded redacted trace. Arbitrary `extra` values are dropped: authorization/cookie fields, request bodies, provider responses, peer URLs, and unapproved dictionaries are not serialized. Sensitive labelled values and bearer material are redacted as a second boundary; callers must still never pass secrets to a logger.
+
+`database_connection_acquire_timeout` identifies a bounded public-read queue or SQLAlchemy pool
+timeout and includes only the request ID, path, method, node, wait duration, and database lane. It
+never includes SQL text, parameters, credentials, or request content.
 
 The request boundary accepts a caller/proxy `X-Request-ID` only when it is 1–128 safe ASCII identifier characters; otherwise it generates a UUID. The same value is returned and logged for normal responses, pre-routing `400`/`413`/`429`/role-disabled responses, and unhandled application exceptions. The log uses the URL path without its query and never records request headers, cookies, authorization, or body. Uvicorn's separate plain access logger is disabled so the application emits one correlated API request event. The web Nginx access/error logs remain separate proxy evidence.
 

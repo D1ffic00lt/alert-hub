@@ -73,6 +73,13 @@ export type RefreshBurstCoalescer = {
   cancel: () => void;
 };
 
+export function sseReconnectDelay(attempt: number, random: () => number = Math.random): number {
+  const boundedAttempt = Math.max(0, Math.min(5, Math.floor(attempt)));
+  const base = Math.min(30_000, 1_000 * 2 ** boundedAttempt);
+  const jitter = 0.8 + Math.max(0, Math.min(1, random())) * 0.4;
+  return Math.min(30_000, Math.round(base * jitter));
+}
+
 export function createRefreshBurstCoalescer(
   run: () => Promise<unknown>,
   delayMs = 250,

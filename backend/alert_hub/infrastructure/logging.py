@@ -28,6 +28,7 @@ _SAFE_EXTRA_FIELDS: Final[tuple[str, ...]] = (
     "peer_node_id",
     "failure_count",
     "attempt",
+    "db_lane",
     "error_code",
     "exception_type",
 )

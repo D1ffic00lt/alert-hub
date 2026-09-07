@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     backend_port: int = Field(default=8080, ge=1, le=65_535)
     database_url: str = "sqlite:///./data/alert-hub.db"
     sqlite_busy_timeout_ms: int = Field(default=5_000, ge=1, le=120_000)
+    database_pool_size: int = Field(default=5, ge=1, le=64)
+    database_max_overflow: int = Field(default=10, ge=0, le=128)
+    database_pool_timeout_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
+    database_public_read_limit: int = Field(default=8, ge=1, le=128)
+    database_public_queue_timeout_seconds: float = Field(default=5.0, ge=0.1, le=30.0)
     auto_create_schema: bool = False
 
     node_id: str = "local-node"
@@ -398,6 +403,15 @@ class Settings(BaseSettings):
             if canonical not in normalized:
                 normalized.append(canonical)
         return normalized
+
+    @model_validator(mode="after")
+    def validate_database_concurrency(self) -> Settings:
+        pool_capacity = self.database_pool_size + self.database_max_overflow
+        if self.database_public_read_limit >= pool_capacity:
+            raise ValueError(
+                "DATABASE_PUBLIC_READ_LIMIT must be smaller than the configured pool capacity"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_sync_backoff(self) -> Settings:
