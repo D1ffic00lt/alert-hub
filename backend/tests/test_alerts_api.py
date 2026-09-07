@@ -263,6 +263,42 @@ def test_alert_rules_are_grouped_by_dynamic_category_filterable_and_partial(
     assert all("/api/v1/rules?type=alert" in value for value in requested_paths)
 
 
+def test_alert_rule_pagination_keeps_categories_on_one_page(
+    client: TestClient,
+    auth: dict[str, str],
+    app: Any,
+) -> None:
+    rules = [
+        *(_rule(f"Infrastructure{index:02d}", category="infrastructure") for index in range(15)),
+        *(_rule(f"Tls{index:02d}", category="tls") for index in range(4)),
+        *(_rule(f"Xray{index:02d}", category="xray") for index in range(14)),
+    ]
+
+    def prometheus(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json=_rules(*rules))
+
+    app.state.prometheus_http_transport = httpx.MockTransport(prometheus)
+    _create_datasource(client, auth, name="Primary Prometheus", host="1.1.1.1")
+
+    first = client.get(
+        "/api/v1/alert-rules", headers=auth, params={"page": 1, "page_size": 25}
+    ).json()
+    second = client.get(
+        "/api/v1/alert-rules", headers=auth, params={"page": 2, "page_size": 25}
+    ).json()
+
+    assert first["pagination"] == {
+        "page": 1,
+        "page_size": 25,
+        "total_items": 33,
+        "total_pages": 2,
+    }
+    assert {item["category"] for item in first["rules"]} == {"infrastructure", "tls"}
+    assert len(first["rules"]) == 19
+    assert {item["category"] for item in second["rules"]} == {"xray"}
+    assert len(second["rules"]) == 14
+
+
 @pytest.mark.parametrize("window", ["24h", "7d", "30d"])
 def test_observed_availability_uses_only_fixed_queries_and_marks_stale_and_unknown(
     client: TestClient,

@@ -6761,6 +6761,13 @@ body,
   line-height: 1;
   text-overflow: ellipsis;
 }
+.alerts-page-skeleton .alerts-kpi {
+  display: flex;
+  min-height: 108px;
+  justify-content: center;
+  flex-direction: column;
+  gap: 14px;
+}
 .alerts-panel {
   min-width: 0;
   overflow: hidden;
@@ -6830,10 +6837,6 @@ body,
   display: grid;
   gap: 12px;
   padding: 16px 20px 20px;
-  transition: opacity 120ms ease;
-}
-.alert-categories.is-refreshing {
-  opacity: 0.62;
 }
 .alert-category,
 .alert-rule {
@@ -7003,6 +7006,14 @@ body,
   overflow: hidden;
   color: var(--text-secondary);
   text-overflow: ellipsis;
+}
+.alert-replica__counts .alert-health--ok {
+  color: var(--success);
+  font-weight: 600;
+}
+.alert-replica__counts .alert-health--error {
+  color: var(--red);
+  font-weight: 600;
 }
 .alert-replica__meta {
   display: grid;

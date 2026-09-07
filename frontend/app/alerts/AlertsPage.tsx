@@ -295,6 +295,8 @@ function ReplicaCard({
   navigate: (path: string) => void;
 }) {
   const displayState = replica.health !== "ok" || replica.lastError ? "error" : replica.state;
+  const healthTone =
+    replica.health === "ok" ? "ok" : replica.health === "error" ? "error" : "unknown";
   return (
     <article className={`alert-replica alert-replica--${displayState}`}>
       <header>
@@ -315,7 +317,7 @@ function ReplicaCard({
         </span>
         <span>
           <small>Health</small>
-          <code>{replica.health}</code>
+          <code className={`alert-health alert-health--${healthTone}`}>{replica.health}</code>
         </span>
       </div>
       <dl className="alert-replica__meta">
@@ -464,6 +466,60 @@ function CategoryDisclosure({
   );
 }
 
+function AlertsPageSkeleton({ language }: { language: Language }) {
+  return (
+    <div
+      className="page-stack alerts-page alerts-page-skeleton"
+      role="status"
+      aria-busy="true"
+      aria-label={tx(language, "Загружаем правила алертов", "Loading alert rules")}
+    >
+      <header className="alerts-heading">
+        <span>
+          <small>{tx(language, "Каталог Prometheus", "Prometheus catalog")}</small>
+          <h1>{tx(language, "Алерты", "Alerts")}</h1>
+          <p>
+            {tx(
+              language,
+              "Получаем первый подтверждённый ответ текущей сессии…",
+              "Waiting for the first verified response in this session…",
+            )}
+          </p>
+        </span>
+      </header>
+      <section className="alerts-kpis" aria-hidden="true">
+        {Array.from({ length: 5 }, (_, index) => (
+          <article className="alerts-kpi" key={index}>
+            <span className="hub-skeleton-line hub-skeleton-line--long" />
+            <span className="hub-skeleton-line hub-skeleton-line--short" />
+          </article>
+        ))}
+      </section>
+      <section className="alerts-panel hub-skeleton-panel" aria-hidden="true">
+        <div className="hub-skeleton-toolbar">
+          <span className="hub-skeleton-field hub-skeleton-field--wide" />
+          <span className="hub-skeleton-field" />
+          <span className="hub-skeleton-field" />
+          <span className="hub-skeleton-button" />
+        </div>
+        <div className="hub-skeleton-table">
+          {Array.from({ length: 4 }, (_, index) => (
+            <div className="hub-skeleton-table__row" key={index}>
+              <span className="hub-skeleton-primary">
+                <span className="hub-skeleton-line hub-skeleton-line--long" />
+                <span className="hub-skeleton-line hub-skeleton-line--short" />
+              </span>
+              <span className="hub-skeleton-pill" />
+              <span className="hub-skeleton-line" />
+              <span className="hub-skeleton-line hub-skeleton-line--short" />
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 export function AlertsPage({
   request,
   runtimeMode,
@@ -582,6 +638,10 @@ export function AlertsPage({
     setPage(1);
   };
   const refresh = () => setRefreshVersion((value) => value + 1);
+
+  if (runtimeMode === "active" && !rules && !rulesError) {
+    return <AlertsPageSkeleton language={language} />;
+  }
 
   return (
     <div className="page-stack alerts-page" aria-busy={rulesLoading}>
@@ -772,11 +832,7 @@ export function AlertsPage({
           </button>
         </div>
 
-        {rulesLoading && !rules ? (
-          <div className="alerts-loading" role="status">
-            {tx(language, "Загружаем правила…", "Loading alert rules…")}
-          </div>
-        ) : rulesError && !rules ? (
+        {rulesError && !rules ? (
           <div className="alerts-empty" role="alert">
             <b>{tx(language, "Правила недоступны", "Alert rules unavailable")}</b>
             <span>{rulesError}</span>
@@ -785,7 +841,7 @@ export function AlertsPage({
             </button>
           </div>
         ) : groups.length ? (
-          <div className={`alert-categories ${rulesLoading ? "is-refreshing" : ""}`}>
+          <div className="alert-categories">
             {groups.map((group) => (
               <CategoryDisclosure
                 group={group}

@@ -304,6 +304,16 @@ other nodes' exact HTTPS peer origins; setting it also requires their exact
 public IPv4 `/32` values in `PEER_ALLOWED_CIDRS`. `VAPID_PUBLIC_KEY` may be
 omitted because the API derives it from the P-256 private key.
 
+When all six API HA variables (`API_HA_MODE`, `PUBLIC_UI_URL`,
+`NODE_PUBLIC_API_URL`, `PUBLIC_INGEST_URL`, `PUBLIC_API_CANDIDATES`, and
+`COOKIE_DOMAIN`) are unset, the production workflow omits them from sudo's
+preserved environment and uses the backward-compatible single-endpoint path.
+This allows a node provisioned before the API HA boundary extension to receive
+an ordinary release. Setting any of the six selects the API HA path instead;
+that path fails closed until the current root-owned provisioner has refreshed
+the installed deploy engine and sudoers allowlist, so configured HA is never
+silently downgraded to single-endpoint mode.
+
 Checks defaults to disabled. When these optional variables are omitted, the
 API deployment writes `false`, 180 seconds stale age, one failure source, no
 Checks-specific Grafana link, a five-second cache TTL, 30 seconds of future
