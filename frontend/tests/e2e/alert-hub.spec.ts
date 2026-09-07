@@ -1105,7 +1105,9 @@ async function signIn(page: Page) {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Запуск кластера" })).toBeVisible();
   await page.getByRole("button", { name: "Войти" }).first().click();
-  await page.getByLabel("Имя пользователя").fill("second-admin");
+  const username = page.getByLabel("Имя пользователя");
+  await expect(username).toHaveValue("");
+  await username.fill("second-admin");
   await page.getByLabel("Пароль", { exact: true }).fill("second-password");
   await page.getByRole("button", { name: "Войти" }).last().click();
   await expect(page.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
@@ -2124,9 +2126,7 @@ test("Checks disabled route is explicit and a refresh failure clears the previou
   };
   await installApi(page, state);
   await signIn(page);
-  await expect(page.locator(".sidebar__nav").getByRole("button", { name: "Checks" })).toHaveCount(
-    0,
-  );
+  await expect(page.locator(".sidebar__nav").getByRole("button", { name: "Checks" })).toBeVisible();
   await page.evaluate(() => {
     history.pushState({}, "", "/checks");
     dispatchEvent(new PopStateEvent("popstate"));
