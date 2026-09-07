@@ -6238,7 +6238,7 @@ body,
 .auth-language-switch {
   position: absolute;
   z-index: 5;
-  top: calc(42px + env(safe-area-inset-top, 0px));
+  top: calc(24px + env(safe-area-inset-top, 0px));
   right: calc(clamp(38px, 5vw, 80px) + env(safe-area-inset-right, 0px));
 }
 
