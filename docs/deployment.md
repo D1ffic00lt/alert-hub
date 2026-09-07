@@ -248,10 +248,11 @@ monitoring bridge provide masqueraded outbound routing. This deliberately avoids
 `gw_priority`, retaining compatibility with Docker Compose 2.15.1 even if Docker
 chooses either bridge as the container's default gateway.
 
-The web container performs a readiness authorization subrequest before serving
-the PWA. If API readiness is lost, web stays running but returns `503` for
-application and static requests. It recovers automatically when API is ready
-again.
+The web container renders a mode-specific shell guard. `single` and `external`
+perform a readiness authorization subrequest and return `503` while the local
+API is unavailable. `client-failover` and `proxy-failover` serve the shell
+without waiting for the local API. The full routing, cookie, and mutation safety
+contract is documented in [Frontend API high availability](api-ha.md).
 
 ## GitHub Environments and secrets
 
@@ -275,6 +276,12 @@ Optional Environment or Repository Variables consumed by deployment are:
 
 ```text
 APP_NAME
+API_HA_MODE
+PUBLIC_UI_URL
+NODE_PUBLIC_API_URL
+PUBLIC_INGEST_URL
+PUBLIC_API_CANDIDATES
+COOKIE_DOMAIN
 PEER_URLS
 PEER_ALLOWED_CIDRS
 VAPID_PUBLIC_KEY
@@ -538,6 +545,11 @@ separate explicit reload.
 The examples preserve SSE, no-store service-worker/runtime headers, CSP and
 security headers, and public `404` denials for `/internal/*`, `/metrics`,
 `/health/deep`, `/api/docs*`, `/api/redoc*`, and `/api/openapi.json`.
+
+Client-failover and same-origin proxy-failover use the additional reviewed
+templates under `deploy/proxy/{nginx,caddy}`. Follow
+[Frontend API high availability](api-ha.md) and validate the complete active
+proxy before reload.
 
 ## Dedicated HTTPS peer proxy
 

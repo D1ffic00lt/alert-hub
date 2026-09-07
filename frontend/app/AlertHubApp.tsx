@@ -13,6 +13,7 @@ import {
 import { useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
 
 import { AlertsPage } from "./alerts/AlertsPage";
+import { apiEndpointManager, type ApiEndpointSnapshot } from "./api/endpoints";
 import { CheckDetailPage, ChecksPage, ChecksWidget } from "./checks/ChecksViews";
 import {
   type ChecksOverviewState,
@@ -49,7 +50,6 @@ import {
   type ThemePreference,
 } from "./theme";
 
-const API_BASE = "/api/v1";
 const AppNameContext = createContext("Alert Hub");
 type UiLanguage = "ru" | "en";
 const LANGUAGE_STORAGE_KEY = "alert-hub-ui-language";
@@ -87,8 +87,7 @@ let refreshBlocked = false;
 let bootstrapSuggested = false;
 let demoModeActive = false;
 let offlineReadOnlyActive = false;
-const verifiedPeerBases = new Set<string>();
-const apiResponseSource = new WeakMap<Response, "origin" | "peer">();
+const authoritativeApiResponses = new WeakSet<Response>();
 const SESSION_EXPIRED_EVENT = "alert-hub:session-expired";
 const SESSION_RESTORED_EVENT = "alert-hub:session-restored";
 const SESSION_HINT_KEY = "alert-hub-session-partition-v1";
@@ -97,6 +96,15 @@ const AUTH_BROADCAST_CHANNEL = "alert-hub-auth-v1";
 const SESSION_HINT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_REVALIDATE_MIN_INTERVAL_MS = 5000;
 const REFRESH_REJECTION_RETRY_MS = 250;
+
+try {
+  apiEndpointManager.setFailoverEnabled(
+    typeof localStorage === "undefined" ||
+      localStorage.getItem("alert-hub-auto-failover") !== "false",
+  );
+} catch {
+  apiEndpointManager.setFailoverEnabled(true);
+}
 
 class PushSetupCancelledError extends Error {
   constructor() {
@@ -1426,25 +1434,6 @@ function asFiniteNumber(value: unknown): number | null {
   return Number.isFinite(result) ? result : null;
 }
 
-function normalizePeerBase(value: unknown): string | null {
-  if (typeof value !== "string" || !value) return null;
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
-      return null;
-    }
-    return url.href.replace(/\/$/, "");
-  } catch {
-    return null;
-  }
-}
-
-function rememberVerifiedPeerBase(value: unknown): string | null {
-  const normalized = normalizePeerBase(value);
-  if (normalized) verifiedPeerBases.add(normalized);
-  return normalized;
-}
-
 function listFrom(payload: unknown, key: string): unknown[] {
   if (Array.isArray(payload)) return payload;
   const record = asRecord(payload);
@@ -1945,7 +1934,6 @@ function forgetAccessToken(clearCachedData = false) {
   memoryAccessExpiresAt = 0;
   offlineReadOnlyActive = false;
   if (clearCachedData) {
-    verifiedPeerBases.clear();
     pruneReadCaches(null);
     if (typeof localStorage !== "undefined") localStorage.removeItem(SESSION_HINT_KEY);
   }
@@ -2005,7 +1993,6 @@ function restoreOfflineSession(): Record<string, unknown> | null {
     memorySessionId = partition;
     offlineReadOnlyActive = true;
     demoModeActive = false;
-    verifiedPeerBases.clear();
     pruneReadCaches(partition);
     return { username: "offline-operator", offline: true };
   } catch {
@@ -2060,12 +2047,16 @@ async function refreshAccessToken(): Promise<boolean> {
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), 8000);
       try {
-        const response = await fetch(`${API_BASE}/auth/refresh`, {
-          method: "POST",
-          credentials: "include",
-          headers,
-          signal: controller.signal,
-        });
+        const response = await apiEndpointManager.fetchApi(
+          "/auth/refresh",
+          {
+            method: "POST",
+            credentials: "include",
+            headers,
+            signal: controller.signal,
+          },
+          { replayRefresh: true },
+        );
         if (refreshBlocked || generation !== authGeneration) return false;
         if (!response.ok) {
           if ((response.status === 401 || response.status === 403) && attempt === 0) {
@@ -2141,69 +2132,24 @@ async function apiFetch(
   if (typeof init.body === "string" && !headers.has("Content-Type"))
     headers.set("Content-Type", "application/json");
   const requestInit = { ...init, credentials: "include" as RequestCredentials, headers };
-  let primary: Response | null = null;
-  let primaryError: unknown = null;
-  try {
-    primary = await fetch(`${API_BASE}${path}`, requestInit);
-    assertExpectedAuthContext();
-    if (primary.status === 401 && !path.startsWith("/auth/")) {
-      const refreshed =
-        Boolean(memoryAccessToken && memoryAccessToken !== attemptedToken) ||
-        (await refreshAccessToken());
-      assertExpectedAuthContext();
-      if (refreshed && memoryAccessToken) {
-        headers.set("Authorization", `Bearer ${memoryAccessToken}`);
-        if (memorySessionId) headers.set("X-Alert-Hub-Cache-Partition", memorySessionId);
-        primary = await fetch(`${API_BASE}${path}`, requestInit);
-        assertExpectedAuthContext();
-      }
-    }
-  } catch (error) {
-    primaryError = error;
-  }
+  let response = await apiEndpointManager.fetchApi(path, requestInit, {
+    replayRefresh: path === "/auth/refresh",
+  });
   assertExpectedAuthContext();
-  const failoverEnabled =
-    typeof localStorage === "undefined" ||
-    localStorage.getItem("alert-hub-auto-failover") !== "false";
-  const canFailOver =
-    method === "GET" && !path.startsWith("/auth/") && failoverEnabled && Boolean(memoryAccessToken);
-  const shouldFailOver =
-    !primary || primary.status >= 500 || primary.headers.get("X-Alert-Hub-Cache") === "hit";
-  if (canFailOver && shouldFailOver && typeof localStorage !== "undefined") {
-    let saved: unknown;
-    try {
-      saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
-    } catch {
-      saved = [];
-    }
-    for (const value of Array.isArray(saved) ? saved.slice(0, 8) : []) {
-      try {
-        assertExpectedAuthContext();
-        const normalized = normalizePeerBase(value);
-        if (!normalized || !verifiedPeerBases.has(normalized)) continue;
-        const base = new URL(normalized);
-        const response = await fetch(
-          `${base.href.replace(/\/$/, "")}${API_BASE}${path}`,
-          requestInit,
-        );
-        assertExpectedAuthContext();
-        if (response.ok) {
-          apiResponseSource.set(response, "peer");
-          return response;
-        }
-      } catch {
-        assertExpectedAuthContext();
-        // Move to the next saved peer without hiding the original response.
-      }
+  if (response.status === 401 && !path.startsWith("/auth/")) {
+    const refreshed =
+      Boolean(memoryAccessToken && memoryAccessToken !== attemptedToken) ||
+      (await refreshAccessToken());
+    assertExpectedAuthContext();
+    if (refreshed && memoryAccessToken) {
+      headers.set("Authorization", `Bearer ${memoryAccessToken}`);
+      if (memorySessionId) headers.set("X-Alert-Hub-Cache-Partition", memorySessionId);
+      response = await apiEndpointManager.fetchApi(path, requestInit);
+      assertExpectedAuthContext();
     }
   }
-  if (primary) {
-    apiResponseSource.set(primary, "origin");
-    return primary;
-  }
-  throw primaryError instanceof Error
-    ? primaryError
-    : new Error(tr("Ни один узел API не ответил", "No API node responded"));
+  authoritativeApiResponses.add(response);
+  return response;
 }
 
 async function apiError(response: Response, fallback: string) {
@@ -2237,11 +2183,10 @@ async function getJson(path: string, signal?: AbortSignal) {
   return {
     payload: (await response.json()) as unknown,
     cached,
-    // Mutations always execute on the authenticated origin. A peer or service-
-    // worker snapshot can safely drive explicit-ID actions, but it must never
-    // define an origin-side filter-wide mutation under eventual consistency.
+    // A live response from the selected API can define a filter-wide mutation
+    // on that same endpoint. A service-worker snapshot cannot do so safely.
     mutationAuthoritative:
-      apiResponseSource.get(response) === "origin" &&
+      authoritativeApiResponses.has(response) &&
       !cached &&
       Boolean(memoryAccessToken) &&
       !offlineReadOnlyActive,
@@ -2319,7 +2264,6 @@ function useAuthSession() {
       authGeneration += 1;
       forgetAccessToken(true);
       demoModeActive = false;
-      verifiedPeerBases.clear();
       bootstrapSuggested = false;
       queryClient.clear();
       setState({ status: "required", user: null });
@@ -2358,13 +2302,16 @@ function useAuthSession() {
       const now = Date.now();
       if (now - lastActivationRevalidation < SESSION_REVALIDATE_MIN_INTERVAL_MS) return;
       lastActivationRevalidation = now;
-      void refreshAccessToken();
+      void apiEndpointManager.prepare(true).then(() => refreshAccessToken());
     };
     const visibilityChanged = () => {
       if (!document.hidden) revalidateActiveSession();
     };
     const reconnectOfflineSession = () => {
-      if (stateRef.current.status === "offline") void refreshAccessToken();
+      void apiEndpointManager.prepare(true).then(() => {
+        if (stateRef.current.status === "offline") return refreshAccessToken();
+        return undefined;
+      });
     };
     const storageChanged = (event: StorageEvent) => {
       if (event.key === LOGOUT_TOMBSTONE_KEY && event.newValue !== null) sessionExpired();
@@ -2470,14 +2417,12 @@ function useAuthSession() {
       clearLocalLogout();
       demoModeActive = false;
       bootstrapSuggested = false;
-      verifiedPeerBases.clear();
       queryClient.clear();
       rememberAccessToken(payload);
       setState({ status: "authenticated", user });
     },
     useDemo: () => {
       demoModeActive = true;
-      verifiedPeerBases.clear();
       queryClient.clear();
       forgetAccessToken(true);
       setState({ status: "demo", user: null });
@@ -2498,12 +2443,16 @@ function useAuthSession() {
           const controller = new AbortController();
           const timer = window.setTimeout(() => controller.abort(), 5000);
           try {
-            await fetch(`${API_BASE}/auth/logout`, {
-              method: "POST",
-              credentials: "include",
-              headers,
-              signal: controller.signal,
-            });
+            await apiEndpointManager.fetchApi(
+              "/auth/logout",
+              {
+                method: "POST",
+                credentials: "include",
+                headers,
+                signal: controller.signal,
+              },
+              { revalidateBeforeMutation: false },
+            );
           } catch {
             // The local tombstone prevents an offline or failed logout from
             // silently restoring the HttpOnly session on the next startup.
@@ -2513,7 +2462,6 @@ function useAuthSession() {
         }
       } finally {
         demoModeActive = false;
-        verifiedPeerBases.clear();
         queryClient.clear();
         forgetAccessToken(true);
         setState({ status: "required", user: null });
@@ -2628,31 +2576,9 @@ function useHubData(
               const cluster = normalizeClusterSnapshot(nodes.value.payload, !nodes.value.cached);
               next.nodes = cluster.nodes;
               next.clusterMeta = cluster.meta;
-              const discovered = cluster.rawNodes
-                .map((item) => rememberVerifiedPeerBase(asRecord(item).public_api_url))
-                .filter((item): item is string => Boolean(item));
-              if (discovered.length) {
-                try {
-                  const saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
-                  const disabled = JSON.parse(
-                    localStorage.getItem("alert-hub-disabled-api-endpoints") ?? "[]",
-                  );
-                  const disabledSet = new Set(Array.isArray(disabled) ? disabled : []);
-                  localStorage.setItem(
-                    "alert-hub-api-endpoints",
-                    JSON.stringify(
-                      [
-                        ...new Set([
-                          ...(Array.isArray(saved) ? saved : []),
-                          ...discovered.filter((item) => !disabledSet.has(item)),
-                        ]),
-                      ].slice(0, 8),
-                    ),
-                  );
-                } catch {
-                  // Endpoint discovery is a device-local optimization only.
-                }
-              }
+              apiEndpointManager.addVerifiedCandidates(
+                cluster.rawNodes.map((item) => asRecord(item).public_api_url),
+              );
             } else if (nodes?.status === "rejected") {
               next.nodes = unavailableNodeTelemetry(next.nodes);
             }
@@ -3210,7 +3136,9 @@ function useHubData(
       stream?.close();
       // EventSource cannot attach a bearer header. The backend's short-lived,
       // HttpOnly stream cookie is renewed together with the access token.
-      stream = new EventSource(`${API_BASE}/stream`, { withCredentials: true });
+      stream = new EventSource(apiEndpointManager.apiUrl("/stream"), {
+        withCredentials: true,
+      });
       stream.onopen = () => {
         if (stopped) return;
         if (poller) window.clearInterval(poller);
@@ -4604,7 +4532,6 @@ function AlertHubRuntime() {
         case "settings":
           return (
             <SettingsPage
-              nodes={data.nodes}
               summary={data.summary}
               readOnly={readOnly}
               setData={setData}
@@ -8842,13 +8769,11 @@ function parseJobGlobs(value: string) {
 }
 
 function SettingsPage({
-  nodes,
   summary,
   readOnly,
   setData,
   onRefresh,
 }: {
-  nodes: ClusterNode[];
   summary: HubSummary;
   readOnly: boolean;
   setData: React.Dispatch<React.SetStateAction<HubData>>;
@@ -8865,6 +8790,37 @@ function SettingsPage({
       ? true
       : localStorage.getItem("alert-hub-auto-failover") !== "false",
   );
+  const [apiSnapshot, setApiSnapshot] = useState<ApiEndpointSnapshot>(() =>
+    apiEndpointManager.snapshot(),
+  );
+  useEffect(
+    () => apiEndpointManager.subscribe(() => setApiSnapshot(apiEndpointManager.snapshot())),
+    [],
+  );
+  const healthyApiCount = apiSnapshot.endpoints.filter(
+    (endpoint) => endpoint.health === "healthy",
+  ).length;
+  const unavailableApiCount = apiSnapshot.endpoints.filter(
+    (endpoint) => endpoint.health === "backoff",
+  ).length;
+  const uncheckedApiCount = apiSnapshot.endpoints.length - healthyApiCount - unavailableApiCount;
+  const apiDiagnosticReason =
+    apiSnapshot.warning === "duplicate-origins"
+      ? tr(
+          "Несколько узлов кластера объявили один и тот же публичный API-адрес.",
+          "Several cluster nodes advertised the same public API origin.",
+        )
+      : apiSnapshot.reason === "A health probe selected a healthy API endpoint"
+        ? tr(
+            "Проверка доступности выбрала исправный API-узел.",
+            "A health probe selected a healthy API endpoint.",
+          )
+        : apiSnapshot.reason === "A request failed over after a network or server error"
+          ? tr(
+              "Запрос переключён после сетевой или серверной ошибки.",
+              "A request failed over after a network or server error.",
+            )
+          : apiSnapshot.reason;
   const [cacheMessage, setCacheMessage] = useState<string | null>(null);
   const [monitoringDraft, setMonitoringDraft] = useState<{
     grafanaUrl: string;
@@ -8876,25 +8832,6 @@ function SettingsPage({
     tone: "success" | "warning";
     text: string;
   } | null>(null);
-  const [endpoints, setEndpoints] = useState<string[]>(() => {
-    if (typeof window === "undefined") return [];
-    try {
-      const saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
-      return Array.isArray(saved)
-        ? saved.filter((item): item is string => typeof item === "string")
-        : [];
-    } catch {
-      return [];
-    }
-  });
-  const availableEndpoints = [
-    ...new Set(
-      nodes
-        .map((node) => normalizePeerBase(node.publicApiUrl))
-        .filter((item): item is string => Boolean(item)),
-    ),
-  ];
-  const enabledEndpoints = endpoints.filter((item) => availableEndpoints.includes(item));
   const grafanaUrl = monitoringDraft?.grafanaUrl ?? summary.grafanaUrl ?? "";
   const keyJobGlobs = monitoringDraft?.keyJobGlobs ?? summary.keyJobGlobs.join(", ");
   const alertHubJobGlobs = monitoringDraft?.alertHubJobGlobs ?? summary.alertHubJobGlobs.join(", ");
@@ -8989,27 +8926,6 @@ function SettingsPage({
       setMonitoringBusy(false);
     }
   };
-  const toggleEndpoint = (item: string) => {
-    const enabled = enabledEndpoints.includes(item);
-    const next = enabled
-      ? enabledEndpoints.filter((entry) => entry !== item)
-      : [...new Set([...enabledEndpoints, item])].slice(0, 8);
-    let disabled: string[];
-    try {
-      const saved = JSON.parse(localStorage.getItem("alert-hub-disabled-api-endpoints") ?? "[]");
-      disabled = Array.isArray(saved)
-        ? saved.filter((value): value is string => typeof value === "string")
-        : [];
-    } catch {
-      disabled = [];
-    }
-    const nextDisabled = enabled
-      ? [...new Set([...disabled, item])]
-      : disabled.filter((entry) => entry !== item);
-    setEndpoints(next);
-    localStorage.setItem("alert-hub-api-endpoints", JSON.stringify(next));
-    localStorage.setItem("alert-hub-disabled-api-endpoints", JSON.stringify(nextDisabled));
-  };
   return (
     <div className="page-stack settings-page">
       <PageHeading
@@ -9077,59 +8993,69 @@ function SettingsPage({
             </div>
           </Panel>
           <Panel
-            eyebrow={tr("Отказоустойчивый клиент", "Failover-aware client")}
-            title={tr("Сохранённые адреса API", "Saved API endpoints")}
+            eyebrow={tr("Маршрутизация API", "API routing")}
+            title={
+              apiSnapshot.degraded
+                ? tr("Работа через резервный узел", "Using a fallback node")
+                : tr("Подключение активно", "Connection active")
+            }
           >
             <p className="settings-intro">
               {tr(
-                "Если текущий узел недоступен, PWA может прочитать данные через другой доверенный адрес кластера.",
-                "If the current node is unavailable, the PWA can read through another trusted cluster endpoint.",
+                `Режим ${apiSnapshot.mode}. Активный API: ${apiSnapshot.displayActiveOrigin}. Адреса задаются оператором до запуска интерфейса.`,
+                `Mode: ${apiSnapshot.mode}. Active API: ${apiSnapshot.displayActiveOrigin}. Endpoints are supplied by the operator before the UI starts.`,
               )}
             </p>
+            <p className="settings-intro">
+              {tr(
+                `Всего: ${apiSnapshot.endpoints.length} · исправны: ${healthyApiCount} · недоступны: ${unavailableApiCount} · не проверены: ${uncheckedApiCount}.`,
+                `Total: ${apiSnapshot.endpoints.length} · healthy: ${healthyApiCount} · unavailable: ${unavailableApiCount} · unchecked: ${uncheckedApiCount}.`,
+              )}
+              {apiDiagnosticReason
+                ? ` ${apiDiagnosticReason}${
+                    apiSnapshot.lastSwitchAt
+                      ? tr(
+                          ` Последнее переключение: ${formatDate(new Date(apiSnapshot.lastSwitchAt).toISOString(), true)}.`,
+                          ` Last switch: ${formatDate(new Date(apiSnapshot.lastSwitchAt).toISOString(), true)}.`,
+                        )
+                      : ""
+                  }`
+                : ""}
+            </p>
             <div className="endpoint-list">
-              {availableEndpoints.map((item, index) => (
-                <div key={item}>
+              {apiSnapshot.endpoints.map((endpoint, index) => (
+                <div key={endpoint.origin || "same-origin"}>
                   <span className="endpoint-order">{index + 1}</span>
                   <span>
-                    <b>{item}</b>
+                    <b>{endpoint.displayOrigin}</b>
                     <small>
-                      {tr(
-                        "Подтверждено авторизованным ответом кластера",
-                        "Verified by an authenticated cluster response",
-                      )}
+                      {endpoint.active
+                        ? tr("Активный адрес", "Active endpoint")
+                        : endpoint.health === "backoff"
+                          ? tr("Пауза после ошибки", "Backoff after failure")
+                          : tr("Готов к переключению", "Ready for failover")}
                     </small>
                   </span>
-                  <StatusDot health={enabledEndpoints.includes(item) ? "unknown" : "paused"} />
-                  <button
-                    className="button button--quiet button--small"
-                    onClick={() => toggleEndpoint(item)}
-                    disabled={readOnly}
-                    aria-label={`${enabledEndpoints.includes(item) ? tr("Отключить", "Disable") : tr("Включить", "Enable")} ${tr("переключение на", "failover to")} ${item}`}
-                  >
-                    {enabledEndpoints.includes(item)
-                      ? tr("Отключить", "Disable")
-                      : tr("Включить", "Enable")}
-                  </button>
+                  <StatusDot
+                    health={
+                      endpoint.health === "healthy"
+                        ? "healthy"
+                        : endpoint.health === "backoff"
+                          ? "offline"
+                          : "unknown"
+                    }
+                  />
+                  <code>{endpoint.active ? tr("активен", "active") : endpoint.health}</code>
                 </div>
               ))}
-              {!availableEndpoints.length && (
-                <EmptyState
-                  icon="⇄"
-                  title={tr("Нет сохранённых адресов узлов", "No saved node endpoints")}
-                  message={tr(
-                    "Здесь появятся публичные HTTPS-адреса API, подтверждённые данными кластера.",
-                    "Public HTTPS API endpoints verified by cluster data appear here.",
-                  )}
-                />
-              )}
             </div>
             <div className="setting-row setting-row--border">
               <span>
-                <b>{tr("Автоматическое переключение чтения", "Automatic read failover")}</b>
+                <b>{tr("Автоматическое переключение API", "Automatic API failover")}</b>
                 <small>
                   {tr(
-                    "Использовать активные авторизованные адреса кластера, если текущий API-узел недоступен.",
-                    "Use active authenticated cluster endpoints when the current API node is unavailable.",
+                    "Выбирать исправный адрес до записи и переключать безопасные запросы чтения, если текущий API-узел недоступен.",
+                    "Select a healthy endpoint before writes and fail over safe reads when the current API node is unavailable.",
                   )}
                 </small>
               </span>
@@ -9138,8 +9064,9 @@ function SettingsPage({
                 onChange={(checked) => {
                   setAutoFailover(checked);
                   localStorage.setItem("alert-hub-auto-failover", String(checked));
+                  apiEndpointManager.setFailoverEnabled(checked);
                 }}
-                label={tr("Автоматическое переключение чтения", "Automatic read failover")}
+                label={tr("Автоматическое переключение API", "Automatic API failover")}
                 disabled={readOnly}
               />
             </div>

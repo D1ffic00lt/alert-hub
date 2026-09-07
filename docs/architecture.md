@@ -8,6 +8,10 @@ visualization surface. A replicated, validated Grafana URL supplies an authentic
 credential or query surface. Administrators can select bounded `job` globs for named `up` queries;
 the server constructs PromQL and never accepts browser-authored PromQL. Each Alert Hub node owns a
 local SQLite database and is intended to remain useful when peers are unreachable.
+The UI can use one API origin, a bounded server-owned list of public API origins,
+a same-origin proxy pool, or an external load balancer. Browser API routing is
+separate from append-only peer replication; no browser candidate exposes the
+peer protocol. See [Frontend API high availability](api-ha.md).
 The overview can aggregate bounded `24h`, `7d`, or `30d` incident and delivery history from that
 node-local replicated append-only event history, with current-active counters from the incident
 projection. This remains an eventually consistent operational summary; Prometheus and Grafana
@@ -106,11 +110,11 @@ flowchart LR
 ```
 
 Both runtimes are unprivileged and use read-only root filesystems. The API alone mounts persistent
-`/data` and secret files. The web service gets only bounded tmpfs space for runtime branding and
+`/data` and secret files. The web service gets only bounded tmpfs space for runtime branding and API endpoint configuration and
 Nginx state; it never receives the application env file, database, or secrets. It proxies through
 a dedicated bridge address which is the only container proxy trusted by the API. If API readiness
-is lost, Nginx stays alive and fails application/static requests closed with `503`; it recovers
-without a web restart when the API returns. Uvicorn remains one worker because SQLite write
+is lost, Nginx stays alive. Single/external mode fails application/static requests closed with
+`503`; client/proxy failover mode keeps the shell available for reserve API selection. Uvicorn remains one worker because SQLite write
 serialization and restart-safe in-process background loops are part of the MVP constraint.
 
 The two images carry the same release version and OpenAPI-derived compatibility value, but have

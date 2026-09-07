@@ -60,9 +60,12 @@ services:
     restart: unless-stopped
     environment:
       APP_NAME: ${APP_NAME:-Alert Hub}
+      API_HA_MODE: ${API_HA_MODE:-single}
+      NODE_PUBLIC_API_URL: ${NODE_PUBLIC_API_URL:-}
+      PUBLIC_API_CANDIDATES: ${PUBLIC_API_CANDIDATES:-}
     depends_on:
       alert-hub:
-        condition: service_healthy
+        condition: service_started
     # Local-only operator/smoke endpoint. A host public proxy targets the fixed
     # WEB_IP on the internal edge bridge to preserve the trusted client-IP chain.
     ports:
@@ -77,7 +80,6 @@ services:
       test:
         - CMD-SHELL
         - >-
-          wget -q -T 2 -t 1 -O /dev/null http://127.0.0.1:8080/health/ready &&
           wget -q -T 2 -t 1 -O /dev/null http://127.0.0.1:8080/ &&
           wget -q -T 2 -t 1 -O /dev/null http://127.0.0.1:8080/runtime-config.js
       interval: 10s

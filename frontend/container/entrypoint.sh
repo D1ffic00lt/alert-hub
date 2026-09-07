@@ -29,18 +29,22 @@ api_ready() {
 mkdir -p /tmp/nginx/client_body /tmp/nginx/proxy /tmp/nginx/fastcgi /tmp/nginx/uwsgi /tmp/nginx/scgi
 /usr/local/bin/render-ui-runtime
 
-attempt=1
-while [ "${attempt}" -le 120 ]; do
-  if api_ready; then
-    break
-  fi
-  if [ "${attempt}" -eq 120 ]; then
-    printf '%s\n' 'Alert Hub API did not become ready within 120 seconds.' >&2
-    exit 1
-  fi
-  attempt=$((attempt + 1))
-  sleep 1
-done
+case "${API_HA_MODE:-single}" in
+  single | external)
+    attempt=1
+    while [ "${attempt}" -le 120 ]; do
+      if api_ready; then
+        break
+      fi
+      if [ "${attempt}" -eq 120 ]; then
+        printf '%s\n' 'Alert Hub API did not become ready within 120 seconds.' >&2
+        exit 1
+      fi
+      attempt=$((attempt + 1))
+      sleep 1
+    done
+    ;;
+esac
 
 nginx -c /etc/alert-hub/nginx.conf -g 'daemon off;' &
 nginx_pid=$!
@@ -58,7 +62,7 @@ while kill -0 "${nginx_pid}" 2>/dev/null; do
   else
     failures=$((failures + 1))
     if [ "${failures}" -ge 3 ] && [ "${degraded}" = false ]; then
-      printf '%s\n' 'Alert Hub API readiness failed three consecutive checks; web remains up in guarded 503 mode.' >&2
+      printf '%s\n' 'Alert Hub local API readiness failed three consecutive checks; web availability follows API_HA_MODE.' >&2
       degraded=true
     fi
   fi

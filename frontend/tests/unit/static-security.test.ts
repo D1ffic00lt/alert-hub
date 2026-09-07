@@ -36,14 +36,19 @@ describe("static SPA security contract", () => {
     }
   });
 
-  it("guards the web shell with API readiness and a recoverable 503", () => {
+  it("uses a mode-specific shell guard while API routes fail closed", () => {
     const nginx = readFileSync(new URL("../../container/nginx.conf", import.meta.url), "utf8");
+    const renderer = readFileSync(
+      new URL("../../container/render-ui-runtime.sh", import.meta.url),
+      "utf8",
+    );
     const unavailable = readFileSync("public/service-unavailable.html", "utf8");
     expect(nginx).toContain("server alert-hub:8080;");
-    expect(nginx).toContain("auth_request /_api_ready;");
+    expect(nginx).toContain("include /run/alert-hub/ui/shell-guard.conf;");
+    expect(renderer).toContain("auth_request /_api_ready;");
     expect(nginx).toContain("return 503");
     expect(nginx).not.toContain("proxy_connect_timeout 5s;");
-    expect(nginx).toContain("error_page 500 502 503 504 =503 /service-unavailable.html;");
+    expect(renderer).toContain("error_page 500 502 503 504 =503 /service-unavailable.html;");
     expect(nginx).toContain("location = /service-unavailable.html");
     expect(nginx).toMatch(/location = \/service-unavailable\.html \{\s+internal;/);
     expect(nginx).not.toContain("127.0.0.1:8000");

@@ -17,6 +17,7 @@ from alert_hub.infrastructure.db.models import (
     Outbox,
     Source,
 )
+from alert_hub.settings import Settings
 from alert_hub.workers.heartbeat import evaluate_heartbeats
 
 
@@ -227,6 +228,21 @@ def test_created_source_returns_ready_absolute_webhook_and_example(
     assert '"external_event_id":"example-1"' in generic["example"]
     assert f'"starts_at":"{generic["created_at"].replace("+00:00", "Z")}"' in generic["example"]
     assert "--connect-timeout 5 --max-time 10" in generic["example"]
+
+
+def test_created_source_prefers_the_dedicated_public_ingest_origin(
+    client: TestClient,
+    auth: dict[str, str],
+    settings: Settings,
+) -> None:
+    settings.public_api_url = "https://api-ru.alerts.example"
+    settings.public_ingest_url = "https://ingest.alerts.example"
+
+    source = _create_source(client, auth, "heartbeat")
+
+    expected = f"https://ingest.alerts.example/ingest/v1/heartbeat/{source['id']}"
+    assert source["webhook_url"] == expected
+    assert expected in source["example"]
 
     heartbeat = _create_source(client, auth, "heartbeat")
     assert "--connect-timeout 5 --max-time 10" in heartbeat["example"]

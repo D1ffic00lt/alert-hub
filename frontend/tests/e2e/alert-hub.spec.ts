@@ -25,6 +25,56 @@ async function fulfill(route: Route, body: unknown, status = 200) {
   });
 }
 
+async function installClientFailoverRuntime(page: Page, primary: string, reserve: string) {
+  await page.route("**/runtime-config.js", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: `Object.defineProperty(globalThis,"__ALERT_HUB_CONFIG__",{value:Object.freeze({"appName":"E2E Operations","apiHaMode":"client-failover","nodePublicApiUrl":"${primary}","publicApiCandidates":Object.freeze(["${primary}","${reserve}"])}),writable:false,configurable:false});`,
+    }),
+  );
+  await page.addInitScript(
+    ({ primaryOrigin, reserveOrigin }) => {
+      const browserFetch = window.fetch.bind(window);
+      Object.defineProperty(window, "__e2eApiRequests", {
+        configurable: true,
+        value: [] as Array<{ endpoint: string; method: string; path: string }>,
+      });
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const raw = input instanceof Request ? input.url : String(input);
+        const url = new URL(raw, window.location.origin);
+        if (url.origin !== primaryOrigin && url.origin !== reserveOrigin) {
+          return browserFetch(input, init);
+        }
+        const endpoint = url.origin === reserveOrigin ? "reserve" : "primary";
+        const method = (
+          init?.method ?? (input instanceof Request ? input.method : "GET")
+        ).toUpperCase();
+        (
+          window as typeof window & {
+            __e2eApiRequests: Array<{ endpoint: string; method: string; path: string }>;
+          }
+        ).__e2eApiRequests.push({ endpoint, method, path: `${url.pathname}${url.search}` });
+        if (url.pathname === "/health/ready") {
+          return new Response('{"status":"ready"}', {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        const headers = new Headers(
+          init?.headers ?? (input instanceof Request ? input.headers : {}),
+        );
+        headers.set("X-E2E-API-Endpoint", endpoint);
+        return browserFetch(`${window.location.origin}${url.pathname}${url.search}`, {
+          ...init,
+          headers,
+        });
+      };
+    },
+    { primaryOrigin: primary, reserveOrigin: reserve },
+  );
+}
+
 function deferredGate() {
   let release: () => void = () => undefined;
   const promise = new Promise<void>((resolve) => {
@@ -285,7 +335,11 @@ async function installApi(page: Page, state: MockState) {
       await fulfill(route, { detail: "session revoked" }, 401);
       return;
     }
-    if (state.primaryUnavailable && method === "GET") {
+    if (
+      state.primaryUnavailable &&
+      method === "GET" &&
+      request.headers()["x-e2e-api-endpoint"] !== "reserve"
+    ) {
       await fulfill(route, { detail: "temporarily unavailable" }, 503);
       return;
     }
@@ -1553,10 +1607,11 @@ test("incidents load once without waiting for metrics and report partial bulk re
   await expect(page.locator('a[href="/metrics"], a[href$="/metrics"]')).toHaveCount(0);
 });
 
-test("peer incident snapshots allow explicit IDs but never filter-wide bulk mutations", async ({
+test("client failover starts on a reserve API and keeps mutations on the selected endpoint", async ({
   page,
 }) => {
-  const peerBase = "https://trusted-peer.example.test";
+  const primaryBase = "https://api-de.alerts.example.test";
+  const reserveBase = "https://api-ru.alerts.example.test";
   const incidents = Array.from({ length: 52 }, (_, index) => ({
     id: `incident-peer-${index}`,
     title: `Peer incident ${index}`,
@@ -1573,19 +1628,6 @@ test("peer incident snapshots allow explicit IDs but never filter-wide bulk muta
   }));
   const state: MockState = {
     authoritativeUnauthorized: false,
-    clusterStatus: {
-      cluster_event_count: 1,
-      cursor: { peer: 1 },
-      nodes: [
-        {
-          id: "peer",
-          name: "Trusted peer",
-          region: "EU",
-          health: "healthy",
-          public_api_url: peerBase,
-        },
-      ],
-    },
     incidentBulkRequests: [],
     incidentListRequests: [],
     incidents,
@@ -1597,92 +1639,59 @@ test("peer incident snapshots allow explicit IDs but never filter-wide bulk muta
     refreshStarted: null,
     sourceRequest: null,
   };
+  await installClientFailoverRuntime(page, primaryBase, reserveBase);
   await installApi(page, state);
-  await page.route(
-    /^https:\/\/trusted-peer\.example\.test\/api\/v1\/incidents(?:\?.*)?$/,
-    async (route) => {
-      const request = route.request();
-      const origin = request.headers().origin ?? "*";
-      const corsHeaders = {
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Alert-Hub-Cache-Partition",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Origin": origin,
-      };
-      if (request.method() === "OPTIONS") {
-        await route.fulfill({ status: 204, headers: corsHeaders });
-        return;
-      }
-      const url = new URL(request.url());
-      const limit = Number(url.searchParams.get("limit") ?? 50);
-      const offset = Number(url.searchParams.get("offset") ?? 0);
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        headers: corsHeaders,
-        body: JSON.stringify({
-          items: incidents.slice(offset, offset + limit),
-          total: incidents.length,
-          limit,
-          offset,
-          counts: {
-            active: incidents.length,
-            open: incidents.filter((incident) => incident.status === "open").length,
-            acknowledged: incidents.filter((incident) => incident.status === "acknowledged").length,
-            resolved: 0,
-            silenced: 0,
-            all: incidents.length,
-          },
-          bulk_limit: 500,
-        }),
-      });
-    },
-  );
   await signIn(page);
-  await expect
-    .poll(() =>
-      page.evaluate((peer) => {
-        const saved = JSON.parse(localStorage.getItem("alert-hub-api-endpoints") ?? "[]");
-        return Array.isArray(saved) && saved.includes(peer);
-      }, peerBase),
-    )
-    .toBe(true);
 
   state.primaryUnavailable = true;
   await page.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
   await expect(page.getByText("Peer incident 0", { exact: true })).toBeVisible();
   await page.getByLabel("Выбрать текущую страницу").check();
-  await expect(
-    page.getByText(/Выбор всех результатов доступен после свежего ответа/),
-  ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Выбрать все 52 результатов" })).toHaveCount(0);
-
+  await expect(page.getByRole("button", { name: "Выбрать все 52 результатов" })).toBeVisible();
+  await page.getByRole("button", { name: "Выбрать все 52 результатов" }).click();
+  await page.getByRole("combobox", { name: "Действие", exact: true }).selectOption("acknowledge");
   await page.getByRole("button", { name: "Применить", exact: true }).click();
   await expect.poll(() => state.incidentBulkRequests?.length ?? 0).toBe(1);
   expect(state.incidentBulkRequests?.[0]).toMatchObject({
     action: "acknowledge",
-    selection_mode: "ids",
+    selection_mode: "filter",
   });
-  expect(state.incidentBulkRequests?.[0]?.incident_ids).toHaveLength(50);
-  expect(state.incidentBulkRequests?.some((request) => request.selection_mode === "filter")).toBe(
-    false,
-  );
 
-  await expect(page.getByText(/Изменено: 50/)).toBeVisible();
-  await expect(page.locator(".incidents-page")).toHaveAttribute("aria-busy", "false");
-  await expect(page.getByText("Peer incident 0", { exact: true })).toBeVisible();
-  await page.getByLabel("Выбрать текущую страницу").check();
-  await expect(
-    page.getByText(/Выбор всех результатов доступен после свежего ответа/),
-  ).toBeVisible();
-  state.primaryUnavailable = false;
-  await page.getByRole("button", { name: "Обновить список" }).click();
-  await expect(page.getByRole("button", { name: "Выбрать все 52 результатов" })).toBeVisible();
-  await page.getByRole("button", { name: "Выбрать все 52 результатов" }).click();
-  await expect(page.getByText(/Выбраны все результаты фильтра/)).toBeVisible();
-  expect(state.incidentBulkRequests?.some((request) => request.selection_mode === "filter")).toBe(
-    false,
+  const requests = await page.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __e2eApiRequests: Array<{ endpoint: string; method: string; path: string }>;
+        }
+      ).__e2eApiRequests,
   );
+  expect(
+    requests.some(
+      ({ endpoint, method, path }) =>
+        endpoint === "primary" && method === "GET" && path.startsWith("/api/v1/incidents"),
+    ),
+  ).toBe(true);
+  expect(
+    requests.some(
+      ({ endpoint, method, path }) =>
+        endpoint === "reserve" && method === "GET" && path.startsWith("/api/v1/incidents"),
+    ),
+  ).toBe(true);
+  expect(
+    requests.filter(
+      ({ method, path }) => method === "POST" && path === "/api/v1/incidents/bulk-action",
+    ),
+  ).toEqual([
+    {
+      endpoint: "reserve",
+      method: "POST",
+      path: "/api/v1/incidents/bulk-action",
+    },
+  ]);
+
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Настройки" }).click();
+  await expect(page.getByText(`Активный API: ${reserveBase}`)).toBeVisible();
+  await expect(page.getByText(/Режим client-failover/)).toBeVisible();
 });
 
 test("incident filters and SSE refresh keep bulk actions aligned with the visible snapshot", async ({
@@ -1736,6 +1745,7 @@ test("incident filters and SSE refresh keep bulk actions aligned with the visibl
   await signIn(page);
   await page.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
   await expect(page.getByText("Filter one", { exact: true })).toBeVisible();
+  await expect(page.locator(".incidents-page")).toHaveAttribute("aria-busy", "false");
 
   const search = page.getByPlaceholder("Название, описание, источник или метка…");
   const requestsBeforeEquivalentSearch = state.incidentListRequests?.length ?? 0;

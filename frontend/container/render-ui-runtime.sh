@@ -4,12 +4,14 @@ set -eu
 ui_runtime_dir=${1:-/run/alert-hub/ui}
 runtime_tmp=""
 manifest_tmp=""
+guard_tmp=""
 
 cleanup() {
   status=$?
   trap - 0 TERM INT
   [ -z "${runtime_tmp}" ] || rm -f -- "${runtime_tmp}"
   [ -z "${manifest_tmp}" ] || rm -f -- "${manifest_tmp}"
+  [ -z "${guard_tmp}" ] || rm -f -- "${guard_tmp}"
   exit "${status}"
 }
 trap cleanup 0
@@ -121,26 +123,127 @@ json_app_name() {
   '
 }
 
+normalize_https_origin() {
+  label=$1
+  value=$2
+  [ -n "${value}" ] || return 0
+  printf '%s\n' "${value}" | awk -v label="${label}" '
+    {
+      candidate = $0
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", candidate)
+      if (candidate !~ /^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?\/?$/ || \
+          candidate ~ /\.(:[0-9]+)?\/?$/ || candidate ~ /\.\./) {
+        printf "%s must contain an exact public HTTPS origin\n", label > "/dev/stderr"
+        exit 1
+      }
+      sub(/\/$/, "", candidate)
+      port = candidate
+      sub(/^.*:/, "", port)
+      if (candidate ~ /:[0-9]+$/ && (port + 0 < 1 || port + 0 > 65535)) {
+        printf "%s contains an invalid port\n", label > "/dev/stderr"
+        exit 1
+      }
+      print candidate
+    }
+  '
+}
+
+json_https_origins() {
+  printf '%s\n' "$1" | awk '
+    BEGIN { printf "["; count = 0 }
+    {
+      total = split($0, values, ",")
+      for (item_index = 1; item_index <= total; item_index++) {
+        candidate = values[item_index]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", candidate)
+        if (!candidate) continue
+        if (candidate !~ /^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$/ || \
+            candidate ~ /\.(:[0-9]+)?$/ || candidate ~ /\.\./) {
+          print "PUBLIC_API_CANDIDATES must contain only exact public HTTPS origins" > "/dev/stderr"
+          exit 1
+        }
+        port = candidate
+        sub(/^.*:/, "", port)
+        if (candidate ~ /:[0-9]+$/ && (port + 0 < 1 || port + 0 > 65535)) {
+          print "PUBLIC_API_CANDIDATES contains an invalid port" > "/dev/stderr"
+          exit 1
+        }
+        if (seen[candidate]++) {
+          print "PUBLIC_API_CANDIDATES must contain unique origins" > "/dev/stderr"
+          failed = 1
+          exit 1
+        }
+        if (++count > 8) {
+          print "PUBLIC_API_CANDIDATES must contain at most 8 origins" > "/dev/stderr"
+          failed = 1
+          exit 1
+        }
+        separator = count > 1 ? "," : ""
+        printf "%s\"%s\"", separator, candidate
+      }
+    }
+    END { if (!failed) printf "]" }
+  '
+}
+
 umask 077
 mkdir -p "${ui_runtime_dir}"
 app_name_json=$(json_app_name 80)
 short_name_json=$(json_app_name 24)
+api_ha_mode=${API_HA_MODE:-single}
+case "${api_ha_mode}" in
+  single | client-failover | proxy-failover | external) ;;
+  *)
+    printf '%s\n' 'API_HA_MODE must be single, client-failover, proxy-failover, or external' >&2
+    exit 1
+    ;;
+esac
+node_public_api_url=$(normalize_https_origin NODE_PUBLIC_API_URL "${NODE_PUBLIC_API_URL:-}")
+candidate_input=${PUBLIC_API_CANDIDATES:-}
+public_api_candidates_json=$(json_https_origins "${candidate_input}")
+if [ "${api_ha_mode}" = client-failover ] && [ -z "${node_public_api_url}" ] && [ "${public_api_candidates_json}" = '[]' ]; then
+  printf '%s\n' 'client-failover requires NODE_PUBLIC_API_URL or PUBLIC_API_CANDIDATES' >&2
+  exit 1
+fi
+if [ -n "${node_public_api_url}" ]; then
+  node_public_api_json=\"${node_public_api_url}\"
+else
+  node_public_api_json=null
+fi
 runtime_tmp=$(mktemp "${ui_runtime_dir}/.runtime-config.js.XXXXXX")
 manifest_tmp=$(mktemp "${ui_runtime_dir}/.manifest.webmanifest.XXXXXX")
+guard_tmp=$(mktemp "${ui_runtime_dir}/.shell-guard.conf.XXXXXX")
 
-printf '%s%s%s\n' \
+printf '%s%s%s%s%s%s%s%s%s%s\n' \
   'Object.defineProperty(globalThis,"__ALERT_HUB_CONFIG__",{value:Object.freeze({"appName":' \
   "${app_name_json}" \
+  ',"apiHaMode":"' "${api_ha_mode}" \
+  '","nodePublicApiUrl":' "${node_public_api_json}" \
+  ',"publicApiCandidates":Object.freeze(' "${public_api_candidates_json}" ')' \
   '}),writable:false,configurable:false});' \
   >"${runtime_tmp}"
+
+case "${api_ha_mode}" in
+  client-failover | proxy-failover)
+    printf '%s\n' '# API-independent shell enabled by API_HA_MODE.' >"${guard_tmp}"
+    ;;
+  *)
+    printf '%s\n' \
+      'auth_request /_api_ready;' \
+      'error_page 500 502 503 504 =503 /service-unavailable.html;' \
+      >"${guard_tmp}"
+    ;;
+esac
 
 printf '%s%s%s%s%s\n' \
   '{"id":"/","name":' "${app_name_json}" ',"short_name":' "${short_name_json}" \
   ',"description":"Распределённый мониторинг инцидентов и отказоустойчивая доставка оповещений.","start_url":"/","scope":"/","display":"standalone","display_override":["window-controls-overlay","standalone","minimal-ui"],"orientation":"any","background_color":"#0A0A0B","theme_color":"#0A0A0B","categories":["productivity","utilities"],"icons":[{"src":"/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any"},{"src":"/icon-512.png","sizes":"512x512","type":"image/png","purpose":"maskable"}],"shortcuts":[{"name":"Активные инциденты","short_name":"Инциденты","description":"Открыть список активных инцидентов","url":"/incidents"},{"name":"Состояние кластера","short_name":"Кластер","description":"Проверить синхронизацию узлов","url":"/cluster"}]}' \
   >"${manifest_tmp}"
 
-chmod 0444 "${runtime_tmp}" "${manifest_tmp}"
+chmod 0444 "${runtime_tmp}" "${manifest_tmp}" "${guard_tmp}"
 mv -f "${runtime_tmp}" "${ui_runtime_dir}/runtime-config.js"
 runtime_tmp=""
 mv -f "${manifest_tmp}" "${ui_runtime_dir}/manifest.webmanifest"
 manifest_tmp=""
+mv -f "${guard_tmp}" "${ui_runtime_dir}/shell-guard.conf"
+guard_tmp=""

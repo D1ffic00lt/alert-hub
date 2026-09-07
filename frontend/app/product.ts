@@ -1,7 +1,14 @@
 export const DEFAULT_APP_NAME = "Alert Hub";
 
 declare global {
-  var __ALERT_HUB_CONFIG__: Readonly<{ appName?: unknown }> | undefined;
+  var __ALERT_HUB_CONFIG__:
+    | Readonly<{
+        appName?: unknown;
+        apiHaMode?: unknown;
+        nodePublicApiUrl?: unknown;
+        publicApiCandidates?: unknown;
+      }>
+    | undefined;
 }
 
 export function normalizeAppName(value: unknown): string {

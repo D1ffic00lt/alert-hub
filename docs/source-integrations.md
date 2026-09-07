@@ -24,6 +24,12 @@ management path and incident projection, but it deliberately does not exercise t
 public ingress, sender CIDR, or external system. Complete setup with one real request from the
 sender. Rotating a source token invalidates the previous token immediately.
 
+Generated webhook URLs use `PUBLIC_INGEST_URL` when it is configured. Keep this
+stable ingress origin separate from per-node `NODE_PUBLIC_API_URL` values used
+for browser failover; changing the active browser API must not rewrite source
+configuration. `PUBLIC_API_URL` remains the compatibility fallback for existing
+installations that have not split those origins yet.
+
 Prometheus is not an event source in this menu. Add it under **Regional reachability → Add
 datasource**; Alert Hub runs only its named backend-owned queries. Set the Grafana link and the
 allowed `job` globs under **Settings → Grafana and job selection**. Grafana webhook payloads are not
