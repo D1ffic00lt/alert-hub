@@ -5,6 +5,7 @@ import {
   blockedPermissionHelp,
   classifyPushClient,
   decodeApplicationServerKey,
+  deviceSessionIcon,
   pushDeviceName,
   withPushTimeout,
 } from "../../app/push.ts";
@@ -28,6 +29,16 @@ describe("Web Push client helpers", () => {
     const name = pushDeviceName(" MacIntel\n", "Mozilla/5.0 Safari/605.1.15", true);
     expect(name).toBe("MacIntel · установленное приложение");
     expect(name.length).toBeLessThanOrEqual(255);
+  });
+
+  it("chooses stable SVG device artwork without relying on platform glyphs", () => {
+    expect(deviceSessionIcon("MacIntel · browser", "Browser session")).toBe("device-desktop");
+    expect(deviceSessionIcon("Browser", "Mozilla/5.0 (Macintosh; Intel Mac OS X)")).toBe(
+      "device-desktop",
+    );
+    expect(deviceSessionIcon("iPhone · browser", "Browser session")).toBe("device-mobile");
+    expect(deviceSessionIcon("Android", "Mobile browser")).toBe("device-mobile");
+    expect(deviceSessionIcon("iPad · installed app", "Browser session")).toBe("device-tablet");
   });
 
   it("returns actionable permission recovery per browser", () => {
