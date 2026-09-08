@@ -35,6 +35,7 @@ import {
   currentPushClientEnvironment,
   currentPushDeviceName,
   decodeApplicationServerKey,
+  deviceSessionIcon,
   withPushTimeout,
 } from "./push";
 import { StatisticsOverview } from "./statistics/StatisticsOverview";
@@ -3316,6 +3317,27 @@ function iconArtwork(name: string): ReactNode | null {
         <>
           <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
           <path d="M10 18.5h4" />
+        </>
+      );
+    case "device-desktop":
+      return (
+        <>
+          <rect x="3" y="4" width="18" height="13" rx="2" />
+          <path d="M8 21h8M12 17v4" />
+        </>
+      );
+    case "device-mobile":
+      return (
+        <>
+          <rect x="7" y="2.5" width="10" height="19" rx="2.5" />
+          <path d="M11 18.5h2" />
+        </>
+      );
+    case "device-tablet":
+      return (
+        <>
+          <rect x="5" y="2.5" width="14" height="19" rx="2" />
+          <path d="M11.5 18.5h1" />
         </>
       );
     case "cluster":
@@ -8113,7 +8135,7 @@ function DevicesPage({
             {devices.map((device) => (
               <div className="device-row" key={device.id}>
                 <span className="device-illustration">
-                  <Icon symbol={device.platform.toLowerCase().includes("mac") ? "▭" : "▯"} />
+                  <Icon symbol={deviceSessionIcon(device.name, device.platform)} />
                 </span>
                 <span className="device-row__name">
                   <span>
