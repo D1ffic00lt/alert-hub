@@ -25,8 +25,10 @@ import {
 import {
   createRefreshBurstCoalescer,
   incidentListPath,
+  type IncidentTimelineSort,
   mergeIncidentSummariesWithHistory,
   normalizeIncidentSearch,
+  sortIncidentEventsByTime,
   sseReconnectDelay,
 } from "./incidents";
 import {
@@ -6204,6 +6206,7 @@ function IncidentDetailPage({
   const [busy, setBusy] = useState<string | null>(null);
   const [comment, setComment] = useState("");
   const [commentOpen, setCommentOpen] = useState(false);
+  const [timelineSort, setTimelineSort] = useState<IncidentTimelineSort>("newest_first");
   const [actionError, setActionError] = useState<string | null>(null);
   const applyDetail = useCallback(
     (payload: unknown) => {
@@ -6288,6 +6291,7 @@ function IncidentDetailPage({
       />
     );
   }
+  const timelineEvents = sortIncidentEventsByTime(incident.events, timelineSort);
   const mutate = async (action: "acknowledge" | "resolve" | "silence") => {
     if (readOnly) return;
     setBusy(action);
@@ -6445,15 +6449,28 @@ function IncidentDetailPage({
           eyebrow={tr("Неизменяемая история", "Immutable history")}
           title={tr("Хронология инцидента", "Incident timeline")}
           action={
-            readOnly ? null : (
-              <button
-                className="button button--quiet button--small"
-                onClick={() => setCommentOpen((value) => !value)}
-              >
-                <Icon symbol="+" />
-                {tr("Добавить комментарий", "Add comment")}
-              </button>
-            )
+            <div className="timeline-panel__actions">
+              <label className="timeline-sort">
+                <span>{tr("Порядок", "Order")}</span>
+                <select
+                  aria-label={tr("Порядок событий", "Event order")}
+                  value={timelineSort}
+                  onChange={(event) => setTimelineSort(event.target.value as IncidentTimelineSort)}
+                >
+                  <option value="newest_first">{tr("Новые в начале", "Newest first")}</option>
+                  <option value="oldest_first">{tr("Новые в конце", "Oldest first")}</option>
+                </select>
+              </label>
+              {!readOnly && (
+                <button
+                  className="button button--quiet button--small"
+                  onClick={() => setCommentOpen((value) => !value)}
+                >
+                  <Icon symbol="+" />
+                  {tr("Добавить комментарий", "Add comment")}
+                </button>
+              )}
+            </div>
           }
         >
           {commentOpen && (
@@ -6485,9 +6502,9 @@ function IncidentDetailPage({
               </div>
             </form>
           )}
-          {incident.events.length ? (
+          {timelineEvents.length ? (
             <div className="timeline">
-              {incident.events.map((event, index) => (
+              {timelineEvents.map((event, index) => (
                 <div className="timeline-item" key={event.id}>
                   <div className="timeline-item__rail">
                     <span className={`timeline-icon timeline-icon--${event.type}`}>
@@ -6505,7 +6522,7 @@ function IncidentDetailPage({
                         }
                       />
                     </span>
-                    {index < incident.events.length - 1 && <i />}
+                    {index < timelineEvents.length - 1 && <i />}
                   </div>
                   <div className="timeline-item__content">
                     <div>

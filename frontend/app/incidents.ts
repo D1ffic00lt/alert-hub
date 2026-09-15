@@ -9,6 +9,36 @@ type IncidentSnapshot = {
   checksRelationState?: string;
 };
 
+export type IncidentTimelineSort = "newest_first" | "oldest_first";
+
+type IncidentTimelineEvent = {
+  id: string;
+  at: string;
+};
+
+export function sortIncidentEventsByTime<T extends IncidentTimelineEvent>(
+  events: readonly T[],
+  order: IncidentTimelineSort,
+): T[] {
+  const direction = order === "newest_first" ? -1 : 1;
+  return [...events].sort((left, right) => {
+    const leftTimestamp = Date.parse(left.at);
+    const rightTimestamp = Date.parse(right.at);
+    const leftIsValid = Number.isFinite(leftTimestamp);
+    const rightIsValid = Number.isFinite(rightTimestamp);
+
+    if (leftIsValid && rightIsValid) {
+      return (
+        direction * (leftTimestamp - rightTimestamp) || direction * left.id.localeCompare(right.id)
+      );
+    }
+    if (leftIsValid !== rightIsValid) return leftIsValid ? -1 : 1;
+    return (
+      direction * left.at.localeCompare(right.at) || direction * left.id.localeCompare(right.id)
+    );
+  });
+}
+
 export function mergeIncidentSummariesWithHistory<T extends IncidentSnapshot>(
   summaries: T[],
   current: T[],
