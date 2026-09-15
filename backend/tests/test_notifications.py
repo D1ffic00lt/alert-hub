@@ -711,6 +711,10 @@ def test_worker_records_delivery_timeline_and_preserves_event_snapshot(
         delivery = db.query(Delivery).one()
         assert delivery.status == "succeeded"
         assert db.get(Outbox, event_id).completed_at is not None
+        attempted = db.query(IncidentEvent).filter_by(event_type="delivery_attempted").one()
+        assert attempted.occurred_at == now
+        assert attempted.payload_json["owner_node_id"] == settings.node_id
+        assert attempted.payload_json["status"] == "sending"
         timeline = db.query(IncidentEvent).filter_by(event_type="delivery_succeeded").one()
         assert timeline.payload_json["delivery_id"] == delivery.id
 
@@ -745,7 +749,10 @@ def test_web_push_delivery_success_and_receipts_advance_subscription_monotonical
         assert subscription is not None
         assert subscription.last_success_at == delivered_at
         receipt = db.scalar(
-            select(ClusterEvent).where(ClusterEvent.entity_type == "delivery_receipt")
+            select(ClusterEvent).where(
+                ClusterEvent.entity_type == "delivery_receipt",
+                ClusterEvent.operation == "delivery_succeeded",
+            )
         )
         assert receipt is not None
         assert receipt.payload_json["subscription_id"] == subscription_id
@@ -922,7 +929,9 @@ def test_worker_retries_after_restart_without_duplicate_delivery(app: Any, setti
     assert len(provider.calls) == 2
 
 
-def test_secondary_node_waits_then_takes_over(app: Any, settings: Any) -> None:
+def test_secondary_node_never_takes_over_without_a_fenced_owner_transition(
+    app: Any, settings: Any
+) -> None:
     _initialize_processor_database(app, settings)
     now = datetime(2026, 2, 3, tzinfo=UTC)
     event_id = new_id()
@@ -963,9 +972,47 @@ def test_secondary_node_waits_then_takes_over(app: Any, settings: Any) -> None:
 
     assert asyncio.run(processor.run_once()) == 1
     assert provider.calls == []
-    clock.value += timedelta(seconds=settings.notification_failover_base_seconds)
+    clock.value += timedelta(days=7)
     assert asyncio.run(processor.run_once()) == 1
-    assert len(provider.calls) == 1
+    assert provider.calls == []
+    with app.state.session_factory() as db:
+        outbox = db.get(Outbox, event_id)
+        assert outbox is not None and outbox.completed_at is None
+        assert outbox.last_error == "awaiting_owner_receipt"
+
+
+def test_explicit_channel_nodes_stabilize_owner_before_inventory_converges(
+    app: Any, settings: Any
+) -> None:
+    _initialize_processor_database(app, settings)
+    now = datetime(2026, 2, 3, tzinfo=UTC)
+    event_id = new_id()
+    peer_id = "configured-peer"
+    candidates = [
+        NodeCandidate(settings.node_id, settings.node_region, frozenset({"notify"})),
+        NodeCandidate(peer_id, "", frozenset({"notify"})),
+    ]
+    while True:
+        channel_id = new_id()
+        if rank_delivery_nodes(f"event-{event_id}", channel_id, candidates, {})[0] == peer_id:
+            break
+    _seed_event(app, settings, now=now, event_id=event_id, channel_id=channel_id)
+    with app.state.session_factory.begin() as db:
+        channel = db.get(NotificationChannel, channel_id)
+        assert channel is not None
+        channel.eligible_nodes_or_regions = {"node_ids": [settings.node_id, peer_id]}
+
+    provider = _SequenceProvider(DeliveryResult("succeeded", "http_204"))
+    processor = NotificationOutboxProcessor(
+        app.state.session_factory,
+        settings,
+        app.state.envelope_cipher,
+        ProviderRegistry({"generic_webhook": provider}),
+        now=_Clock(now + timedelta(days=7)),
+    )
+
+    assert asyncio.run(processor.run_once()) >= 1
+    assert provider.calls == []
 
 
 def test_no_eligible_delivery_remains_visible_and_queued(app: Any, settings: Any) -> None:

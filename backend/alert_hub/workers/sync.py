@@ -18,8 +18,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from alert_hub.application.cluster_health import (
-    PEER_OFFLINE_FAILURE_THRESHOLD,
-    record_node_api_down,
     resolve_node_api_alert,
 )
 from alert_hub.application.sync import (
@@ -421,27 +419,9 @@ class PeerSyncWorker:
                 "exception_type": type(exc).__name__,
             },
         )
-        if node_id is not None and failure_count >= PEER_OFFLINE_FAILURE_THRESHOLD:
-            try:
-                with self.session_factory.begin() as db:
-                    node = db.get(Node, node_id)
-                    if node is not None:
-                        record_node_api_down(
-                            db,
-                            node,
-                            self.settings,
-                            failure_count=failure_count,
-                        )
-            except Exception as alert_exc:
-                logger.error(
-                    "peer_api_alert_update_failed",
-                    extra={
-                        "event": "peer_api_alert_update_failed",
-                        "peer_node_id": node_id,
-                        "operation": "firing",
-                        "exception_type": type(alert_exc).__name__,
-                    },
-                )
+        # A failure here proves only that this observer could not complete the
+        # private synchronization request. It does not prove that the target's
+        # public API is unavailable, so it must never open an API-down incident.
 
     def _mark_success(self, state: PeerState) -> None:
         with self._state_lock:
@@ -458,6 +438,9 @@ class PeerSyncWorker:
                 with self.session_factory.begin() as db:
                     node = db.get(Node, node_id)
                     if node is not None:
+                        # Drain incidents created by releases that inferred public
+                        # API availability from this private peer path. The peer
+                        # worker can resolve that legacy state, but cannot reopen it.
                         resolve_node_api_alert(
                             db,
                             node,

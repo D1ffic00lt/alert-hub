@@ -55,24 +55,18 @@ from the third consecutive failure, and unknown before an attempt has produced e
 is the worker's current cursor evidence, not an estimate from the durable `last_seen_at` field. The
 UI refreshes this runtime view every 30 seconds even while its cluster-event stream is connected.
 
-Administrators configure peer-generated API outage incidents under **Cluster → API-down alerts**.
-The setting is per node, can be applied to any selected set or to all known nodes, is audited, and
-replicates as append-only `node_api_alert_setting` history. Enabling it for an already-offline peer
-opens the incident immediately on the serving node. Otherwise, after three consecutive failures
-of the authenticated peer health check, every live observer with that verified peer identity may
-create a critical `AlertHubNodeApiDown` incident. A later successful authenticated check resolves
-it. The worker persists its verified endpoint-to-node association locally so an API outage that
-continues across an observer restart is still attributable; a URL is never treated as identity
-until a successful handshake has proved the node ID.
+Administrators configure per-node API outage settings under **Cluster → API-down alerts**. The
+setting is audited and replicates as append-only `node_api_alert_setting` history, but automatic
+firing is temporarily disarmed: private authenticated peer-sync failures describe replication
+health and are not evidence that the public API is unavailable. A successful peer request resolves
+any legacy `AlertHubNodeApiDown` incident created by an earlier release, and peer failures cannot
+reopen it. The saved setting is retained for a future independently verified public-readiness
+signal; disabling it also resolves any active legacy incident.
 
 The managed incident source is not an ingest credential and is omitted from editable Sources.
-Its firing and resolved events use the normal durable notification outbox. They match notification
-routes with an empty source filter ("any source"); severity and label matchers still apply. Keep at
-least one such route to an independent receiver if API-down notifications are required. Multiple
-observers may emit duplicate firing events during a partition by design; preserving the outage is
-preferred to suppressing every duplicate. Disabling monitoring resolves an active API-down
-incident. A node cannot watch itself, so enable the setting on each target and configure at least
-one other peer to observe it.
+Legacy resolved events use the normal durable notification outbox. External monitoring should
+check each node's public `/health/ready` endpoint until independent public-readiness observation is
+implemented in Alert Hub.
 
 Administrators set the optional Grafana HTTPS dashboard link and the bounded `job` glob lists under
 **Settings → Grafana and job selection**. The values are audited and replicated as append-only
@@ -642,9 +636,12 @@ The current repository runs periodic peer pull with pagination, persisted vector
 exponential backoff, deterministic projection replay, and peer health/lag metrics. Heartbeat
 requests append replicated observation events; the projection uses the newest observation and
 reconciles missed/restored incidents across either arrival order. Notification ownership and
-delivery IDs use the logical incident event key, while replicated receipts map that key to each
-node's local event row before suppressing reserve delivery. These behaviors have separate-database
-regressions, but a true partition can still duplicate delivery by design.
+delivery IDs use the logical incident event key. Only the deterministic rank-zero owner calls the
+provider; reserve work stays queued and polls for replicated attempt and result receipts instead
+of taking over after a local timeout. Explicit channel node eligibility is used even while
+inventory replication is delayed. These behaviors have separate-database partition regressions.
+Automatic notification-owner failover is intentionally unavailable until a fenced ownership
+transition can prevent the previous owner from sending.
 
 Empty-cursor replay can rebuild a node while complete cluster history is retained. This is not a
 compact snapshot protocol: do not prune cluster history until a retention/snapshot design and

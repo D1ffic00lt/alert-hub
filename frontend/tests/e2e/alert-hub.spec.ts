@@ -98,6 +98,7 @@ type MockState = {
   clusterStatus?: unknown;
   clusterApiAlertRequests?: Array<Record<string, unknown>>;
   checksDetails?: Record<string, Record<string, unknown>>;
+  checksMissingOnPrimary?: string[];
   checksGate?: Promise<void> | null;
   checksItems?: Array<Record<string, unknown>>;
   checksMode?: "disabled" | "ready" | "unavailable";
@@ -457,7 +458,11 @@ async function installApi(page: Page, state: MockState) {
     if (method === "GET" && path.startsWith("/checks/")) {
       const checksMode = state.checksMode ?? "disabled";
       const checkId = decodeURIComponent(path.slice("/checks/".length));
-      const check = state.checksDetails?.[checkId] ?? null;
+      const check =
+        state.checksMissingOnPrimary?.includes(checkId) &&
+        request.headers()["x-e2e-api-endpoint"] !== "reserve"
+          ? null
+          : (state.checksDetails?.[checkId] ?? null);
       const common = {
         enabled: checksMode !== "disabled",
         data_state:
@@ -2101,7 +2106,9 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
   await page.setViewportSize({ width: 390, height: 844 });
   const longIdRow = page.getByRole("link", { name: "Открыть Check Simple check" });
   await expect(longIdRow.locator(".check-identity__id")).toHaveText(fixtures.longCheckId);
-  await expect(longIdRow.locator("button, a")).toHaveCount(0);
+  await expect(
+    longIdRow.getByRole("link", { name: /Открыть Check в новой вкладке Simple check/ }),
+  ).toHaveAttribute("href", `/checks/${encodeURIComponent(fixtures.longCheckId)}`);
   await longIdRow.focus();
   await expect(longIdRow).toBeFocused();
   const detailGate = deferredGate();
@@ -2206,6 +2213,10 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
   await expect(page.getByRole("heading", { name: "Checkout incident" })).toBeVisible();
   const relatedChecks = page.getByRole("navigation", { name: "Связанные Checks" });
   await expect(relatedChecks).toContainText("complex-check");
+  await expect(relatedChecks.getByRole("link", { name: /complex-check/ })).toHaveAttribute(
+    "href",
+    "/checks/complex-check",
+  );
   await expect(relatedChecks.getByRole("button", { name: /must-not-become-a-link/ })).toHaveCount(
     0,
   );
@@ -2256,6 +2267,73 @@ test("Checks disabled route is explicit and a refresh failure clears the previou
   await expect(page.locator(".check-detail-hero")).toHaveCount(0);
   await expect(page.getByText(/Прежний успешный результат скрыт/)).toBeVisible();
   await expect(page.getByText("check_ttfb_unavailable")).toBeVisible();
+});
+
+test("Check deep links survive direct load, refresh, history, new tab, and source-local API failover", async ({
+  context,
+  page,
+}) => {
+  const fixtures = checksFixtures();
+  const checkId = "complex-check";
+  const primaryBase = "https://api-de.alerts.example.test";
+  const reserveBase = "https://api-ru.alerts.example.test";
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    checksDetails: fixtures.details,
+    checksItems: fixtures.items,
+    checksMissingOnPrimary: [checkId],
+    checksMode: "ready",
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installClientFailoverRuntime(page, primaryBase, reserveBase);
+  await installApi(page, state);
+  await signIn(page);
+
+  const href = `/checks/${encodeURIComponent(checkId)}`;
+  state.refreshResponseStatuses = [200];
+  await page.goto(href);
+  await expect(page).toHaveURL(new RegExp(`${href}$`));
+  await expect(page.getByRole("heading", { name: "Complex customer path" })).toBeVisible();
+
+  state.refreshResponseStatuses = [200];
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Complex customer path" })).toBeVisible();
+
+  await page.getByRole("button", { name: "← Checks" }).click();
+  await expect(page).toHaveURL(/\/checks$/);
+  await page.goBack();
+  await expect(page.getByRole("heading", { name: "Complex customer path" })).toBeVisible();
+  await page.goForward();
+  await expect(page).toHaveURL(/\/checks$/);
+
+  const newPage = await context.newPage();
+  await newPage.addInitScript(() => localStorage.setItem("alert-hub-ui-language", "ru"));
+  await installClientFailoverRuntime(newPage, primaryBase, reserveBase);
+  await installApi(newPage, state);
+  state.refreshResponseStatuses = [200];
+  await newPage.goto(href);
+  await expect(newPage.getByRole("heading", { name: "Complex customer path" })).toBeVisible();
+  await newPage.close();
+
+  const requests = await page.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __e2eApiRequests: Array<{ endpoint: string; method: string; path: string }>;
+        }
+      ).__e2eApiRequests,
+  );
+  const detailRequests = requests.filter(
+    ({ method, path }) => method === "GET" && path === `/api/v1${href}`,
+  );
+  expect(detailRequests.some(({ endpoint }) => endpoint === "primary")).toBe(true);
+  expect(detailRequests.some(({ endpoint }) => endpoint === "reserve")).toBe(true);
 });
 
 test("Alerts groups HA rules by dynamic category, preserves datasource state, and stays responsive", async ({

@@ -10,7 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
 
 import { AlertsPage } from "./alerts/AlertsPage";
 import { createAsyncRequestLimiter } from "./api/concurrency";
@@ -35,6 +35,7 @@ import {
   currentPushClientEnvironment,
   currentPushDeviceName,
   decodeApplicationServerKey,
+  deviceSessionIcon,
   withPushTimeout,
 } from "./push";
 import { StatisticsOverview } from "./statistics/StatisticsOverview";
@@ -1248,6 +1249,7 @@ const EVENT_TYPE_LABELS: Record<string, readonly [string, string]> = {
   acknowledged: ["Инцидент принят в работу", "Acknowledged"],
   silenced: ["Инцидент приглушён", "Silenced"],
   commented: ["Добавлен комментарий", "Commented"],
+  delivery_attempted: ["Начата отправка уведомления", "Delivery Attempted"],
   delivery_succeeded: ["Уведомление доставлено", "Delivery Succeeded"],
   delivery_failed: ["Ошибка доставки", "Delivery Failed"],
   delivery_retry: ["Повторная доставка", "Delivery Retry"],
@@ -2121,6 +2123,7 @@ async function apiFetch(
   init: RequestInit = {},
   expectedAuthGeneration?: number,
   expectedSessionId?: string | null,
+  endpointOptions: { retryNotFound?: boolean } = {},
 ) {
   const assertExpectedAuthContext = () => {
     if (
@@ -2157,6 +2160,7 @@ async function apiFetch(
   const requestInit = { ...init, credentials: "include" as RequestCredentials, headers };
   let response = await apiEndpointManager.fetchApi(path, requestInit, {
     replayRefresh: path === "/auth/refresh",
+    retryNotFound: endpointOptions.retryNotFound,
   });
   assertExpectedAuthContext();
   if (response.status === 401 && !path.startsWith("/auth/")) {
@@ -2167,7 +2171,7 @@ async function apiFetch(
     if (refreshed && memoryAccessToken) {
       headers.set("Authorization", `Bearer ${memoryAccessToken}`);
       if (memorySessionId) headers.set("X-Alert-Hub-Cache-Partition", memorySessionId);
-      response = await apiEndpointManager.fetchApi(path, requestInit);
+      response = await apiEndpointManager.fetchApi(path, requestInit, endpointOptions);
       assertExpectedAuthContext();
     }
   }
@@ -2262,7 +2266,11 @@ function useOverviewStatistics(demo: boolean): {
 }
 
 async function getChecksJson(path: string, signal: AbortSignal): Promise<ChecksRequestResult> {
-  const response = await apiFetch(path, { cache: "no-store", signal });
+  const detailSegment = /^\/checks\/([^/?]+)(?:[?#]|$)/u.exec(path)?.[1];
+  const checkDetailRequest = Boolean(detailSegment && detailSegment !== "summary");
+  const response = await apiFetch(path, { cache: "no-store", signal }, undefined, undefined, {
+    retryNotFound: checkDetailRequest,
+  });
   const payload = (await response.json().catch(() => ({}))) as unknown;
   return { status: response.status, payload };
 }
@@ -3309,6 +3317,27 @@ function iconArtwork(name: string): ReactNode | null {
         <>
           <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
           <path d="M10 18.5h4" />
+        </>
+      );
+    case "device-desktop":
+      return (
+        <>
+          <rect x="3" y="4" width="18" height="13" rx="2" />
+          <path d="M8 21h8M12 17v4" />
+        </>
+      );
+    case "device-mobile":
+      return (
+        <>
+          <rect x="7" y="2.5" width="10" height="19" rx="2.5" />
+          <path d="M11 18.5h2" />
+        </>
+      );
+    case "device-tablet":
+      return (
+        <>
+          <rect x="5" y="2.5" width="14" height="19" rx="2" />
+          <path d="M11.5 18.5h1" />
         </>
       );
     case "cluster":
@@ -6400,13 +6429,13 @@ function IncidentDetailPage({
               <Icon symbol="checks" /> {tr("Связанные Checks", "Related Checks")}
             </span>
             {incident.checkIds?.map((checkId) => (
-              <button
+              <Link
                 key={checkId}
                 className="button button--quiet button--small"
-                onClick={() => navigate(`/checks/${encodeURIComponent(checkId)}`)}
+                to={`/checks/${encodeURIComponent(checkId)}`}
               >
                 <code>{checkId}</code> <span aria-hidden="true">→</span>
-              </button>
+              </Link>
             ))}
           </nav>
         )}
@@ -8106,7 +8135,7 @@ function DevicesPage({
             {devices.map((device) => (
               <div className="device-row" key={device.id}>
                 <span className="device-illustration">
-                  <Icon symbol={device.platform.toLowerCase().includes("mac") ? "▭" : "▯"} />
+                  <Icon symbol={deviceSessionIcon(device.name, device.platform)} />
                 </span>
                 <span className="device-row__name">
                   <span>
@@ -8327,8 +8356,8 @@ function ClusterPage({
           <div className="cluster-api-alerts__intro">
             <p>
               {tr(
-                "После трёх подряд ошибок живой peer создаст critical-инцидент и отправит его по обычным маршрутам уведомлений. Для мониторинга нужен хотя бы один другой настроенный узел.",
-                "After three consecutive failures, a live peer creates a critical incident and sends it through the normal notification routes. Monitoring requires at least one other configured node.",
+                "Автоматическая отправка временно приостановлена: ошибки приватной peer-синхронизации не доказывают недоступность публичного API. Настройки сохранены; доступность пока проверяйте внешним мониторингом через /health/ready.",
+                "Automatic delivery is temporarily paused: private peer-sync failures do not prove public API unavailability. Settings are preserved; monitor /health/ready externally for now.",
               )}
             </p>
           </div>

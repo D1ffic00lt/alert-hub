@@ -259,7 +259,11 @@ def apply_delivery_receipt(db: Session, payload: Mapping[str, Any]) -> bool:
     existing = db.get(Delivery, delivery_id)
     status = str(payload.get("status") or "pending")
     if existing is not None and existing.status == "succeeded" and status != "succeeded":
-        return False
+        # Late attempt/failure receipts must not regress success, but their
+        # immutable timeline evidence still identifies every sending node.
+        _apply_delivery_timeline(db, payload, existing)
+        db.flush()
+        return True
     if existing is None:
         from alert_hub.infrastructure.db.models import NotificationChannel
 
@@ -326,7 +330,16 @@ def _apply_delivery_timeline(
         )
     except (TypeError, ValueError):
         occurred_at = source_event.received_at
-    event_type = "delivery_succeeded" if delivery.status == "succeeded" else "delivery_failed"
+    status = str(payload.get("status") or delivery.status)
+    event_type = {
+        "sending": "delivery_attempted",
+        "succeeded": "delivery_succeeded",
+    }.get(status, "delivery_failed")
+    owner_node_id = str(payload.get("owner_node_id") or delivery.owner_node_id)
+    try:
+        attempt = int(payload.get("attempt") or delivery.attempt)
+    except (TypeError, ValueError):
+        attempt = delivery.attempt
     db.add(
         IncidentEvent(
             id=receipt_event_id,
@@ -343,11 +356,11 @@ def _apply_delivery_timeline(
                 "delivery_id": delivery.id,
                 "channel_id": delivery.channel_id,
                 "subscription_id": delivery.subscription_id,
-                "owner_node_id": delivery.owner_node_id,
-                "attempt": delivery.attempt,
-                "status": delivery.status,
-                "provider_status": delivery.provider_status,
-                "error_code": delivery.error_code,
+                "owner_node_id": owner_node_id,
+                "attempt": attempt,
+                "status": status,
+                "provider_status": _safe_status(payload.get("provider_status")),
+                "error_code": _safe_status(payload.get("error_code")),
                 "source_event_id": delivery.event_id,
             },
         )

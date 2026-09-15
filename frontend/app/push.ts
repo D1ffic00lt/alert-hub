@@ -1,5 +1,7 @@
 export type PushBrowserFamily = "chromium" | "firefox" | "safari" | "other";
 
+export type DeviceSessionIcon = "device-desktop" | "device-mobile" | "device-tablet";
+
 export type PushClientEnvironment = {
   browser: PushBrowserFamily;
   ios: boolean;
@@ -85,6 +87,15 @@ export function currentPushDeviceName(language: "ru" | "en" = "ru"): string {
   const platform =
     environment.ios && /^mac/i.test(navigator.platform) ? "iPad" : navigator.platform;
   return pushDeviceName(platform, navigator.userAgent, environment.standalone, language);
+}
+
+export function deviceSessionIcon(name: string, platform: string): DeviceSessionIcon {
+  const fingerprint = `${name} ${platform}`.toLowerCase();
+  if (/ipad|tablet|планшет/u.test(fingerprint)) return "device-tablet";
+  if (/iphone|ipod|android|mobile|phone|телефон|смартфон/u.test(fingerprint)) {
+    return "device-mobile";
+  }
+  return "device-desktop";
 }
 
 export function blockedPermissionHelp(environment: PushClientEnvironment): string {

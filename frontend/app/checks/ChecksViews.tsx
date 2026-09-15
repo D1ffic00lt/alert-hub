@@ -6,6 +6,7 @@ import {
   useMemo,
   useState,
 } from "react";
+import { Link } from "react-router-dom";
 
 import {
   CHECK_STATUSES,
@@ -605,10 +606,10 @@ export function ChecksWidget({
               {problems.map((check) => {
                 const identity = checkIdentity(check);
                 return (
-                  <button
+                  <Link
                     key={check.checkId}
                     className="checks-problem-row"
-                    onClick={() => navigate(`/checks/${encodeURIComponent(check.checkId)}`)}
+                    to={`/checks/${encodeURIComponent(check.checkId)}`}
                   >
                     <CheckStatusBadge status={check.status} language={language} compact />
                     <span>
@@ -624,7 +625,7 @@ export function ChecksWidget({
                       </small>
                     </span>
                     <span aria-hidden="true">›</span>
-                  </button>
+                  </Link>
                 );
               })}
             </div>
@@ -967,7 +968,8 @@ function ChecksTable({
           {items.map((check) => {
             const identity = checkIdentity(check);
             const showInstances = check.instances.length > 0 && check.instancesTotal > 1;
-            const open = () => navigate(`/checks/${encodeURIComponent(check.checkId)}`);
+            const href = `/checks/${encodeURIComponent(check.checkId)}`;
+            const open = () => navigate(href);
             const onKeyDown = (event: ReactKeyboardEvent<HTMLTableRowElement>) => {
               if (event.key !== "Enter") return;
               event.preventDefault();
@@ -1053,8 +1055,14 @@ function ChecksTable({
                     ? tx(language, "Недоступно", "Unavailable")
                     : check.activeAlerts}
                 </td>
-                <td className="checks-table__open" aria-hidden="true">
-                  <span>›</span>
+                <td className="checks-table__open">
+                  <Link
+                    to={href}
+                    aria-label={`${tx(language, "Открыть Check в новой вкладке", "Open Check in a new tab")} ${identity.primary}`}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <span aria-hidden="true">›</span>
+                  </Link>
                 </td>
               </tr>
             );

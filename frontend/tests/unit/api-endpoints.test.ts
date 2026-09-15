@@ -115,6 +115,35 @@ describe("API endpoint manager", () => {
     expect(unauthorizedFetch).toHaveBeenCalledTimes(1);
   });
 
+  it("retries a source-local Check 404 on healthy APIs without changing its identifier", async () => {
+    const path = "/checks/checkout%3Aeu%2Bcanary";
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      calls.push(url);
+      return new Response("{}", {
+        status: new URL(url).origin === DEAD ? 404 : 200,
+      });
+    }) as typeof fetch;
+    const manager = clientManager(fetchImpl);
+
+    const response = await manager.fetchApi(path, {}, { retryNotFound: true });
+
+    expect(response.status).toBe(200);
+    expect(calls).toEqual([`${DEAD}/api/v1${path}`, `${LIVE}/api/v1${path}`]);
+    expect(manager.snapshot().activeOrigin).toBe(DEAD);
+  });
+
+  it("returns an explicit Check 404 after every healthy API reports it missing", async () => {
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 404 })) as typeof fetch;
+    const manager = clientManager(fetchImpl);
+
+    expect((await manager.fetchApi("/checks/missing", {}, { retryNotFound: true })).status).toBe(
+      404,
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it("shares recovery probing when concurrent reads fail on the active endpoint", async () => {
     const calls: string[] = [];
     const fetchImpl = vi.fn(async (input: string | URL | Request) => {

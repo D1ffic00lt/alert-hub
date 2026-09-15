@@ -875,8 +875,8 @@ fi
   exit 1
 }
 
-phase 'checking receipt suppression beyond every secondary failover delay'
-# Three candidates have ranks 0..2 and the CI failover base is three seconds.
+phase 'checking reserves remain suppressed after repeated owner-receipt polls'
+# The compatibility setting is three seconds; it now controls reserve receipt polling only.
 sleep 8
 wait_notification_outboxes_idle
 wait_notification_receipts
@@ -897,4 +897,4 @@ for node in node-ru node-nl node-de; do
 done
 
 printf '%s\n' \
-  'Controlled three-node Docker CI substitute passed: partition, process loss, restart, cursor convergence, deterministic projection, dedupe, re-fire, single-owner webhook delivery, and replicated-receipt suppression.'
+  'Controlled three-node Docker CI substitute passed: partition, process loss, restart, cursor convergence, deterministic projection, dedupe, re-fire, rank-zero webhook delivery, and replicated attempt/result suppression.'

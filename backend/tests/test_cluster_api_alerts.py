@@ -8,7 +8,10 @@ import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from alert_hub.application.cluster_health import CLUSTER_API_HEALTH_SOURCE_ID
+from alert_hub.application.cluster_health import (
+    CLUSTER_API_HEALTH_SOURCE_ID,
+    record_node_api_down,
+)
 from alert_hub.application.sync import IncomingClusterEvent, apply_cluster_events
 from alert_hub.infrastructure.db.models import (
     ClusterEvent,
@@ -21,7 +24,7 @@ from alert_hub.infrastructure.db.models import (
 from alert_hub.workers.sync import PeerSyncWorker
 
 
-def test_bulk_api_down_alert_setting_opens_and_resolves_offline_incident(
+def test_bulk_api_down_alert_setting_does_not_treat_offline_peer_as_api_outage(
     client: TestClient,
     auth: dict[str, str],
     app,
@@ -59,7 +62,7 @@ def test_bulk_api_down_alert_setting_opens_and_resolves_offline_incident(
     assert enabled.json() == {
         "updated": 1,
         "unchanged": 0,
-        "alerts_opened": 1,
+        "alerts_opened": 0,
         "nodes": [{"id": "remote-node", "api_down_alert_enabled": True}],
     }
 
@@ -71,9 +74,7 @@ def test_bulk_api_down_alert_setting_opens_and_resolves_offline_incident(
 
     incidents = client.get("/api/v1/incidents?status=active", headers=auth)
     assert incidents.status_code == 200, incidents.text
-    assert incidents.json()["items"][0]["title"] == "API unavailable: Germany"
-    assert incidents.json()["items"][0]["severity"] == "critical"
-    assert incidents.json()["items"][0]["source_name"] == "Cluster API health"
+    assert incidents.json()["items"] == []
 
     # The managed source powers routing and replication but is not editable as a
     # regular webhook source in the operator UI.
@@ -100,9 +101,9 @@ def test_bulk_api_down_alert_setting_opens_and_resolves_offline_incident(
         incident = db.scalar(
             select(Incident).where(Incident.source_id == CLUSTER_API_HEALTH_SOURCE_ID)
         )
-        assert incident is not None and incident.status == "resolved"
-        assert int(db.scalar(select(func.count(IncidentEvent.id))) or 0) == 2
-        assert int(db.scalar(select(func.count(Outbox.id))) or 0) == 2
+        assert incident is None
+        assert int(db.scalar(select(func.count(IncidentEvent.id))) or 0) == 0
+        assert int(db.scalar(select(func.count(Outbox.id))) or 0) == 0
         setting_events = db.scalars(
             select(ClusterEvent).where(ClusterEvent.entity_type == "node_api_alert_setting")
         ).all()
@@ -137,7 +138,7 @@ def test_bulk_api_down_alert_setting_rejects_unknown_nodes_atomically(
         )
 
 
-def test_peer_worker_alerts_after_threshold_and_resolves_after_recovery(
+def test_peer_worker_does_not_open_api_alert_during_failure_recovery_flapping(
     app,
     settings,
 ) -> None:
@@ -189,10 +190,18 @@ def test_peer_worker_alerts_after_threshold_and_resolves_after_recovery(
                 await worker.sync_once()
             with app.state.session_factory() as db:
                 events = db.scalars(select(IncidentEvent).order_by(IncidentEvent.occurred_at)).all()
-                assert [event.event_type for event in events] == ["firing"]
+                assert events == []
+            with app.state.session_factory.begin() as db:
+                node = db.get(Node, "germany-node")
+                assert node is not None
+                assert record_node_api_down(db, node, worker_settings, failure_count=4)
             available[0] = True
             clock[0] = 0.4
             await worker.sync_once()
+            available[0] = False
+            for attempt in range(5, 13):
+                clock[0] = attempt * 0.1
+                await worker.sync_once()
 
     with TestClient(app):
         with app.state.session_factory.begin() as db:

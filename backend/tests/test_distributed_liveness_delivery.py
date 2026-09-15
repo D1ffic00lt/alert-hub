@@ -432,7 +432,9 @@ def test_connected_nodes_use_logical_event_identity_and_replicated_receipt(
             assert delivery is not None and delivery.status == "succeeded"
             assert delivery.event_id == f"event-{secondary}"
 
-        clocks[secondary].value += timedelta(seconds=60)
+        clocks[secondary].value += timedelta(
+            seconds=settings[secondary].notification_failover_base_seconds
+        )
         assert asyncio.run(processors[secondary].run_once()) == 1
         assert providers[secondary].calls == []
         assert sum(len(provider.calls) for provider in providers.values()) == 1
@@ -534,7 +536,7 @@ def test_incident_and_receipt_in_same_sync_page_project_receipt_once(
             assert len(receipt_timeline) == 1
 
 
-def test_partitioned_duplicate_deliveries_keep_distinct_receipt_history(
+def test_partitioned_nodes_do_not_promote_reserves_after_local_timeouts(
     tmp_path: Path,
 ) -> None:
     sender_ids = ("notify-a", "notify-b")
@@ -565,25 +567,43 @@ def test_partitioned_duplicate_deliveries_keep_distinct_receipt_history(
                 now=now,
             )
 
-        for node in sender_ids:
-            processor = NotificationOutboxProcessor(
+        ranking = rank_delivery_nodes(
+            event_key,
+            channel_id,
+            [NodeCandidate(node, node, frozenset({"notify"})) for node in sender_ids],
+            {},
+        )
+        owner, reserve = ranking
+        processors = {
+            node: NotificationOutboxProcessor(
                 apps[node].state.session_factory,
                 settings[node],
                 apps[node].state.envelope_cipher,
                 ProviderRegistry({"generic_webhook": providers[node]}),
                 now=_Clock(now + timedelta(seconds=60)),
             )
-            assert asyncio.run(processor.run_once()) == 1
-            assert len(providers[node].calls) == 1
+            for node in (reserve, owner)
+        }
+
+        async def run_partitioned_processors() -> list[int]:
+            return list(
+                await asyncio.gather(
+                    processors[reserve].run_once(),
+                    processors[owner].run_once(),
+                )
+            )
+
+        assert asyncio.run(run_partitioned_processors()) == [1, 1]
+        assert len(providers[owner].calls) == 1
+        assert providers[reserve].calls == []
 
         receipt_ids: set[str] = set()
         for node in sender_ids:
             with apps[node].state.session_factory() as db:
-                receipt = db.scalar(
+                receipts = db.scalars(
                     select(ClusterEvent).where(ClusterEvent.entity_type == "delivery_receipt")
-                )
-                assert receipt is not None
-                receipt_ids.add(receipt.event_id)
+                ).all()
+                receipt_ids.update(receipt.event_id for receipt in receipts)
         assert len(receipt_ids) == 2
 
         for node in sender_ids:
@@ -599,4 +619,9 @@ def test_partitioned_duplicate_deliveries_keep_distinct_receipt_history(
             receipt_timeline = db.scalars(
                 select(IncidentEvent).where(IncidentEvent.event_type == "delivery_succeeded")
             ).all()
-            assert len(receipt_timeline) == 2
+            assert len(receipt_timeline) == 1
+            attempted = db.scalars(
+                select(IncidentEvent).where(IncidentEvent.event_type == "delivery_attempted")
+            ).all()
+            assert len(attempted) == 1
+            assert attempted[0].payload_json["owner_node_id"] == owner
