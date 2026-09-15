@@ -1,5 +1,5 @@
 /* Alert Hub application shell and notification worker. */
-const SHELL_CACHE = "alert-hub-v7-shell";
+const SHELL_CACHE = "alert-hub-v8-shell";
 // Keep the authenticated read-cache prefix stable so a service-worker upgrade
 // does not erase a verified session partition needed for a cold offline start.
 const DATA_CACHE = "alert-hub-v2-read-model";
@@ -91,9 +91,14 @@ async function readThrough(request) {
 
 async function navigateThrough(request) {
   const cache = await caches.open(SHELL_CACHE);
+  const cachedShell = async () => (await cache.match(request)) || (await cache.match("/"));
   try {
     const response = await fetch(request);
     const responseUrl = new URL(response.url || request.url);
+    if (response.status >= 500 && responseUrl.origin === self.location.origin) {
+      const cached = await cachedShell();
+      if (cached) return cached;
+    }
     if (
       response.ok &&
       responseUrl.origin === self.location.origin &&
@@ -104,12 +109,38 @@ async function navigateThrough(request) {
     }
     return response;
   } catch {
-    return (await cache.match(request)) || (await cache.match("/")) || Response.error();
+    return (await cachedShell()) || Response.error();
   }
 }
 
-function runtimeFileThrough(request) {
+function networkOnly(request) {
   return fetch(request, { cache: "no-store" });
+}
+
+async function runtimeConfigThrough(request) {
+  const cache = await caches.open(SHELL_CACHE);
+  try {
+    const response = await fetch(request, { cache: "no-store" });
+    const responseUrl = new URL(response.url || request.url);
+    const sameRuntimeConfig =
+      responseUrl.origin === self.location.origin && responseUrl.pathname === "/runtime-config.js";
+    if (
+      response.ok &&
+      sameRuntimeConfig &&
+      response.headers.get("content-type")?.includes("javascript")
+    ) {
+      await cache.put(request, response.clone()).catch(() => undefined);
+    }
+    if (response.status >= 500 && sameRuntimeConfig) {
+      const cached = await cache.match(request);
+      if (cached) return cached;
+    }
+    return response;
+  } catch (error) {
+    const cached = await cache.match(request);
+    if (cached) return cached;
+    throw error;
+  }
 }
 
 async function manifestThrough(request) {
@@ -155,7 +186,7 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (request.method !== "GET" || url.origin !== self.location.origin) return;
   if (/^\/api\/v1\/checks(?:\/|$)/.test(url.pathname)) {
-    event.respondWith(runtimeFileThrough(request));
+    event.respondWith(networkOnly(request));
     return;
   }
   if (isReadableApi(url, request)) {
@@ -167,7 +198,7 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   if (url.pathname === "/runtime-config.js") {
-    event.respondWith(runtimeFileThrough(request));
+    event.respondWith(runtimeConfigThrough(request));
     return;
   }
   if (url.pathname === "/manifest.webmanifest") {

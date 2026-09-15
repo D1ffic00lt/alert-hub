@@ -12,19 +12,27 @@ replication and never exposes the peer API to browsers.
 | `proxy-failover`  | same origin                               | operator Nginx/Caddy          | available                 |
 | `external`        | load balancer or smart-DNS address        | external load balancer or DNS | guarded `503` by default  |
 
-| Failure or operation               | `single`          | `client-failover`                    | `proxy-failover`                   | `external`                          |
-| ---------------------------------- | ----------------- | ------------------------------------ | ---------------------------------- | ----------------------------------- |
-| One API process is lost            | no                | yes, after shell load                | yes, while the gateway is healthy  | owned by the external router        |
-| Selected frontend's local API lost | no                | yes                                  | yes                                | owned by the external router        |
-| Complete selected frontend lost    | no                | cached PWA or alternate UI URL only  | no, unless another UI URL is known | yes, when the router removes it     |
-| Cold browser start                 | healthy pair only | yes, if `PUBLIC_UI_URL` is reachable | yes, if UI/gateway is reachable    | yes, if external routing is healthy |
-| Session refresh                    | local API only    | eligible API origins                 | selected proxy upstream            | healthy externally selected pair    |
-| Ambiguous write outcome            | never replayed    | never replayed                       | proxy must not replay              | external router must not replay     |
+| Failure or operation               | `single`          | `client-failover`                                    | `proxy-failover`                   | `external`                          |
+| ---------------------------------- | ----------------- | ---------------------------------------------------- | ---------------------------------- | ----------------------------------- |
+| One API process is lost            | no                | yes, after shell load                                | yes, while the gateway is healthy  | owned by the external router        |
+| Selected frontend's local API lost | no                | yes                                                  | yes                                | owned by the external router        |
+| Complete selected frontend lost    | no                | last-known-good PWA shell/config or alternate UI URL | no, unless another UI URL is known | yes, when the router removes it     |
+| Cold browser start                 | healthy pair only | yes, if `PUBLIC_UI_URL` is reachable                 | yes, if UI/gateway is reachable    | yes, if external routing is healthy |
+| Session refresh                    | local API only    | eligible API origins                                 | selected proxy upstream            | healthy externally selected pair    |
+| Ambiguous write outcome            | never replayed    | never replayed                                       | proxy must not replay              | external router must not replay     |
 
 No mode can make a never-loaded UI hostname reachable. Frontend-host failover
 still requires external routing, multiple operator-published UI URLs, or a
 previously installed service-worker shell. API HA starts after the HTML and
 runtime configuration are available.
+
+The service worker uses network-first navigation and runtime configuration. A
+previously verified same-origin shell and `/runtime-config.js` may replace only
+a network failure or transient `5xx` response from the external gateway. It
+does not replace `4xx` responses, cache authenticated material, or make a fresh
+browser independent of the external router. Before planned node maintenance,
+drain the node at that router and wait until it is no longer selected; health
+check detection can otherwise leave a bounded `502` window.
 
 ## Configuration contract
 

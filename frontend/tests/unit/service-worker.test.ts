@@ -76,7 +76,9 @@ function createHarness() {
     navigationFails: false,
     navigationReturnsNull: false,
     navigationResponse: "html" as "external" | "html" | "text",
+    navigationStatus: 200,
     networkOffline: false,
+    runtimeConfigStatus: 200,
   };
   const caches = {
     delete: async (name: string) => stores.delete(name),
@@ -115,7 +117,16 @@ function createHarness() {
         );
       });
     }
-    if (pathname === "/runtime-config.js") return new Response("fresh-runtime-config");
+    if (pathname === "/runtime-config.js") {
+      return responseWithUrl(
+        "fresh-runtime-config",
+        {
+          headers: { "Content-Type": "application/javascript" },
+          status: controls.runtimeConfigStatus,
+        },
+        url,
+      );
+    }
     if (pathname === "/manifest.webmanifest") {
       return new Response('{"name":"Network Hub"}', {
         headers: { "Content-Type": "application/manifest+json" },
@@ -141,6 +152,7 @@ function createHarness() {
         "<!doctype html><title>fresh SPA shell</title>",
         {
           headers: { "Content-Type": "text/html" },
+          status: controls.navigationStatus,
         },
         responseUrl,
       );
@@ -235,7 +247,7 @@ async function dispatchWaitable(
 describe("service worker fetch boundaries", () => {
   it("does not intercept backend or unknown navigations as SPA shell requests", async () => {
     const { caches, listeners } = createHarness();
-    const shell = await caches.open("alert-hub-v7-shell");
+    const shell = await caches.open("alert-hub-v8-shell");
     await shell.put("/", new Response("known-good-shell"));
 
     const metricsResponse = await dispatchFetch(
@@ -278,9 +290,9 @@ describe("service worker fetch boundaries", () => {
     await expect(dispatchFetch(listeners.fetch, apiRequest)).rejects.toThrow("offline");
   });
 
-  it("keeps runtime config network-only while manifest branding has an offline fallback", async () => {
+  it("keeps a last-known-good runtime config for transient gateway failure", async () => {
     const { caches, controls, listeners, networkCalls } = createHarness();
-    const shell = await caches.open("alert-hub-v7-shell");
+    const shell = await caches.open("alert-hub-v8-shell");
     await shell.put("/runtime-config.js", new Response("stale-runtime-config"));
 
     const runtime = await dispatchFetch(
@@ -288,8 +300,22 @@ describe("service worker fetch boundaries", () => {
       request("/runtime-config.js", "cors", "script"),
     );
     expect(await (await runtime)?.text()).toBe("fresh-runtime-config");
-    expect(await (await shell.match("/runtime-config.js"))?.text()).toBe("stale-runtime-config");
+    expect(await (await shell.match("/runtime-config.js"))?.text()).toBe("fresh-runtime-config");
     expect(networkCalls.at(-1)).toMatchObject({ cache: "no-store" });
+
+    controls.runtimeConfigStatus = 502;
+    const gatewayFailure = await dispatchFetch(
+      listeners.fetch,
+      request("/runtime-config.js", "cors", "script"),
+    );
+    expect(await (await gatewayFailure)?.text()).toBe("fresh-runtime-config");
+
+    controls.runtimeConfigStatus = 404;
+    const removed = await dispatchFetch(
+      listeners.fetch,
+      request("/runtime-config.js", "cors", "script"),
+    );
+    expect(removed?.status).toBe(404);
 
     const manifestRequest = request("/manifest.webmanifest", "cors", "manifest");
     const onlineManifest = await dispatchFetch(listeners.fetch, manifestRequest);
@@ -302,7 +328,7 @@ describe("service worker fetch boundaries", () => {
 
   it("only replaces the offline shell with same-origin HTML from an SPA route", async () => {
     const { caches, controls, listeners } = createHarness();
-    const shell = await caches.open("alert-hub-v7-shell");
+    const shell = await caches.open("alert-hub-v8-shell");
     const response = await dispatchFetch(
       listeners.fetch,
       request("/incidents", "navigate", "document"),
@@ -318,6 +344,26 @@ describe("service worker fetch boundaries", () => {
     controls.navigationResponse = "external";
     await dispatchFetch(listeners.fetch, request("/settings", "navigate", "document"));
     expect(await (await shell.match("/"))?.text()).toBe(knownGood);
+  });
+
+  it("serves the last-known-good shell for load-balancer 5xx but not 4xx", async () => {
+    const { caches, controls, listeners } = createHarness();
+    const shell = await caches.open("alert-hub-v8-shell");
+    await shell.put("/", new Response("known-good-shell"));
+
+    controls.navigationStatus = 502;
+    const gatewayFailure = await dispatchFetch(
+      listeners.fetch,
+      request("/incidents", "navigate", "document"),
+    );
+    expect(await gatewayFailure?.text()).toBe("known-good-shell");
+
+    controls.navigationStatus = 404;
+    const notFound = await dispatchFetch(
+      listeners.fetch,
+      request("/incidents", "navigate", "document"),
+    );
+    expect(notFound?.status).toBe(404);
   });
 
   it("partitions verified JSON reads and falls back for network errors or 5xx, never 401", async () => {
@@ -379,7 +425,7 @@ describe("service worker push contract", () => {
       openedWindows,
     } = createHarness();
     controls.manifestOffline = true;
-    const shell = await caches.open("alert-hub-v7-shell");
+    const shell = await caches.open("alert-hub-v8-shell");
     await shell.put(
       "/manifest.webmanifest",
       new Response('{"name":"Cached Operations"}', {
@@ -470,7 +516,7 @@ describe("service worker cache lifecycle", () => {
         ],
       },
     });
-    const shell = await caches.open("alert-hub-v7-shell");
+    const shell = await caches.open("alert-hub-v8-shell");
     expect(await shell.match(`${origin}/assets/index-safe.js`)).toBeDefined();
     expect(await shell.match(`${origin}/runtime-config.js`)).toBeUndefined();
     expect(await shell.match("https://evil.invalid/assets/index.js")).toBeUndefined();
