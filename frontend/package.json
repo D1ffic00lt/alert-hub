@@ -3,6 +3,9 @@
   "version": "0.1.6",
   "license": "MIT",
   "private": true,
+  "overrides": {
+    "smol-toml": "1.8.0"
+  },
   "engines": {
     "node": ">=22.13.0"
   },
