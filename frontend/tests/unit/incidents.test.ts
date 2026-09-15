@@ -4,6 +4,7 @@ import {
   incidentListPath,
   mergeIncidentSummariesWithHistory,
   normalizeIncidentSearch,
+  sortIncidentEventsByTime,
   sseReconnectDelay,
 } from "../../app/incidents";
 
@@ -125,6 +126,51 @@ describe("incident snapshot merging", () => {
       annotations: { runbook: "safe" },
       events: [{ id: "event-1" }],
     });
+  });
+});
+
+describe("incident timeline ordering", () => {
+  it("sorts events in both time directions without mutating the API snapshot", () => {
+    const events = [
+      { id: "event-middle", at: "2026-09-15T12:00:00Z" },
+      { id: "event-oldest", at: "2026-09-15T10:00:00Z" },
+      { id: "event-newest", at: "2026-09-15T14:00:00Z" },
+    ];
+
+    expect(sortIncidentEventsByTime(events, "newest_first").map((event) => event.id)).toEqual([
+      "event-newest",
+      "event-middle",
+      "event-oldest",
+    ]);
+    expect(sortIncidentEventsByTime(events, "oldest_first").map((event) => event.id)).toEqual([
+      "event-oldest",
+      "event-middle",
+      "event-newest",
+    ]);
+    expect(events.map((event) => event.id)).toEqual([
+      "event-middle",
+      "event-oldest",
+      "event-newest",
+    ]);
+  });
+
+  it("uses event ids as a deterministic tie-breaker and keeps invalid dates last", () => {
+    const events = [
+      { id: "event-b", at: "2026-09-15T12:00:00Z" },
+      { id: "event-invalid", at: "not-a-date" },
+      { id: "event-a", at: "2026-09-15T12:00:00Z" },
+    ];
+
+    expect(sortIncidentEventsByTime(events, "oldest_first").map((event) => event.id)).toEqual([
+      "event-a",
+      "event-b",
+      "event-invalid",
+    ]);
+    expect(sortIncidentEventsByTime(events, "newest_first").map((event) => event.id)).toEqual([
+      "event-b",
+      "event-a",
+      "event-invalid",
+    ]);
   });
 });
 

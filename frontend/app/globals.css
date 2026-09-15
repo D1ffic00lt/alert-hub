@@ -2012,6 +2012,35 @@ summary:focus-visible {
   gap: 10px;
   margin-top: 7px;
 }
+.timeline-panel__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.timeline-sort {
+  display: inline-flex;
+  height: 32px;
+  align-items: center;
+  gap: 7px;
+  padding-left: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted-2);
+  font-size: var(--font-label);
+}
+.timeline-sort:focus-within {
+  border-color: rgba(98, 230, 179, 0.4);
+}
+.timeline-sort select {
+  height: 100%;
+  max-width: 150px;
+  padding: 0 28px 0 3px;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: var(--text-soft);
+}
 .timeline {
   padding: 16px 19px 20px;
 }
@@ -5937,6 +5966,12 @@ body,
 
   .panel__header > :last-child:not(:first-child) {
     margin-left: auto;
+  }
+
+  .timeline-panel__actions {
+    width: 100%;
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .kpi-grid,

@@ -2025,6 +2025,123 @@ test("SSE refreshes an incident detail that is absent from the global top-100 sn
   expect(state.incidentListRequests).toHaveLength(listRequestsBeforeStream);
 });
 
+test("incident detail timeline can show newest events first or last", async ({ page }) => {
+  const incident = {
+    id: "incident-sortable-timeline",
+    title: "Sortable timeline",
+    description: "Timeline ordering control regression.",
+    severity: "warning",
+    status: "open",
+    source_name: "Prometheus",
+    region: "RU",
+    target: "api",
+    starts_at: "2026-09-15T10:00:00Z",
+    last_event_at: "2026-09-15T12:00:00Z",
+    labels: {},
+    annotations: {},
+    timeline: [
+      {
+        id: "event-oldest",
+        event_type: "firing",
+        label: "Oldest event",
+        detail: "First event",
+        occurred_at: "2026-09-15T10:00:00Z",
+        origin_node_id: "ru",
+      },
+      {
+        id: "event-newest",
+        event_type: "acknowledged",
+        label: "Newest event",
+        detail: "Latest event",
+        occurred_at: "2026-09-15T12:00:00Z",
+        origin_node_id: "ru",
+      },
+    ],
+  };
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    incidentDetails: { [incident.id]: incident },
+    incidents: [incident],
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installApi(page, state);
+  await signIn(page);
+  await page.evaluate((incidentId) => {
+    window.history.pushState({}, "", `/incidents/${incidentId}`);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }, incident.id);
+
+  const labels = page.locator(".timeline-item__content b");
+  await expect(page.getByRole("heading", { name: incident.title })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Порядок событий" })).toHaveValue("newest_first");
+  await expect(labels).toHaveText(["Newest event", "Oldest event"]);
+
+  await page.getByRole("combobox", { name: "Порядок событий" }).selectOption("oldest_first");
+  await expect(labels).toHaveText(["Oldest event", "Newest event"]);
+
+  const timelinePanel = page.locator(".timeline-panel");
+  for (const visualCase of [
+    { theme: "dark", width: 1280, height: 900 },
+    { theme: "light", width: 1280, height: 900 },
+    { theme: "dark", width: 820, height: 1000 },
+    { theme: "light", width: 820, height: 1000 },
+    { theme: "dark", width: 390, height: 844 },
+    { theme: "light", width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize({ width: visualCase.width, height: visualCase.height });
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.theme = theme;
+    }, visualCase.theme);
+    await expect
+      .poll(() =>
+        timelinePanel.evaluate(
+          (panel) => panel.getBoundingClientRect().right <= window.innerWidth + 1,
+        ),
+      )
+      .toBe(true);
+    const layout = await timelinePanel.evaluate((panel) => {
+      const panelBounds = panel.getBoundingClientRect();
+      const actions = panel.querySelector<HTMLElement>(".timeline-panel__actions");
+      const controls = actions
+        ? [...actions.children].map((control) => control.getBoundingClientRect())
+        : [];
+      const controlsOverlap = controls.some((left, index) =>
+        controls
+          .slice(index + 1)
+          .some(
+            (right) =>
+              left.left < right.right &&
+              left.right > right.left &&
+              left.top < right.bottom &&
+              left.bottom > right.top,
+          ),
+      );
+      return {
+        controlsOverlap,
+        controlsWithinPanel: controls.every(
+          (control) =>
+            control.left >= panelBounds.left - 1 && control.right <= panelBounds.right + 1,
+        ),
+        noHorizontalOverflow: document.documentElement.scrollWidth <= window.innerWidth,
+        panelLeft: panelBounds.left,
+        panelRight: panelBounds.right,
+        viewportWidth: window.innerWidth,
+      };
+    });
+    expect(layout.noHorizontalOverflow).toBe(true);
+    expect(layout.panelLeft).toBeGreaterThanOrEqual(0);
+    expect(layout.panelRight).toBeLessThanOrEqual(layout.viewportWidth + 1);
+    expect(layout.controlsWithinPanel).toBe(true);
+    expect(layout.controlsOverlap).toBe(false);
+  }
+});
+
 test("Checks dashboard, filters, grouping, matrix details, links, and mobile accessibility", async ({
   page,
 }) => {
