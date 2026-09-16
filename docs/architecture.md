@@ -12,6 +12,9 @@ The UI can use one API origin, a bounded server-owned list of public API origins
 a same-origin proxy pool, or an external load balancer. Browser API routing is
 separate from append-only peer replication; no browser candidate exposes the
 peer protocol. See [Frontend API high availability](api-ha.md).
+An optional local stdio MCP process gives Codex the same bounded operational read models through
+dedicated, replicated `mcp:read` service tokens. It is not a third deployed image and has no
+direct SQLite, peer-protocol, shell, SSH, arbitrary URL, arbitrary PromQL, or mutation surface.
 The overview can aggregate bounded `24h`, `7d`, or `30d` incident and delivery history from that
 node-local replicated append-only event history, with current-active counters from the incident
 projection. This remains an eventually consistent operational summary; Prometheus and Grafana
@@ -39,6 +42,7 @@ flowchart LR
     PEERPX --> PEER["Other Alert Hub API"]
     API -. "backend queries" .-> PROM["Existing Prometheus"]
     API -. "bounded provider delivery" .-> PUSH["Web Push / Telegram / SMTP / webhook"]
+    MCP["Local Alert Hub MCP\nread-only stdio"] -->|"HTTPS fixed GET tools"| PX
 ```
 
 Checks uses that existing Prometheus boundary as a read-only, optional read model. Alert Hub does

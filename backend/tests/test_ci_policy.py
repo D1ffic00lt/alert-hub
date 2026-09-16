@@ -1251,6 +1251,7 @@ def test_ci_keeps_images_local_and_release_publishes_exact_pair() -> None:
     assert set(integration["needs"]) == {
         "repository-quality",
         "backend",
+        "mcp",
         "frontend",
         "security",
         "operations",

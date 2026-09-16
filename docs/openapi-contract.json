@@ -41,6 +41,8 @@
     "/api/v1/push/vapid-public-key": ["get"],
     "/api/v1/routes": ["get", "post"],
     "/api/v1/routes/{route_id}": ["get", "patch", "delete"],
+    "/api/v1/service-tokens": ["get", "post"],
+    "/api/v1/service-tokens/{token_id}": ["delete"],
     "/api/v1/sources": ["get", "post"],
     "/api/v1/sources/{source_id}": ["patch", "delete"],
     "/api/v1/sources/{source_id}/rotate-token": ["post"],

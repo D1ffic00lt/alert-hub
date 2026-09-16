@@ -33,7 +33,7 @@ override RUNTIME_SECRETS_DIR := $(RUNTIME_ROOT)/secrets
 .PHONY: \
 	init config build up down logs ps health \
 	format format-check repository-quality backend-test backend-quality \
-	frontend-test frontend-quality security-check operations-check \
+	frontend-test frontend-quality mcp-quality security-check operations-check \
 	container-smoke distributed-smoke test quality ci
 
 init:
@@ -92,14 +92,22 @@ frontend-quality:
 	npm --prefix frontend run build
 	npm --prefix frontend run test:e2e
 
+mcp-quality:
+	"$(PYTHON)" -m ruff format --check integrations/alert-hub-mcp
+	"$(PYTHON)" -m ruff check integrations/alert-hub-mcp
+	"$(PYTHON)" -m mypy integrations/alert-hub-mcp/src
+	cd integrations/alert-hub-mcp && "$(PYTHON)" -m pytest --cov=alert_hub_mcp --cov-report=term-missing
+
 format:
 	"$(FRONTEND_BIN)/prettier" --write . --ignore-unknown
 	"$(PYTHON)" -m ruff format backend
+	"$(PYTHON)" -m ruff format integrations/alert-hub-mcp
 	"$(PYTHON)" -m ruff format --config ruff.toml $(DEPLOY_PYTHON)
 
 format-check:
 	"$(FRONTEND_BIN)/prettier" --check . --ignore-unknown
 	"$(PYTHON)" -m ruff format --check backend
+	"$(PYTHON)" -m ruff format --check integrations/alert-hub-mcp
 	"$(PYTHON)" -m ruff format --check --config ruff.toml $(DEPLOY_PYTHON)
 
 repository-quality:
@@ -182,6 +190,6 @@ distributed-smoke:
 
 test: backend-test frontend-test
 
-quality: repository-quality backend-quality frontend-quality
+quality: repository-quality backend-quality frontend-quality mcp-quality
 
 ci: quality security-check operations-check

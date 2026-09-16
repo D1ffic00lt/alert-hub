@@ -33,6 +33,7 @@ from alert_hub.api import (
     prometheus,
     push,
     routes,
+    service_tokens,
     sources,
     statistics,
     stream,
@@ -40,7 +41,7 @@ from alert_hub.api import (
 from alert_hub.application.auth import add_audit, ensure_bootstrap_token
 from alert_hub.application.checks import ChecksSnapshotCache
 from alert_hub.application.statistics import StatisticsSnapshotCache
-from alert_hub.application.sync import register_local_node_event
+from alert_hub.application.sync import register_local_node_event, reproject_service_tokens
 from alert_hub.infrastructure.db.session import (
     create_db_engine,
     create_session_factory,
@@ -305,6 +306,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         initialize_database(engine, session_factory, runtime_settings)
         with session_factory.begin() as db:
             ensure_bootstrap_token(db, runtime_settings)
+            reproject_service_tokens(db)
             register_local_node_event(db, runtime_settings)
         heartbeat_task: asyncio.Task[None] | None = None
         notification_task: asyncio.Task[None] | None = None
@@ -505,6 +507,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     app.include_router(auth.router)
+    app.include_router(service_tokens.router)
     app.include_router(alerts.router)
     app.include_router(checks.router)
     app.include_router(incidents.router)
