@@ -1411,6 +1411,12 @@ def test_manual_release_reserves_tag_and_publishes_assets_idempotently() -> None
         step for step in steps if step.get("name") == "Validate release version and source revision"
     )
     validation_run = validation_step["run"]
+    dependency_step = next(
+        step for step in steps if step.get("name") == "Install release test dependencies"
+    )
+    dependency_run = dependency_step["run"]
+    assert "./backend[dev]" in dependency_run
+    assert "./integrations/alert-hub-mcp[dev]" in dependency_run
     assert "product_version=$(<VERSION)" in validation_run
     assert "backend/pyproject.toml" not in validation_run
     assert "frontend/package.json" not in validation_run
