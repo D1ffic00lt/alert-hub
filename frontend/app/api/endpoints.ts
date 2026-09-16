@@ -51,6 +51,8 @@ type EndpointManagerOptions = {
   probeTimeoutMs?: number;
   requestTimeoutMs?: number;
   mutationTimeoutMs?: number;
+  affinityStorage?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
+  sessionAffinityTtlMs?: number;
 };
 
 const API_HA_MODES = new Set<ApiHaMode>([
@@ -62,6 +64,22 @@ const API_HA_MODES = new Set<ApiHaMode>([
 const MAX_API_CANDIDATES = 8;
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
+const SESSION_AFFINITY_STORAGE_KEY = "alert-hub-api-session-affinity-v1";
+const SESSION_AFFINITY_TTL_MS = 30_000;
+const SESSION_ESTABLISHING_PATHS = new Set(["/auth/login", "/auth/bootstrap", "/auth/refresh"]);
+
+type SessionAffinity = {
+  origin: string;
+  expiresAt: number;
+};
+
+function defaultAffinityStorage(): Pick<Storage, "getItem" | "setItem" | "removeItem"> | null {
+  try {
+    return typeof localStorage === "undefined" ? null : localStorage;
+  } catch {
+    return null;
+  }
+}
 
 export function normalizePublicApiOrigin(value: unknown): string | null {
   if (typeof value !== "string" || !value || /[\\\s]/u.test(value)) return null;
@@ -126,6 +144,8 @@ export class ApiEndpointManager {
   private readonly probeTimeoutMs: number;
   private readonly requestTimeoutMs: number;
   private readonly mutationTimeoutMs: number;
+  private readonly affinityStorage: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
+  private readonly sessionAffinityTtlMs: number;
   private readonly states = new Map<string, EndpointState>();
   private readonly listeners = new Set<() => void>();
   private candidates: string[];
@@ -144,6 +164,9 @@ export class ApiEndpointManager {
     this.probeTimeoutMs = options.probeTimeoutMs ?? 2_500;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 2_500;
     this.mutationTimeoutMs = options.mutationTimeoutMs ?? 10_000;
+    this.affinityStorage =
+      options.affinityStorage === undefined ? defaultAffinityStorage() : options.affinityStorage;
+    this.sessionAffinityTtlMs = options.sessionAffinityTtlMs ?? SESSION_AFFINITY_TTL_MS;
     this.candidates =
       config.mode === "client-failover" && config.candidates.length ? config.candidates : [""];
     this.activeOrigin = this.candidates[0] ?? "";
@@ -154,6 +177,25 @@ export class ApiEndpointManager {
   setFailoverEnabled(enabled: boolean) {
     this.failoverEnabled = enabled;
     this.emit();
+  }
+
+  pinSessionOrigin(origin = this.activeOrigin) {
+    if (this.mode !== "client-failover" || !this.candidates.includes(origin)) return;
+    const affinity = { origin, expiresAt: this.now() + this.sessionAffinityTtlMs, version: 1 };
+    try {
+      this.affinityStorage?.setItem(SESSION_AFFINITY_STORAGE_KEY, JSON.stringify(affinity));
+    } catch {
+      // Routing still works within this tab when storage is unavailable.
+    }
+    this.promote(origin, "A fresh session is temporarily pinned to its issuing API endpoint");
+  }
+
+  clearSessionAffinity() {
+    try {
+      this.affinityStorage?.removeItem(SESSION_AFFINITY_STORAGE_KEY);
+    } catch {
+      // Hardened browsers may reject storage access; there is no persisted affinity to clear.
+    }
   }
 
   addVerifiedCandidates(values: unknown[]) {
@@ -270,6 +312,8 @@ export class ApiEndpointManager {
       safeRead || options.replayRefresh ? this.requestTimeoutMs : this.mutationTimeoutMs;
     let firstRetryableResponse: Response | null = null;
     let firstNotFoundResponse: Response | null = null;
+    let deferredAuthRejection: Response | null = null;
+    let deferredAuthRejectionUntil = 0;
     let lastError: unknown = null;
     while (attempted.size < maximumAttempts) {
       const origin = (canReplay ? this.orderedCandidates(false) : [this.activeOrigin]).find(
@@ -288,10 +332,24 @@ export class ApiEndpointManager {
           this.markHealthy(origin);
           continue;
         }
+        const responseAffinity = this.readSessionAffinity();
+        if (
+          (response.status === 401 || response.status === 403) &&
+          responseAffinity !== null &&
+          origin !== responseAffinity.origin
+        ) {
+          deferredAuthRejection ??= response;
+          deferredAuthRejectionUntil = responseAffinity.expiresAt;
+          this.markHealthy(origin);
+          continue;
+        }
         if (response.status < 500) {
           this.markHealthy(origin);
           if (!firstNotFoundResponse) {
             this.promote(origin, "A request failed over after a network or server error");
+          }
+          if (response.ok && SESSION_ESTABLISHING_PATHS.has(path.split("?", 1)[0] ?? path)) {
+            this.pinSessionOrigin(origin);
           }
           return response;
         }
@@ -307,14 +365,26 @@ export class ApiEndpointManager {
       if (attempted.size < maximumAttempts) await this.prepare();
     }
     if (firstRetryableResponse) return firstRetryableResponse;
+    if (deferredAuthRejection && deferredAuthRejectionUntil > this.now()) {
+      return new Response(
+        JSON.stringify({
+          detail: "Session replication is still converging; retry the issuing API endpoint",
+        }),
+        {
+          status: 503,
+          headers: { "Content-Type": "application/json", "Retry-After": "1" },
+        },
+      );
+    }
+    if (deferredAuthRejection) return deferredAuthRejection;
     if (firstNotFoundResponse) return firstNotFoundResponse;
     throw lastError instanceof Error ? lastError : new Error("No API endpoint responded");
   }
 
   private orderedCandidates(includeBackoff: boolean) {
+    const affinity = this.readSessionAffinity();
     const ordered = [
-      this.activeOrigin,
-      ...this.candidates.filter((origin) => origin !== this.activeOrigin),
+      ...new Set([...(affinity ? [affinity.origin] : []), this.activeOrigin, ...this.candidates]),
     ];
     if (!this.failoverEnabled) return ordered.slice(0, 1);
     const now = this.now();
@@ -322,6 +392,28 @@ export class ApiEndpointManager {
       (origin) => includeBackoff || this.ensureState(origin).retryAt <= now,
     );
     return available.length ? available : ordered.slice(0, 1);
+  }
+
+  private readSessionAffinity(): SessionAffinity | null {
+    if (this.mode !== "client-failover" || this.affinityStorage === null) return null;
+    try {
+      const payload = JSON.parse(
+        this.affinityStorage.getItem(SESSION_AFFINITY_STORAGE_KEY) ?? "null",
+      ) as Record<string, unknown> | null;
+      const origin = typeof payload?.origin === "string" ? payload.origin : "";
+      const expiresAt = Number(payload?.expiresAt);
+      const valid =
+        payload?.version === 1 &&
+        this.candidates.includes(origin) &&
+        Number.isFinite(expiresAt) &&
+        expiresAt > this.now() &&
+        expiresAt <= this.now() + this.sessionAffinityTtlMs;
+      if (valid) return { origin, expiresAt };
+      this.affinityStorage.removeItem(SESSION_AFFINITY_STORAGE_KEY);
+    } catch {
+      // Ignore malformed or inaccessible storage and fall back to normal health routing.
+    }
+    return null;
   }
 
   private async fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
