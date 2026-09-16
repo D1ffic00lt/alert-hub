@@ -57,6 +57,9 @@ class User(Base):
     sessions: Mapped[list[Session]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    service_tokens: Mapped[list[ServiceToken]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class Session(Base):
@@ -73,6 +76,21 @@ class Session(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     user: Mapped[User] = relationship(back_populates="sessions")
+
+
+class ServiceToken(Base):
+    __tablename__ = "service_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    scopes_json: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["mcp:read"])
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), index=True)
+
+    user: Mapped[User] = relationship(back_populates="service_tokens")
 
 
 class Source(Base):

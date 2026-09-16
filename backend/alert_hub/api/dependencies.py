@@ -13,15 +13,47 @@ from sqlalchemy.orm import Session
 
 from alert_hub.application.auth import add_audit
 from alert_hub.infrastructure.db.base import utc_now
+from alert_hub.infrastructure.db.models import ServiceToken, User
 from alert_hub.infrastructure.db.models import Session as AuthSession
-from alert_hub.infrastructure.db.models import User
 from alert_hub.infrastructure.encryption import EnvelopeCipher
 from alert_hub.infrastructure.request_security import address_in_cidrs
 from alert_hub.metrics import DB_POOL_ACQUIRE_SECONDS, DB_POOL_ACQUIRE_TIMEOUTS
-from alert_hub.security import TokenError, constant_time_equal, decode_access_token, hash_token
+from alert_hub.security import (
+    TokenError,
+    constant_time_equal,
+    decode_access_token,
+    decode_service_token,
+    hash_token,
+)
 from alert_hub.settings import Settings
 
 logger = logging.getLogger("alert_hub.database")
+
+_SERVICE_TOKEN_EXACT_PATHS = frozenset(
+    {
+        "/api/v1/alert-rules",
+        "/api/v1/availability",
+        "/api/v1/cluster/status",
+        "/api/v1/metrics/reachability",
+        "/api/v1/metrics/summary",
+        "/api/v1/metrics/queries/connection_test",
+        "/api/v1/metrics/queries/firing_alerts",
+        "/api/v1/metrics/queries/key_jobs_up",
+        "/api/v1/metrics/queries/alert_hub_health",
+    }
+)
+
+
+def _service_token_path_allowed(path: str) -> bool:
+    if path in _SERVICE_TOKEN_EXACT_PATHS:
+        return True
+    for root in ("/api/v1/incidents", "/api/v1/checks"):
+        if path == root:
+            return True
+        suffix = path.removeprefix(f"{root}/")
+        if suffix != path and suffix and "/" not in suffix:
+            return True
+    return False
 
 
 def get_settings(request: Request) -> Settings:
@@ -109,16 +141,15 @@ def _bearer_token(request: Request) -> str:
     return token
 
 
-def current_session(
+def _session_from_access_token(
     request: Request,
-    db: Session = Depends(get_db),
-    settings: Settings = Depends(get_settings),
+    db: Session,
+    settings: Settings,
+    bearer: str,
 ) -> AuthSession:
     try:
-        claims = decode_access_token(_bearer_token(request), settings.signing_key)
-    except (TokenError, HTTPException) as exc:
-        if isinstance(exc, HTTPException):
-            raise
+        claims = decode_access_token(bearer, settings.signing_key)
+    except TokenError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired access token",
@@ -145,8 +176,64 @@ def current_session(
     return auth_session
 
 
-def current_user(auth_session: AuthSession = Depends(current_session)) -> User:
-    return auth_session.user
+def current_session(
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> AuthSession:
+    return _session_from_access_token(request, db, settings, _bearer_token(request))
+
+
+def _service_token_user(
+    request: Request,
+    db: Session,
+    settings: Settings,
+    token_id: str,
+    secret: str,
+) -> User:
+    token = db.get(ServiceToken, token_id)
+    expected_hash = hash_token(secret, settings.signing_key, f"service-token:{token_id}")
+    now = utc_now()
+    if (
+        token is None
+        or not constant_time_equal(token.token_hash, expected_hash)
+        or token.revoked_at is not None
+        or token.expires_at <= now
+        or token.scopes_json != ["mcp:read"]
+        or token.user is None
+        or token.user.disabled_at is not None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Service token unavailable",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if request.method not in {"GET", "HEAD"}:
+        raise HTTPException(status_code=403, detail="Service token is read-only")
+    if not _service_token_path_allowed(request.url.path):
+        raise HTTPException(status_code=403, detail="Service token cannot access this endpoint")
+    request.state.service_token_id = token.id
+    request.state.session_id = f"service-token:{token.id}"
+    return token.user
+
+
+def current_user(
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> User:
+    bearer = _bearer_token(request)
+    try:
+        service_claims = decode_service_token(bearer)
+    except TokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid service token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    if service_claims is not None:
+        return _service_token_user(request, db, settings, *service_claims)
+    return _session_from_access_token(request, db, settings, bearer).user
 
 
 def session_from_refresh_cookie(
@@ -183,8 +270,8 @@ def get_envelope_cipher(request: Request) -> EnvelopeCipher:
     return cipher
 
 
-def admin_user(user: User = Depends(current_user)) -> User:
-    if not user.is_admin:
+def admin_user(request: Request, user: User = Depends(current_user)) -> User:
+    if getattr(request.state, "service_token_id", None) is not None or not user.is_admin:
         raise HTTPException(status_code=403, detail="Administrator access required")
     return user
 

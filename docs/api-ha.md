@@ -81,10 +81,19 @@ prefers the current healthy endpoint. Each read/refresh attempt and health probe
 has a finite timeout. Network errors, timeouts, and `5xx` responses place an
 endpoint in exponential backoff and allow a safe `GET` or `HEAD` to move to the
 next candidate. Concurrent failures share one recovery probe instead of each
-starting another probe burst. An authoritative `4xx` never triggers failover.
+starting another probe burst. An authoritative `4xx` never triggers failover, except that a
+`401/403` from a non-issuing node is treated as temporary unavailability while a fresh session's
+bounded issuing-node affinity is active.
 Visibility/focus and browser-online transitions revalidate the pool.
 
 Login and bootstrap mutations first select a healthy endpoint, then send once.
+Successful login, bootstrap, and refresh responses create a 30-second affinity to the issuing
+API origin. The origin and expiry contain no credential and are shared through same-origin storage
+so a newly opened tab does not select a replica that has not received the session event yet. The
+access token remains memory-only. If the issuing origin is unavailable, reads and refresh may use
+a reserve, but its `401/403` cannot clear the session until affinity expires; a rejection from the
+issuer remains authoritative immediately. This bounds the revoke/expiry delay without mistaking
+ordinary replication lag for logout.
 Normal `POST`, `PATCH`, `PUT`, and `DELETE` requests are never replayed after an
 ambiguous network failure. Refresh recovery is the narrow exception: it may try
 another eligible API, and concurrent refresh work remains coalesced. SSE follows

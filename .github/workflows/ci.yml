@@ -32,7 +32,9 @@ jobs:
         with:
           python-version: "3.12.14"
           cache: pip
-          cache-dependency-path: backend/pyproject.toml
+          cache-dependency-path: |
+            backend/pyproject.toml
+            integrations/alert-hub-mcp/pyproject.toml
       - name: Install style tooling
         run: |
           npm --prefix frontend ci --ignore-scripts
@@ -160,6 +162,33 @@ jobs:
           APP_ENV: test
         run: python deploy/scripts/check-openapi.py
 
+  mcp:
+    name: MCP lint, types, and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.14"
+          cache: pip
+          cache-dependency-path: integrations/alert-hub-mcp/pyproject.toml
+      - name: Install MCP server
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e './integrations/alert-hub-mcp[dev]'
+      - name: Ruff format
+        run: ruff format --check integrations/alert-hub-mcp
+      - name: Ruff lint
+        run: ruff check integrations/alert-hub-mcp
+      - name: Static typing
+        run: mypy integrations/alert-hub-mcp/src
+      - name: Tests with branch coverage
+        working-directory: integrations/alert-hub-mcp
+        run: pytest --cov=alert_hub_mcp --cov-report=term-missing
+
   frontend:
     name: Frontend lint, types, tests, and build
     runs-on: ubuntu-24.04
@@ -212,7 +241,9 @@ jobs:
         with:
           python-version: "3.12.14"
           cache: pip
-          cache-dependency-path: backend/pyproject.toml
+          cache-dependency-path: |
+            backend/pyproject.toml
+            integrations/alert-hub-mcp/pyproject.toml
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.23.2"
@@ -223,7 +254,7 @@ jobs:
       - name: Audit Python environment
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e './backend[dev]'
+          python -m pip install -e './backend[dev]' -e './integrations/alert-hub-mcp[dev]'
           python -m pip check
           python -m pip_audit --local --cache-dir "${RUNNER_TEMP}/pip-audit"
       - name: Verify and audit Node dependency tree
@@ -288,7 +319,7 @@ jobs:
 
   container-integration:
     name: Build and exercise exact compatible API and web images
-    needs: [repository-quality, backend, frontend, security, operations]
+    needs: [repository-quality, backend, mcp, frontend, security, operations]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:

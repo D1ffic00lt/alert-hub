@@ -39,6 +39,7 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
         "prometheus_datasources",
         "push_subscriptions",
         "sessions",
+        "service_tokens",
         "sources",
         "sync_cursors",
         "users",
@@ -82,6 +83,17 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
     peer_node_foreign_key = peer_identity_foreign_keys["fk_peer_endpoint_identities_node_id_nodes"]
     assert peer_node_foreign_key["referred_table"] == "nodes"
     assert peer_node_foreign_key["options"].get("ondelete") == "CASCADE"
+    service_token_foreign_keys = {
+        foreign_key["name"]: foreign_key
+        for foreign_key in inspect(engine).get_foreign_keys("service_tokens")
+    }
+    service_token_user_key = service_token_foreign_keys["fk_service_tokens_user_id_users"]
+    assert service_token_user_key["referred_table"] == "users"
+    assert service_token_user_key["options"].get("ondelete") == "CASCADE"
+    service_token_indexes = {
+        index["name"]: index for index in inspect(engine).get_indexes("service_tokens")
+    }
+    assert bool(service_token_indexes["ix_service_tokens_token_hash"]["unique"])
     incident_indexes = {index["name"]: index for index in inspect(engine).get_indexes("incidents")}
     assert incident_indexes["ix_incidents_status_severity"]["column_names"] == [
         "status",
@@ -130,6 +142,7 @@ def test_initial_migration_builds_and_downgrades_schema(tmp_path: Path) -> None:
     assert "ix_incidents_status_severity" not in downgraded_projection_indexes
     assert "ix_cluster_events_type_operation_time" not in downgraded_cluster_indexes
     assert "peer_endpoint_identities" not in inspect(engine).get_table_names()
+    assert "service_tokens" not in inspect(engine).get_table_names()
     assert "api_down_alert_enabled" not in {
         column["name"] for column in inspect(engine).get_columns("nodes")
     }

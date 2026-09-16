@@ -12,9 +12,15 @@ from sqlalchemy.orm import Session as DbSession
 
 from alert_hub.application.incidents import append_cluster_event
 from alert_hub.application.notifications import push_subscription_payload
-from alert_hub.infrastructure.db.base import utc_now
-from alert_hub.infrastructure.db.models import AuditLog, PushSubscription, Session, User
-from alert_hub.security import encode_access_token, hash_token, random_token
+from alert_hub.infrastructure.db.base import new_id, utc_now
+from alert_hub.infrastructure.db.models import (
+    AuditLog,
+    PushSubscription,
+    ServiceToken,
+    Session,
+    User,
+)
+from alert_hub.security import encode_access_token, encode_service_token, hash_token, random_token
 from alert_hub.settings import Settings
 
 PushSubscriptionSessionState = Literal[
@@ -36,6 +42,12 @@ class IssuedSession:
     session: Session
 
 
+@dataclass(slots=True)
+class IssuedServiceToken:
+    raw_token: str
+    token: ServiceToken
+
+
 def session_cluster_payload(session: Session) -> dict[str, object]:
     """Serialize replicated session state without exposing the refresh token."""
 
@@ -49,6 +61,52 @@ def session_cluster_payload(session: Session) -> dict[str, object]:
         "absolute_expires_at": session.absolute_expires_at.isoformat(),
         "revoked_at": session.revoked_at.isoformat() if session.revoked_at else None,
     }
+
+
+def service_token_cluster_payload(token: ServiceToken) -> dict[str, object]:
+    """Serialize a service token without exposing the bearer secret."""
+
+    return {
+        "user_id": token.user_id,
+        "name": token.name,
+        "token_hash": token.token_hash,
+        "scopes": token.scopes_json,
+        "created_at": token.created_at.isoformat(),
+        "expires_at": token.expires_at.isoformat(),
+        "revoked_at": token.revoked_at.isoformat() if token.revoked_at else None,
+    }
+
+
+def issue_service_token(
+    db: DbSession,
+    user: User,
+    name: str,
+    expires_in_days: int,
+    settings: Settings,
+) -> IssuedServiceToken:
+    now = utc_now()
+    token_id = new_id()
+    secret = random_token(48)
+    token = ServiceToken(
+        id=token_id,
+        user_id=user.id,
+        name=name.strip(),
+        token_hash=hash_token(secret, settings.signing_key, f"service-token:{token_id}"),
+        scopes_json=["mcp:read"],
+        created_at=now,
+        expires_at=now + timedelta(days=expires_in_days),
+    )
+    db.add(token)
+    db.flush()
+    append_cluster_event(
+        db,
+        settings,
+        entity_type="service_token",
+        entity_id=token.id,
+        operation="upsert",
+        payload=service_token_cluster_payload(token),
+    )
+    return IssuedServiceToken(encode_service_token(token.id, secret), token)
 
 
 def ensure_bootstrap_token(db: DbSession, settings: Settings) -> str | None:

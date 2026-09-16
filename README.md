@@ -98,7 +98,7 @@ Direct development requires Python 3.12 and Node.js 22.14:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install -e './backend[dev]'
+.venv/bin/python -m pip install -e './backend[dev]' -e './integrations/alert-hub-mcp[dev]'
 npm --prefix frontend ci
 ```
 
@@ -115,6 +115,7 @@ Focused commands are also available:
 ```bash
 make backend-quality
 make frontend-quality
+make mcp-quality
 make repository-quality
 make container-smoke
 ```
@@ -141,6 +142,7 @@ separate, manual, protected workflows.
 ```text
 backend/                         Python application and API image
 frontend/                        React PWA and static web image
+integrations/alert-hub-mcp/      read-only Codex/MCP diagnostic integration
 docker-compose.yml               default API + web deployment
 docker-compose.split.yml         explicit API + web example
 docker-compose.api-only.yml      headless backend example
@@ -161,6 +163,7 @@ docs/                            architecture, security, and runbooks
 - [Security and threat model](docs/security.md)
 - [Security policy](SECURITY.md)
 - [Source integrations](docs/source-integrations.md)
+- [Alert Hub MCP](integrations/alert-hub-mcp/README.md)
 
 The guiding trade-off is deliberate: **do not lose an alert, even when avoiding
 a duplicate is temporarily impossible**.
