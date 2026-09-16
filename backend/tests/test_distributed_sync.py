@@ -34,6 +34,7 @@ from alert_hub.infrastructure.db.models import (
     NotificationRoute,
     PrometheusDatasource,
     PushSubscription,
+    ServiceToken,
     Session,
     Source,
     SyncCursor,
@@ -247,6 +248,138 @@ def test_empty_cursor_bootstraps_new_node_and_replicates_sensitive_state(
             assert replicated_source is not None and replicated_source.deleted_at is not None
             assert replicated_channel is not None and replicated_channel.deleted_at is not None
             assert replicated_push is not None and replicated_push.disabled_at is not None
+
+
+def test_service_token_and_revocation_replicate_between_nodes(tmp_path: Path) -> None:
+    settings_a = _settings(tmp_path, "service-token-a")
+    settings_b = _settings(tmp_path, "service-token-b")
+    app_a = create_app(settings_a)
+    app_b = create_app(settings_b)
+
+    with (
+        TestClient(app_a, base_url="http://testserver") as client_a,
+        TestClient(app_b, base_url="http://testserver") as client_b,
+    ):
+        auth = _bootstrap(client_a, "service-token-a")
+        created = client_a.post(
+            "/api/v1/service-tokens",
+            headers=auth,
+            json={"name": "replicated MCP", "expires_in_days": 30},
+        )
+        assert created.status_code == 201, created.text
+        body = created.json()
+        service_auth = {"Authorization": f"Bearer {body['token']}"}
+
+        worker = _pull(app_b, settings_b, app_a)
+        assert worker.states["http://configured-peer"].last_error is None
+        remote_read = client_b.get("/api/v1/incidents", headers=service_auth)
+        assert remote_read.status_code == 200, remote_read.text
+        with app_b.state.session_factory() as db:
+            replicated = db.get(ServiceToken, body["id"])
+            assert replicated is not None
+            assert replicated.revoked_at is None
+            history = "\n".join(
+                str(event.payload_json) for event in db.scalars(select(ClusterEvent)).all()
+            )
+            assert body["token"] not in history
+
+        revoked = client_a.delete(f"/api/v1/service-tokens/{body['id']}", headers=auth)
+        assert revoked.status_code == 204, revoked.text
+        worker = _pull(app_b, settings_b, app_a)
+        assert worker.states["http://configured-peer"].last_error is None
+        denied = client_b.get("/api/v1/incidents", headers=service_auth)
+        assert denied.status_code == 401
+        with app_b.state.session_factory() as db:
+            replicated = db.get(ServiceToken, body["id"])
+            assert replicated is not None and replicated.revoked_at is not None
+
+
+def test_service_token_projects_after_its_user_and_revocation_is_remove_wins(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, "service-token-out-of-order")
+    app = create_app(settings)
+    occurred_at = datetime(2026, 9, 5, 9, tzinfo=UTC)
+    user_id = "00000000-0000-0000-0000-000000000101"
+    token_id = "00000000-0000-0000-0000-000000000201"
+    token_payload: dict[str, object] = {
+        "user_id": user_id,
+        "name": "MCP diagnostics",
+        "token_hash": "a" * 64,
+        "scopes": ["mcp:read"],
+        "created_at": occurred_at.isoformat(),
+        "expires_at": (occurred_at + timedelta(days=30)).isoformat(),
+    }
+    token_event = IncomingClusterEvent(
+        event_id="00000000-0000-0000-0000-000000000301",
+        origin_node_id="remote-a",
+        origin_seq=1,
+        entity_type="service_token",
+        entity_id=token_id,
+        operation="upsert",
+        occurred_at=occurred_at,
+        payload=token_payload,
+    )
+    user_event = IncomingClusterEvent(
+        event_id="00000000-0000-0000-0000-000000000302",
+        origin_node_id="remote-a",
+        origin_seq=2,
+        entity_type="user",
+        entity_id=user_id,
+        operation="bootstrap",
+        occurred_at=occurred_at + timedelta(minutes=1),
+        payload={
+            "username": "remote-admin",
+            "password_hash": "replicated-password-hash",
+            "is_admin": True,
+            "created_at": occurred_at.isoformat(),
+        },
+    )
+    revoked_at = occurred_at + timedelta(minutes=2)
+    tombstone_event = IncomingClusterEvent(
+        event_id="00000000-0000-0000-0000-000000000303",
+        origin_node_id="remote-a",
+        origin_seq=3,
+        entity_type="service_token",
+        entity_id=token_id,
+        operation="tombstone",
+        occurred_at=revoked_at,
+        payload={"revoked_at": revoked_at.isoformat()},
+    )
+    stale_upsert = IncomingClusterEvent(
+        event_id="00000000-0000-0000-0000-000000000304",
+        origin_node_id="remote-b",
+        origin_seq=1,
+        entity_type="service_token",
+        entity_id=token_id,
+        operation="upsert",
+        occurred_at=revoked_at + timedelta(minutes=1),
+        payload={**token_payload, "name": "stale active copy"},
+    )
+
+    with TestClient(app, base_url="http://testserver"):
+        with app.state.session_factory.begin() as db:
+            first = apply_cluster_events(db, [token_event, token_event], settings)
+            assert first.applied == 1
+            assert first.duplicates == 1
+            assert db.get(ServiceToken, token_id) is None
+
+        with app.state.session_factory.begin() as db:
+            second = apply_cluster_events(db, [user_event], settings)
+            assert second.applied == 1
+            projected = db.get(ServiceToken, token_id)
+            assert projected is not None
+            assert projected.revoked_at is None
+
+        with app.state.session_factory.begin() as db:
+            third = apply_cluster_events(db, [tombstone_event, stale_upsert], settings)
+            assert third.applied == 2
+
+        with app.state.session_factory() as db:
+            projected = db.get(ServiceToken, token_id)
+            assert projected is not None
+            assert projected.name == "stale active copy"
+            assert projected.revoked_at == revoked_at
 
 
 def test_successful_web_push_channel_test_replicates_last_success_at(

@@ -156,6 +156,19 @@ channel. One rejected refresh is confirmed once before credentials and session-p
 are cleared, which remains the bounded fallback for browsers without Web Locks. Network and 5xx
 refresh failures leave the current identity intact; only two consecutive authentication rejections,
 explicit logout/revocation, or another definitive server rejection ends the frontend session.
+In client-failover mode, successful session issuance stores only an exact configured API origin
+and a 30-second expiry for cross-tab affinity. No token enters storage. During that window, a
+`401/403` from a non-issuing replica is fail-closed as temporary unavailability rather than logout;
+the issuing node's rejection remains immediately authoritative, and every reserve rejection becomes
+authoritative after the bound expires.
+
+Dedicated MCP service tokens use the `mcp:read` scope, are shown once, stored only as keyed hashes,
+expire within one year, replicate as append-only events, and use remove-wins revocation. The API
+accepts them only for `GET`/`HEAD` on incidents, checks, alert rules, availability, cluster status,
+metrics summaries/reachability, and four fixed named metric queries. They cannot access admin APIs,
+arbitrary PromQL, internal peer operations, audit, credentials, or mutations. The local MCP process
+requires exact operator-configured HTTPS origins, refuses redirects and environment proxies, bounds
+timeouts/body sizes, and treats alert/provider text as untrusted data rather than instructions.
 
 Web Push subscriptions are bound by the API to the authenticated session ID; the client-supplied device label is not an authorization or identity key. Revoking a device session, logging out, reaching absolute session expiry, or disabling the owning user prevents delivery and emits a replicated, remove-wins subscription tombstone before the next provider request. A locally observed sliding expiry suppresses delivery without a permanent tombstone because another replica may later supply a valid rotation. Pre-migration subscriptions without a session ID are disabled during migration and are also rejected fail-closed at runtime; the browser must register them again after upgrade.
 

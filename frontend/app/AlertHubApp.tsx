@@ -1954,6 +1954,7 @@ function forgetAccessToken(clearCachedData = false) {
   memoryAccessExpiresAt = 0;
   offlineReadOnlyActive = false;
   if (clearCachedData) {
+    apiEndpointManager.clearSessionAffinity();
     pruneReadCaches(null);
     if (typeof localStorage !== "undefined") localStorage.removeItem(SESSION_HINT_KEY);
   }
@@ -1977,6 +1978,7 @@ function hasLogoutTombstone() {
 }
 
 function markLocalLogout() {
+  apiEndpointManager.clearSessionAffinity();
   if (typeof localStorage !== "undefined") {
     localStorage.setItem(LOGOUT_TOMBSTONE_KEY, String(Date.now()));
   }

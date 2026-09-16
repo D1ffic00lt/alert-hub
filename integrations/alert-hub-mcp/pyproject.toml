@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alert-hub-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for Alert Hub operational context"
+license = "MIT"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "httpx>=0.27,<1",
+  "mcp>=2,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.13,<3",
+  "pytest>=9.0.3,<10",
+  "pytest-asyncio>=1.0,<2",
+  "pytest-cov>=6,<8",
+  "ruff>=0.8,<1",
+]
+
+[project.scripts]
+alert-hub-mcp = "alert_hub_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alert_hub_mcp"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["alert_hub_mcp"]
+
+[tool.coverage.report]
+fail_under = 85
+precision = 1
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true

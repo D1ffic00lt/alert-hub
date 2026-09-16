@@ -28,13 +28,13 @@ REVIEWED_SOURCE_DIGESTS = {
         "4f1a3de109386c007c70d744ec0b2a31af2839b993ae6cffeca12f72b36ccd8e"
     ),
     "backend/alert_hub/api/dependencies.py": (
-        "dea16c3387c94b186178a0a05686163a109f08923399e3fe1a55d09c15a7a6cb"
+        "4c1001aae6ab1b604a7ee6ff179b2a592e52b0f32a7ec87b980e125157dc00d2"
     ),
     "backend/alert_hub/application/auth.py": (
-        "80d393b5300b561ae9eab121ba0f0a8137777becfe54b4d6dca24c130fa2b8b4"
+        "c8c4a1f405217387b9eb8650469f1c44e9c937e90564a9258a8d2a7a00588ed6"
     ),
     "backend/alert_hub/security.py": (
-        "912f34432dbc46a2c801096d61fc5065bd2bf2c48c28c8acbd0b93707163cb58"
+        "2c7f3770aca4ab7dd4aececc7c92e629e5e9de922299ae7ac8d913c8264e30c4"
     ),
 }
 APPROVED_SOURCE = (

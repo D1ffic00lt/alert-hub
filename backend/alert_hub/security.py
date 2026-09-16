@@ -7,6 +7,7 @@ import json
 import secrets
 import time
 from typing import Any, cast
+from uuid import UUID
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
@@ -31,6 +32,9 @@ class TokenError(ValueError):
     pass
 
 
+SERVICE_TOKEN_PREFIX = "ahs_"
+
+
 def hash_password(password: str) -> str:
     if len(password) < 12:
         raise ValueError("password must contain at least 12 characters")
@@ -53,6 +57,25 @@ def password_needs_rehash(password_hash: str) -> bool:
 
 def random_token(bytes_count: int = 32) -> str:
     return secrets.token_urlsafe(bytes_count)
+
+
+def encode_service_token(token_id: str, secret: str) -> str:
+    return f"{SERVICE_TOKEN_PREFIX}{token_id}.{secret}"
+
+
+def decode_service_token(value: str) -> tuple[str, str] | None:
+    if not value.startswith(SERVICE_TOKEN_PREFIX):
+        return None
+    token_id, separator, secret = value.removeprefix(SERVICE_TOKEN_PREFIX).partition(".")
+    if not separator or not secret or len(secret) > 256:
+        raise TokenError("malformed service token")
+    try:
+        parsed_id = UUID(token_id)
+    except ValueError as exc:
+        raise TokenError("malformed service token") from exc
+    if str(parsed_id) != token_id:
+        raise TokenError("malformed service token")
+    return token_id, secret
 
 
 def hash_token(token: str, secret: str, purpose: str) -> str:

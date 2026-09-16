@@ -9,6 +9,15 @@ import {
 const DEAD = "https://api-de.alerts.example";
 const LIVE = "https://api-ru.alerts.example";
 
+function memoryStorage() {
+  const values = new Map<string, string>();
+  return {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => values.set(key, value),
+    removeItem: (key: string) => values.delete(key),
+  };
+}
+
 function clientManager(fetchImpl: typeof fetch) {
   return new ApiEndpointManager(
     {
@@ -240,5 +249,108 @@ describe("API endpoint manager", () => {
       `${DEAD}/api/v1/auth/refresh`,
       `${LIVE}/api/v1/auth/refresh`,
     ]);
+  });
+
+  it("shares short-lived issuing-node affinity with another tab", async () => {
+    const storage = memoryStorage();
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      calls.push(url);
+      return new Response('{"access_token":"token"}', { status: 200 });
+    }) as typeof fetch;
+    const firstTab = new ApiEndpointManager(
+      {
+        mode: "client-failover",
+        nodePublicApiUrl: LIVE,
+        candidates: [LIVE, DEAD],
+      },
+      { fetchImpl, affinityStorage: storage },
+    );
+
+    expect((await firstTab.fetchApi("/auth/login", { method: "POST" })).status).toBe(200);
+
+    const secondTab = new ApiEndpointManager(
+      {
+        mode: "client-failover",
+        nodePublicApiUrl: DEAD,
+        candidates: [DEAD, LIVE],
+      },
+      { fetchImpl, affinityStorage: storage },
+    );
+    expect(
+      (
+        await secondTab.fetchApi(
+          "/auth/refresh",
+          { method: "POST" },
+          { replayRefresh: true, revalidateBeforeMutation: false },
+        )
+      ).status,
+    ).toBe(200);
+    expect(calls.filter((url) => url.endsWith("/api/v1/auth/refresh"))).toEqual([
+      `${LIVE}/api/v1/auth/refresh`,
+    ]);
+  });
+
+  it("does not treat a reserve-node rejection as authoritative while a session converges", async () => {
+    const storage = memoryStorage();
+    let now = 1_000;
+    let sessionCreated = false;
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith("/health/ready")) return new Response("{}", { status: 200 });
+      if (!sessionCreated && url === `${LIVE}/api/v1/auth/login`) {
+        sessionCreated = true;
+        return new Response('{"access_token":"token"}', { status: 200 });
+      }
+      if (new URL(url).origin === LIVE) return new Response("{}", { status: 503 });
+      return new Response("{}", { status: 401 });
+    }) as typeof fetch;
+    const manager = new ApiEndpointManager(
+      {
+        mode: "client-failover",
+        nodePublicApiUrl: LIVE,
+        candidates: [LIVE, DEAD],
+      },
+      {
+        fetchImpl,
+        affinityStorage: storage,
+        now: () => now,
+        sessionAffinityTtlMs: 5_000,
+      },
+    );
+
+    expect((await manager.fetchApi("/auth/login", { method: "POST" })).status).toBe(200);
+    expect((await manager.fetchApi("/auth/me")).status).toBe(503);
+    expect(calls).toContain(`${DEAD}/api/v1/auth/me`);
+
+    now += 5_001;
+    expect((await manager.fetchApi("/auth/me")).status).toBe(401);
+  });
+
+  it("keeps an issuing-node authentication rejection authoritative", async () => {
+    const storage = memoryStorage();
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/auth/login")) {
+        return new Response('{"access_token":"token"}', { status: 200 });
+      }
+      return new Response("{}", { status: 401 });
+    }) as typeof fetch;
+    const manager = new ApiEndpointManager(
+      {
+        mode: "client-failover",
+        nodePublicApiUrl: LIVE,
+        candidates: [LIVE, DEAD],
+      },
+      { fetchImpl, affinityStorage: storage },
+    );
+
+    await manager.fetchApi("/auth/login", { method: "POST" }, { revalidateBeforeMutation: false });
+
+    expect((await manager.fetchApi("/auth/me")).status).toBe(401);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 });

@@ -37,6 +37,7 @@ from alert_hub.infrastructure.db.models import (
     NotificationRoute,
     PrometheusDatasource,
     PushSubscription,
+    ServiceToken,
     Source,
     SyncCursor,
     User,
@@ -318,6 +319,16 @@ def _session_events_for_user(db: Session, user_id: str) -> list[ClusterEvent]:
     ]
 
 
+def _service_token_events_for_user(db: Session, user_id: str) -> list[ClusterEvent]:
+    return [
+        event
+        for event in db.scalars(
+            select(ClusterEvent).where(ClusterEvent.entity_type == "service_token")
+        ).all()
+        if str(event.payload_json.get("user_id") or "") == user_id
+    ]
+
+
 def _push_events_for_session(db: Session, session_id: str) -> list[ClusterEvent]:
     return [
         event
@@ -393,6 +404,77 @@ def _project_session(db: Session, entity_id: str) -> None:
     db.flush()
     for push_event in _push_events_for_session(db, entity_id):
         _project_push_subscription(db, push_event.entity_id)
+
+
+def _project_service_token(db: Session, entity_id: str) -> None:
+    events = sorted(
+        db.scalars(
+            select(ClusterEvent).where(
+                ClusterEvent.entity_type == "service_token",
+                ClusterEvent.entity_id == entity_id,
+            )
+        ).all(),
+        key=_event_order,
+    )
+    if not events:
+        return
+    state: dict[str, Any] = {}
+    revoked_at: datetime | None = None
+    for event in events:
+        state.update(
+            (key, value) for key, value in event.payload_json.items() if key != "revoked_at"
+        )
+        candidate = _payload_datetime(event.payload_json, "revoked_at")
+        if candidate is None and event.operation == "tombstone":
+            candidate = event.occurred_at
+        if candidate is not None and (revoked_at is None or candidate < revoked_at):
+            revoked_at = candidate
+    user_id = str(state.get("user_id") or "")
+    name = str(state.get("name") or "").strip()
+    token_hash = str(state.get("token_hash") or "")
+    scopes = state.get("scopes")
+    created_at = _payload_datetime(state, "created_at", default=events[0].occurred_at)
+    expires_at = _payload_datetime(state, "expires_at")
+    if (
+        not user_id
+        or db.get(User, user_id) is None
+        or not name
+        or len(token_hash) != 64
+        or scopes != ["mcp:read"]
+        or created_at is None
+        or expires_at is None
+    ):
+        return
+    token = db.get(ServiceToken, entity_id)
+    if token is None:
+        token = ServiceToken(
+            id=entity_id,
+            user_id=user_id,
+            name=name[:255],
+            token_hash=token_hash,
+            scopes_json=["mcp:read"],
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+        db.add(token)
+    token.user_id = user_id
+    token.name = name[:255]
+    token.token_hash = token_hash
+    token.scopes_json = ["mcp:read"]
+    token.created_at = created_at
+    token.expires_at = expires_at
+    token.revoked_at = revoked_at
+    db.flush()
+
+
+def reproject_service_tokens(db: Session) -> None:
+    """Project service-token history persisted by an older N-1 node."""
+
+    entity_ids = db.scalars(
+        select(ClusterEvent.entity_id).where(ClusterEvent.entity_type == "service_token").distinct()
+    ).all()
+    for entity_id in entity_ids:
+        _project_service_token(db, entity_id)
 
 
 def _project_source(db: Session, entity_id: str, settings: Settings) -> None:
@@ -931,6 +1013,8 @@ def _replay_user_dependencies(db: Session, user_id: str, settings: Settings) -> 
     del settings
     for event in _session_events_for_user(db, user_id):
         _project_session(db, event.entity_id)
+    for event in _service_token_events_for_user(db, user_id):
+        _project_service_token(db, event.entity_id)
     for event in _push_events_for_user(db, user_id):
         _project_push_subscription(db, event.entity_id)
 
@@ -944,6 +1028,8 @@ def _project_event(db: Session, event: ClusterEvent, settings: Settings) -> None
         _project_user(db, event.entity_id, settings)
     elif event.entity_type == "session":
         _project_session(db, event.entity_id)
+    elif event.entity_type == "service_token":
+        _project_service_token(db, event.entity_id)
     elif event.entity_type == "source":
         _project_source(db, event.entity_id, settings)
     elif event.entity_type == "incident":
@@ -1006,6 +1092,7 @@ def apply_cluster_events(
         "user": 1,
         "source": 2,
         "session": 3,
+        "service_token": 3,
         "notification_channel": 3,
         "notification_route": 3,
         "prometheus_datasource": 3,

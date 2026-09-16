@@ -2863,6 +2863,59 @@ test("new tabs serialize refresh-token rotation instead of falling back to login
   await secondPage.close();
 });
 
+test("a fresh client-failover session keeps a second tab on its issuing node", async ({
+  context,
+  page,
+}) => {
+  const issuingApi = "https://api-ru-session.alerts.example.test";
+  const laggingApi = "https://api-nl-session.alerts.example.test";
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installClientFailoverRuntime(page, issuingApi, laggingApi);
+  await installApi(page, state);
+  await signIn(page);
+
+  state.refreshResponseStatuses = [200];
+  const secondPage = await context.newPage();
+  await secondPage.addInitScript(() => localStorage.setItem("alert-hub-ui-language", "ru"));
+  // This tab prefers the lagging node. The shared fresh-session affinity must
+  // override that order until session replication has had a bounded chance to converge.
+  await installClientFailoverRuntime(secondPage, laggingApi, issuingApi);
+  await installApi(secondPage, state);
+  await secondPage.goto("/");
+
+  await expect(secondPage.getByRole("heading", { name: "Состояние системы" })).toBeVisible();
+  const secondTabRequests = await secondPage.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __e2eApiRequests: Array<{ endpoint: string; method: string; path: string }>;
+        }
+      ).__e2eApiRequests,
+  );
+  expect(
+    secondTabRequests.some(
+      ({ endpoint, method, path }) =>
+        endpoint === "reserve" && method === "POST" && path === "/api/v1/auth/refresh",
+    ),
+  ).toBe(true);
+  expect(
+    secondTabRequests.some(
+      ({ endpoint, method, path }) =>
+        endpoint === "primary" && method === "POST" && path === "/api/v1/auth/refresh",
+    ),
+  ).toBe(false);
+  await secondPage.close();
+});
+
 test("bootstrap, deep-link navigation, live source creation, failover trust, and logout isolation", async ({
   page,
 }) => {
