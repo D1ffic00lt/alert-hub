@@ -84,7 +84,7 @@ jobs:
       - name: Install release test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e './backend[dev]'
+          python -m pip install -e './backend[dev]' -e './integrations/alert-hub-mcp[dev]'
           npm --prefix frontend ci
           npm --prefix frontend exec -- playwright install --with-deps chromium
       - name: Run complete source and recovery gates
