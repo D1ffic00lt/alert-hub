@@ -64,7 +64,6 @@ def _settings(**overrides: Any) -> Settings:
         cluster_secret="checks-test-cluster-key",
         cookie_secure=False,
         heartbeat_scan_seconds=0,
-        checks_enabled=True,
         **overrides,
     )
 

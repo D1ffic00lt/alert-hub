@@ -112,8 +112,8 @@ the complete refresh at 16 concurrent Prometheus requests across all fixed queri
 `CHECKS_MAX_SERIES` adds a combined bound across all fixed query responses and the retained in-memory registry. A limit violation is a
 fail-closed `checks_limit_exceeded`, never a truncated normal summary.
 
-Every `/api/v1/checks*` request requires the existing authentication and authorization checks,
-including disabled mode. Serialization allowlists normalized fields; unknown labels, raw label
+Every `/api/v1/checks*` request requires the existing authentication and authorization checks.
+Serialization allowlists normalized fields; unknown labels, raw label
 sets, Prometheus bodies, internal datasource addresses, and upstream exception text are not
 returned. Conflicting required values become `unknown` instead of selecting an attacker-favorable
 sample. A failed required refresh invalidates current success and returns `data_state: unavailable`;
@@ -209,7 +209,7 @@ Login, bootstrap, ingest, and internal peer traffic use bounded fixed-window lim
 
 ## Production startup invariants
 
-Production startup fails closed unless cookies are secure; `NODE_PUBLIC_API_URL` (or legacy `PUBLIC_API_URL`) is an exact non-loopback HTTPS origin; the browser's `PUBLIC_UI_URL` is present in the exact non-loopback HTTPS `TRUSTED_ORIGINS`; signing, active cluster, and any previous cluster secrets are pairwise distinct, non-default, and high entropy; a master encryption key file is configured; a cookie domain is syntactically safe and contains every trusted browser/API host; peer/origin URLs are valid; an optional `GRAFANA_URL` uses HTTPS without embedded credentials; Checks booleans, thresholds, cache TTL, future tolerance, and cardinality limit are within their bounded ranges; and sync has a non-empty peer CIDR policy. Client failover additionally requires `PUBLIC_UI_URL`, a shared cookie domain, a frozen bounded HTTPS candidate list, and separate API vhosts that never route `/internal/*`. An invalid or disallowed `CHECKS_GRAFANA_BASE_URL` is a deliberate exception: it is safely discarded so a navigation convenience cannot prevent local service. Local HTTP health checks behind the proxy remain possible because these checks validate declared public trust configuration rather than weakening runtime cookie/origin policy.
+Production startup fails closed unless cookies are secure; `NODE_PUBLIC_API_URL` (or legacy `PUBLIC_API_URL`) is an exact non-loopback HTTPS origin; the browser's `PUBLIC_UI_URL` is present in the exact non-loopback HTTPS `TRUSTED_ORIGINS`; signing, active cluster, and any previous cluster secrets are pairwise distinct, non-default, and high entropy; a master encryption key file is configured; a cookie domain is syntactically safe and contains every trusted browser/API host; peer/origin URLs are valid; an optional `GRAFANA_URL` uses HTTPS without embedded credentials; Checks thresholds, cache TTL, future tolerance, and cardinality limit are within their bounded ranges; and sync has a non-empty peer CIDR policy. Client failover additionally requires `PUBLIC_UI_URL`, a shared cookie domain, a frozen bounded HTTPS candidate list, and separate API vhosts that never route `/internal/*`. An invalid or disallowed `CHECKS_GRAFANA_BASE_URL` is a deliberate exception: it is safely discarded so a navigation convenience cannot prevent local service. Local HTTP health checks behind the proxy remain possible because these checks validate declared public trust configuration rather than weakening runtime cookie/origin policy.
 
 Authenticated administrators may replace the runtime Grafana fallback with a replicated cluster
 link. This path also requires HTTPS without embedded credentials. Configurable Prometheus job

@@ -16,6 +16,7 @@ import { AlertsPage } from "./alerts/AlertsPage";
 import { createAsyncRequestLimiter } from "./api/concurrency";
 import { apiEndpointManager, type ApiEndpointSnapshot } from "./api/endpoints";
 import { CheckDetailPage, ChecksPage, ChecksWidget } from "./checks/ChecksViews";
+import { createDemoChecksRequest } from "./checks/demo";
 import {
   type ChecksOverviewState,
   type ChecksRequestResult,
@@ -497,6 +498,8 @@ function createDemoData(): HubData {
           runbook_url: "https://runbooks.example.net/api-latency",
         },
         events: createTimelineA(),
+        checkIds: ["checkout-flow"],
+        checksRelationState: "available",
       },
       {
         id: "inc-01J7ZNRQBGCQKD0NN06T",
@@ -557,6 +560,8 @@ function createDemoData(): HubData {
             node: "ru-msk-01",
           },
         ],
+        checkIds: ["vless-nl-edge"],
+        checksRelationState: "available",
       },
       {
         id: "inc-01J7ZHW5D6W2C66RJ2EM",
@@ -596,6 +601,8 @@ function createDemoData(): HubData {
             node: "eu-de-01",
           },
         ],
+        checkIds: ["portal-tls"],
+        checksRelationState: "available",
       },
       {
         id: "inc-01J7Z9P2ZVM3A1NNDKWB",
@@ -646,6 +653,7 @@ function createDemoData(): HubData {
             node: "eu-nl-01",
           },
         ],
+        checksRelationState: "available",
       },
     ],
     nodes: [
@@ -3857,7 +3865,6 @@ function Sidebar({
   onCollapse,
   incidents,
   nodes,
-  operator,
 }: {
   route: RouteId;
   navigate: (path: string) => void;
@@ -3865,7 +3872,6 @@ function Sidebar({
   onCollapse: () => void;
   incidents: Incident[];
   nodes: ClusterNode[];
-  operator: string;
 }) {
   const activeIncidents = incidents.filter((item) => item.status !== "resolved").length;
   const healthyNodes = nodes.filter((item) => item.health === "healthy").length;
@@ -3876,9 +3882,10 @@ function Sidebar({
   return (
     <aside className={`sidebar ${collapsed ? "sidebar--collapsed" : ""}`}>
       <div className="sidebar__top">
-        <Brand />
+        <span className="sidebar__title">{tr("Навигация", "Navigation")}</span>
         <button
           className="icon-button sidebar__collapse"
+          type="button"
           onClick={onCollapse}
           aria-label={
             collapsed
@@ -3891,44 +3898,49 @@ function Sidebar({
       </div>
       <nav className="sidebar__nav" aria-label={tr("Основная навигация", "Primary navigation")}>
         <span className="sidebar__section-label">{tr("Мониторинг", "Operations")}</span>
-        {NAV_ITEMS.slice(0, 7).map((item) => (
-          <button
-            key={item.id}
-            className={
-              route === item.id ||
-              (route === "incident" && item.id === "incidents") ||
-              (route === "check" && item.id === "checks")
-                ? "active"
-                : ""
-            }
-            onClick={() => navigate(item.path)}
-            title={collapsed ? item.label : undefined}
-          >
-            <Icon symbol={item.icon} />
-            <span>{item.label}</span>
-            {item.id === "incidents" && <em>{activeIncidents}</em>}
-          </button>
-        ))}
+        {NAV_ITEMS.slice(0, 7).map((item) => {
+          const active =
+            route === item.id ||
+            (route === "incident" && item.id === "incidents") ||
+            (route === "check" && item.id === "checks");
+          return (
+            <button
+              key={item.id}
+              className={active ? "active" : ""}
+              type="button"
+              onClick={() => navigate(item.path)}
+              title={collapsed ? item.label : undefined}
+              aria-label={item.label}
+              aria-current={active ? "page" : undefined}
+            >
+              <Icon symbol={item.icon} />
+              <span>{item.label}</span>
+              {item.id === "incidents" && <em>{activeIncidents}</em>}
+            </button>
+          );
+        })}
         <span className="sidebar__section-label">{tr("Управление", "Manage")}</span>
-        {NAV_ITEMS.slice(7).map((item) => (
-          <button
-            key={item.id}
-            className={route === item.id ? "active" : ""}
-            onClick={() => navigate(item.path)}
-            title={collapsed ? item.label : undefined}
-          >
-            <Icon symbol={item.icon} />
-            <span>{item.label}</span>
-          </button>
-        ))}
+        {NAV_ITEMS.slice(7).map((item) => {
+          const active = route === item.id;
+          return (
+            <button
+              key={item.id}
+              className={active ? "active" : ""}
+              type="button"
+              onClick={() => navigate(item.path)}
+              title={collapsed ? item.label : undefined}
+              aria-label={item.label}
+              aria-current={active ? "page" : undefined}
+            >
+              <Icon symbol={item.icon} />
+              <span>{item.label}</span>
+            </button>
+          );
+        })}
       </nav>
       <div className="sidebar__footer">
         <div className="sidebar__cluster-mini">
-          <span className="cluster-ring">
-            <i />
-            <i />
-            <i />
-          </span>
+          <StatusDot health={nodes.length ? aggregateNodeHealth(nodes) : "unknown"} />
           <span>
             <b>
               {nodes.length
@@ -3944,16 +3956,6 @@ function Sidebar({
                   : `${healthyNodes} healthy · ${impairedNodes} impaired · ${unknownNodes} unknown`
                 : tr("Ожидаем данные", "Waiting for live data")}
             </small>
-          </span>
-        </div>
-        <div
-          className="sidebar__profile"
-          aria-label={tr("Текущая учётная запись", "Signed-in account")}
-        >
-          <span className="avatar">OP</span>
-          <span>
-            <b>{tr("Оператор", "Operator")}</b>
-            <small>{operator}</small>
           </span>
         </div>
       </div>
@@ -3979,13 +3981,20 @@ function MobileNav({
           className={
             route === item.id || (route === "incident" && item.id === "incidents") ? "active" : ""
           }
+          type="button"
           onClick={() => navigate(item.path)}
+          aria-label={item.label}
+          aria-current={
+            route === item.id || (route === "incident" && item.id === "incidents")
+              ? "page"
+              : undefined
+          }
         >
           <Icon symbol={item.icon} />
           <span>{item.label}</span>
         </button>
       ))}
-      <button onClick={onMore}>
+      <button type="button" onClick={onMore} aria-label={tr("Ещё", "More")}>
         <Icon symbol="more" />
         <span>{tr("Ещё", "More")}</span>
       </button>
@@ -4033,10 +4042,19 @@ function MobileDrawer({
                   ? "active"
                   : ""
               }
+              type="button"
               onClick={() => {
                 navigate(item.path);
                 onClose();
               }}
+              aria-label={item.label}
+              aria-current={
+                route === item.id ||
+                (route === "incident" && item.id === "incidents") ||
+                (route === "check" && item.id === "checks")
+                  ? "page"
+                  : undefined
+              }
             >
               <Icon symbol={item.icon} />
               <span>{item.label}</span>
@@ -4089,6 +4107,8 @@ function ConnectionBanner({
 }
 
 function AppHeader({
+  pageLabel,
+  operator,
   nodes,
   mode,
   online,
@@ -4100,6 +4120,8 @@ function AppHeader({
   onLogout,
   logoutBusy,
 }: {
+  pageLabel: string;
+  operator: string;
   nodes: ClusterNode[];
   mode: DataMode;
   online: boolean;
@@ -4128,11 +4150,26 @@ function AppHeader({
       : syncHealth === "unknown"
         ? tr("нет телеметрии", "telemetry unavailable")
         : healthLabel(syncHealth);
+  const runtimeHealth: Health = !online
+    ? "offline"
+    : liveUpdates
+      ? "healthy"
+      : mode === "live"
+        ? "degraded"
+        : "paused";
+  const runtimeLabel = liveUpdates
+    ? tr("В реальном времени", "Live")
+    : mode === "live"
+      ? tr("Опрос", "Polling")
+      : mode === "cached"
+        ? tr("Из кэша", "Cached")
+        : tr("демо-режим", "demo mode");
   return (
     <header className="app-header">
-      <div className="app-header__mobile-brand">
+      <div className="app-header__brand">
         <button
-          className="icon-button"
+          className="icon-button app-header__menu"
+          type="button"
           onClick={onMenu}
           aria-label={tr("Открыть меню", "Open menu")}
         >
@@ -4140,61 +4177,67 @@ function AppHeader({
         </button>
         <Brand />
       </div>
-      <div
-        className="node-chip"
-        title={tr("Последнее состояние кластера", "Latest cluster inventory")}
-      >
-        <StatusDot health={online ? (nodes.length ? clusterHealth : "paused") : "offline"} />
-        <span>
-          <small>{tr("Состав кластера", "Cluster inventory")}</small>
-          <b>
-            {nodes.length
-              ? currentUiLanguage() === "ru"
-                ? `${nodes.length} узл.`
-                : `${nodes.length} known node(s)`
-              : tr("Нет данных об узлах", "No node records")}
-          </b>
-        </span>
+      <div className="app-header__context" aria-label={tr("Текущий раздел", "Current section")}>
+        <small>{tr("Операции", "Operations")}</small>
+        <b>{pageLabel}</b>
       </div>
       <div className="app-header__status">
-        <span className="header-signal">
+        <span
+          className="header-signal header-signal--runtime"
+          title={tr("Режим обновления данных", "Data update mode")}
+        >
+          <StatusDot health={runtimeHealth} />
+          <b>{runtimeLabel}</b>
+        </span>
+        <span
+          className="header-signal header-signal--sync"
+          title={tr("Последнее состояние кластера", "Latest cluster state")}
+        >
           <StatusDot health={syncHealth} />
           <span>
             {tr("Синхронизация", "Sync")} <b>{syncLabel}</b>
           </span>
         </span>
-        <span className="header-signal">
-          <StatusDot health={liveUpdates ? "healthy" : mode === "live" ? "degraded" : "paused"} />
-          <span>
-            {liveUpdates
-              ? tr("В реальном времени", "Live")
-              : mode === "live"
-                ? tr("Опрос", "Polling")
-                : mode === "cached"
-                  ? tr("Из кэша", "Cached")
-                  : tr("демо-режим", "demo mode")}
-          </span>
-        </span>
         <button
           className={`icon-button refresh-button ${refreshing ? "is-spinning" : ""}`}
+          type="button"
           onClick={onRefresh}
           aria-label={tr("Обновить данные кластера", "Refresh cluster data")}
         >
           <Icon symbol="refresh" />
         </button>
-        <button className="button button--quiet notifications-button" onClick={onNotifications}>
+        <button
+          className="button button--quiet notifications-button"
+          type="button"
+          onClick={onNotifications}
+          aria-label={tr("Уведомления", "Notifications")}
+        >
           <Icon symbol="bell" />
           <span>{tr("Уведомления", "Notifications")}</span>
         </button>
+        <div
+          className="app-header__account"
+          aria-label={tr("Текущая учётная запись", "Signed-in account")}
+        >
+          <span className="avatar">OP</span>
+          <span>
+            <b>{tr("Оператор", "Operator")}</b>
+            <small>{operator}</small>
+          </span>
+        </div>
         <button
-          className="button button--quiet button--small"
+          className="icon-button app-header__logout"
           type="button"
           onClick={onLogout}
           disabled={logoutBusy}
-          aria-label={tr("Выйти из Alert Hub", "Log out of Alert Hub")}
+          aria-label={
+            logoutBusy
+              ? tr("Выходим из Alert Hub", "Logging out of Alert Hub")
+              : tr("Выйти из Alert Hub", "Log out of Alert Hub")
+          }
+          title={tr("Выйти", "Log out")}
         >
           <Icon symbol="logout" />
-          <span>{logoutBusy ? tr("Выходим…", "Logging out…") : tr("Выйти", "Log out")}</span>
         </button>
       </div>
     </header>
@@ -4335,13 +4378,13 @@ function AlertHubRuntime() {
     language,
     route.id === "incidents" || route.id === "incident",
   );
+  const demoChecksRequest = useMemo(() => createDemoChecksRequest(language), [language]);
+  const checksRequest = auth.state.status === "demo" ? demoChecksRequest : getChecksJson;
   const checksRuntimeMode: ChecksRuntimeMode =
-    auth.state.status === "authenticated"
+    auth.state.status === "authenticated" || auth.state.status === "demo"
       ? "active"
-      : auth.state.status === "offline"
-        ? "unavailable"
-        : "disabled";
-  const [checksOverview, refreshChecks] = useChecksOverview(getChecksJson, checksRuntimeMode);
+      : "unavailable";
+  const [checksOverview, refreshChecks] = useChecksOverview(checksRequest, checksRuntimeMode);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenu, setMobileMenu] = useState(false);
   const [sourceWizard, setSourceWizard] = useState(false);
@@ -4349,7 +4392,6 @@ function AlertHubRuntime() {
   const [logoutBusy, setLogoutBusy] = useState(false);
   const readOnly = auth.state.status === "demo" || auth.state.status === "offline";
   const effectiveOnline = auth.state.status === "offline" ? false : online;
-  const checksVisible = checksOverview.enabled !== false;
   const refreshAll = async () => {
     if (auth.state.status === "offline") await auth.recover();
     refreshChecks();
@@ -4454,6 +4496,12 @@ function AlertHubRuntime() {
     route.id === "incident"
       ? tr("Инцидент", "Incident")
       : (NAV_ITEMS.find((item) => item.id === route.id)?.label ?? tr("Обзор", "Overview"));
+  const operatorLabel =
+    auth.state.status === "authenticated"
+      ? String(auth.state.user.username ?? "operator")
+      : auth.state.status === "offline"
+        ? tr("офлайн · только чтение", "offline · read-only")
+        : tr("демо-режим", "demo-preview");
 
   const view = !hubPageReady ? (
     <HubPageSkeleton label={pageLabel} />
@@ -4498,7 +4546,6 @@ function AlertHubRuntime() {
               navigate={navigate}
               setData={setData}
               readOnly={readOnly}
-              checksVisible={checksVisible}
               externalRefreshVersion={incidentsVersion}
               requestMode={
                 auth.state.status === "demo"
@@ -4512,7 +4559,7 @@ function AlertHubRuntime() {
         case "checks":
           return (
             <ChecksPage
-              request={getChecksJson}
+              request={checksRequest}
               runtimeMode={checksRuntimeMode}
               language={language}
               navigate={navigate}
@@ -4522,7 +4569,7 @@ function AlertHubRuntime() {
           return (
             <CheckDetailPage
               checkId={route.checkId ?? ""}
-              request={getChecksJson}
+              request={checksRequest}
               runtimeMode={checksRuntimeMode}
               language={language}
               navigate={navigate}
@@ -4630,16 +4677,11 @@ function AlertHubRuntime() {
         onCollapse={() => setSidebarCollapsed((value) => !value)}
         incidents={data.incidents}
         nodes={data.nodes}
-        operator={
-          auth.state.status === "authenticated"
-            ? String(auth.state.user.username ?? "operator")
-            : auth.state.status === "offline"
-              ? tr("офлайн · только чтение", "offline · read-only")
-              : tr("демо-режим", "demo-preview")
-        }
       />
       <div className="app-frame">
         <AppHeader
+          pageLabel={pageLabel}
+          operator={operatorLabel}
           nodes={data.nodes}
           mode={mode}
           online={effectiveOnline}
@@ -6178,7 +6220,6 @@ function IncidentDetailPage({
   navigate,
   setData,
   readOnly,
-  checksVisible,
   externalRefreshVersion,
   requestMode,
 }: {
@@ -6187,7 +6228,6 @@ function IncidentDetailPage({
   navigate: (path: string) => void;
   setData: React.Dispatch<React.SetStateAction<HubData>>;
   readOnly: boolean;
-  checksVisible: boolean;
   externalRefreshVersion: number;
   requestMode: "live" | "offline" | "demo";
 }) {
@@ -6424,27 +6464,22 @@ function IncidentDetailPage({
           <Icon symbol="!" /> {actionError}
         </div>
       )}
-      {checksVisible &&
-        incident.checksRelationState === "available" &&
-        Boolean(incident.checkIds?.length) && (
-          <nav
-            className="incident-check-links"
-            aria-label={tr("Связанные Checks", "Related Checks")}
-          >
-            <span>
-              <Icon symbol="checks" /> {tr("Связанные Checks", "Related Checks")}
-            </span>
-            {incident.checkIds?.map((checkId) => (
-              <Link
-                key={checkId}
-                className="button button--quiet button--small"
-                to={`/checks/${encodeURIComponent(checkId)}`}
-              >
-                <code>{checkId}</code> <span aria-hidden="true">→</span>
-              </Link>
-            ))}
-          </nav>
-        )}
+      {incident.checksRelationState === "available" && Boolean(incident.checkIds?.length) && (
+        <nav className="incident-check-links" aria-label={tr("Связанные Checks", "Related Checks")}>
+          <span>
+            <Icon symbol="checks" /> {tr("Связанные Checks", "Related Checks")}
+          </span>
+          {incident.checkIds?.map((checkId) => (
+            <Link
+              key={checkId}
+              className="button button--quiet button--small"
+              to={`/checks/${encodeURIComponent(checkId)}`}
+            >
+              <code>{checkId}</code> <span aria-hidden="true">→</span>
+            </Link>
+          ))}
+        </nav>
+      )}
       <div className="incident-detail-grid">
         <Panel
           className="timeline-panel"

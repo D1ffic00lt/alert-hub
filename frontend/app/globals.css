@@ -7458,7 +7458,7 @@ body,
   }
 }
 
-/* Checks is an optional, network-only operational surface. */
+/* Checks is an always-available, network-only operational surface. */
 .checks-glyph {
   display: inline-flex;
   width: 1.3em;
