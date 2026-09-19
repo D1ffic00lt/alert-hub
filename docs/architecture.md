@@ -21,15 +21,21 @@ projection. This remains an eventually consistent operational summary; Prometheu
 continue to own detailed infrastructure time-series.
 
 The authenticated Alerts read model uses the same outbound Prometheus boundary. Rule inventory is
-read directly from `/api/v1/rules?type=alert`; observed availability is calculated on demand with
-fixed `avg_over_time`, `count_over_time`, and `last_over_time` expressions for exactly `24h`, `7d`,
-or `30d`. Neither result is persisted in SQLite. The Alerts catalog groups rules by the arbitrary
-Prometheus label `alert_category`, with a separate uncategorized group when the label is absent.
+read directly from `/api/v1/rules?type=alert`; alert-state history is calculated on demand from
+`ALERTS` with one fixed range query for exactly `24h`, `7d`, or `30d`; observed availability is
+calculated with fixed `avg_over_time`, `count_over_time`, and `last_over_time` expressions over the
+same three windows. None of those time-series are persisted in SQLite. The Alerts catalog groups
+rules by the arbitrary Prometheus label `alert_category`, with a separate uncategorized group when
+the label is absent.
 Replicas with the same category and alert name are one logical rule while their datasource, file,
 group, state, instance counts, evaluation health, error, labels, and annotations remain separate.
-Availability evidence is not mixed into that catalog; the regional matrix and Checks remain their
-own screens. A datasource failure produces an explicit partial result when another datasource
-answered.
+The alert-history strip presents inactive, pending, firing, and unknown buckets. It calls inactive
+buckets quiet intervals rather than uptime or an SLO. Prometheus instance labels remain available
+inside the backend so a slash is overlaid only when every active instance has an exact local
+incident relationship and was silenced in Alert Hub; those labels are not returned to the browser.
+Unknown silence evidence stays unknown and is not presented as unmuted. Availability evidence is not mixed into that catalog; the regional
+matrix and Checks remain their own screens. A datasource failure produces an explicit partial
+result when another datasource answered.
 
 ```mermaid
 flowchart LR

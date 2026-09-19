@@ -12,8 +12,10 @@ from sqlalchemy.orm import Session
 from alert_hub.infrastructure.db.models import PrometheusDatasource
 from alert_hub.infrastructure.encryption import EncryptionError, EnvelopeCipher
 from alert_hub.infrastructure.prometheus import (
+    AlertHistoryWindow,
     AlertRule,
     FixedQueryName,
+    MatrixSeries,
     PrometheusClient,
     PrometheusQueryError,
     VectorSample,
@@ -69,6 +71,13 @@ class DatasourceRulesResult:
     datasource_id: str
     datasource_name: str
     rules: list[AlertRule]
+
+
+@dataclass(frozen=True, slots=True)
+class DatasourceHistoryResult:
+    datasource_id: str
+    datasource_name: str
+    series: list[MatrixSeries]
 
 
 def prepare_enabled_datasources(
@@ -205,5 +214,37 @@ async def query_datasource_rules_targets(
 
     raw_results = await asyncio.gather(*(query_one(target) for target in targets))
     successes = [item for item in raw_results if isinstance(item, DatasourceRulesResult)]
+    failures = [item for item in raw_results if isinstance(item, DatasourceQueryFailure)]
+    return successes, failures
+
+
+async def query_datasource_history_targets(
+    targets: list[DatasourceQueryTarget],
+    client: PrometheusClient,
+    window: AlertHistoryWindow,
+    *,
+    evaluated_at: datetime,
+) -> tuple[list[DatasourceHistoryResult], list[DatasourceQueryFailure]]:
+    async def query_one(
+        target: DatasourceQueryTarget,
+    ) -> DatasourceHistoryResult | DatasourceQueryFailure:
+        try:
+            series = await client.alert_history(
+                target.url,
+                target.credentials,
+                window,
+                evaluated_at=evaluated_at,
+            )
+        except PrometheusQueryError as exc:
+            return DatasourceQueryFailure(
+                target.datasource_id,
+                target.datasource_name,
+                exc.code,
+                exc.detail,
+            )
+        return DatasourceHistoryResult(target.datasource_id, target.datasource_name, series)
+
+    raw_results = await asyncio.gather(*(query_one(target) for target in targets))
+    successes = [item for item in raw_results if isinstance(item, DatasourceHistoryResult)]
     failures = [item for item in raw_results if isinstance(item, DatasourceQueryFailure)]
     return successes, failures
