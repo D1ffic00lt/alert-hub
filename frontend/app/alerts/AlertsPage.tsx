@@ -197,28 +197,34 @@ function demoRules(): AlertRulesSnapshot {
 }
 
 function demoHistory(window: AlertHistoryWindow): AlertHistorySnapshot {
-  const count = window === "24h" ? 24 : window === "7d" ? 28 : 30;
-  const bucketSeconds = window === "24h" ? 3_600 : window === "7d" ? 21_600 : 86_400;
+  const count = 40;
+  const bucketSeconds = window === "24h" ? 2_160 : window === "7d" ? 15_120 : 64_800;
+  const samplesPerBucket = 4;
+  const sampleSeconds = Math.trunc(bucketSeconds / samplesPerBucket);
   const generatedAt = new Date("2026-09-07T00:00:00Z");
   const startsAt = new Date(generatedAt.getTime() - count * bucketSeconds * 1_000);
   const buckets = Array.from({ length: count }, (_, index) => ({
     starts_at: new Date(startsAt.getTime() + index * bucketSeconds * 1_000).toISOString(),
     ends_at: new Date(startsAt.getTime() + (index + 1) * bucketSeconds * 1_000).toISOString(),
   }));
-  const apiStates = Array.from({ length: count }, () => "inactive");
-  const apiMuted: Array<boolean | null> = Array.from({ length: count }, () => false);
-  apiStates[Math.max(0, count - 9)] = "pending";
-  apiStates[Math.max(0, count - 6)] = "firing";
-  apiMuted[Math.max(0, count - 6)] = true;
-  apiStates[count - 1] = "firing";
-  const latencyStates = Array.from({ length: count }, () => "inactive");
-  latencyStates[Math.max(0, count - 3)] = "pending";
+  const apiActivity = Array.from({ length: count }, () =>
+    Array.from({ length: samplesPerBucket }, () => "inactive"),
+  );
+  apiActivity[count - 5] = ["firing", "pending", "inactive", "inactive"];
+  apiActivity[count - 3] = Array.from({ length: samplesPerBucket }, () => "firing");
+  apiActivity[count - 1] = ["firing", "pending", "inactive", "inactive"];
+  const latencyActivity = Array.from({ length: count }, () =>
+    Array.from({ length: samplesPerBucket }, () => "inactive"),
+  );
+  latencyActivity[count - 2] = ["pending", "pending", "inactive", "inactive"];
   return normalizeAlertHistory(
     {
       data_state: "ok",
       generated_at: generatedAt.toISOString(),
       window,
       bucket_seconds: bucketSeconds,
+      sample_seconds: sampleSeconds,
+      samples_per_bucket: samplesPerBucket,
       buckets,
       datasources: [
         { id: "prom-ru", name: "RU Prometheus" },
@@ -231,18 +237,14 @@ function demoHistory(window: AlertHistoryWindow): AlertHistorySnapshot {
           datasource_name: "RU Prometheus",
           name: "ApiDown",
           category: "infrastructure",
-          states: apiStates,
-          muted: apiMuted,
-          mute_source: "alert_hub",
+          activity: apiActivity,
         },
         {
           datasource_id: "prom-nl",
           datasource_name: "NL Prometheus",
           name: "XrayLatencyHigh",
           category: "xray",
-          states: latencyStates,
-          muted: Array.from({ length: count }, () => null),
-          mute_source: null,
+          activity: latencyActivity,
         },
       ],
       errors: [],
@@ -983,8 +985,8 @@ export function AlertsPage({
             <small>
               {tx(
                 language,
-                "Доля спокойных интервалов, не SLO. Перечёркивание означает silence в Alert Hub.",
-                "Quiet intervals, not an SLO. A slash means silenced in Alert Hub.",
+                "40 интервалов; внутри каждой капсулы события идут по времени сверху вниз.",
+                "40 intervals; activity inside each pill runs chronologically from top to bottom.",
               )}
             </small>
           </span>

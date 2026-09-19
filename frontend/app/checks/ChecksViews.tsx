@@ -8,6 +8,7 @@ import {
 } from "react";
 import { Link } from "react-router-dom";
 
+import { CheckHistory } from "./CheckHistory";
 import {
   CHECK_STATUSES,
   checkIdentity,
@@ -28,11 +29,13 @@ import {
 } from "./diagnostics";
 import {
   type CheckDetailState,
+  type CheckHistoryViewState,
   type ChecksListState,
   type ChecksOverviewState,
   type ChecksRequest,
   type ChecksRuntimeMode,
   useCheckDetail,
+  useCheckHistory,
   useChecksList,
 } from "./hooks";
 
@@ -695,6 +698,11 @@ export function ChecksPage({
   const [searchDraft, setSearchDraft] = useState(filters.search);
   const [grouped, setGrouped] = useState(true);
   const [state, refresh] = useChecksList(request, runtimeMode, filters);
+  const [historyState, refreshHistory] = useCheckHistory(request, runtimeMode, "30d");
+  const refreshAll = () => {
+    refresh();
+    refreshHistory();
+  };
   const groups = useMemo(
     () => (grouped ? groupChecks(state.items) : [{ key: "all", label: null, items: state.items }]),
     [grouped, state.items],
@@ -746,7 +754,7 @@ export function ChecksPage({
         <div className="page-heading__actions">
           <button
             className="button button--quiet"
-            onClick={refresh}
+            onClick={refreshAll}
             disabled={state.phase === "loading"}
           >
             <Glyph>↻</Glyph>
@@ -861,7 +869,7 @@ export function ChecksPage({
             language={language}
             phase={state.phase}
             error={state.error}
-            onRetry={refresh}
+            onRetry={refreshAll}
           />
         ) : (
           <>
@@ -889,7 +897,12 @@ export function ChecksPage({
                     <span>{group.items.length}</span>
                   </h2>
                 )}
-                <ChecksTable items={group.items} language={language} navigate={navigate} />
+                <ChecksTable
+                  items={group.items}
+                  language={language}
+                  navigate={navigate}
+                  historyState={historyState}
+                />
               </section>
             ))}
             <nav
@@ -932,10 +945,12 @@ function ChecksTable({
   items,
   language,
   navigate,
+  historyState,
 }: {
   items: CheckListItem[];
   language: ChecksLanguage;
   navigate: Navigate;
+  historyState: CheckHistoryViewState;
 }) {
   return (
     <div className="checks-table-wrap">
@@ -1001,6 +1016,15 @@ function ChecksTable({
                     </span>
                   )}
                   <DiagnosticList codes={check.diagnosticCodes} language={language} compact />
+                  <CheckHistory
+                    checkId={check.checkId}
+                    snapshot={historyState.snapshot}
+                    window="30d"
+                    language={language}
+                    loading={historyState.loading}
+                    error={historyState.error}
+                    compact
+                  />
                 </td>
                 <td data-label={tx(language, "Статус", "Status")}>
                   <CheckStatusBadge status={check.status} language={language} />
@@ -1576,6 +1600,11 @@ export function CheckDetailPage({
   navigate: Navigate;
 }) {
   const [state, refresh] = useCheckDetail(request, runtimeMode, checkId);
+  const [historyState, refreshHistory] = useCheckHistory(request, runtimeMode, "30d", checkId);
+  const refreshAll = () => {
+    refresh();
+    refreshHistory();
+  };
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const onToggle = (key: string, open: boolean) => {
     setExpanded((current) => {
@@ -1600,7 +1629,7 @@ export function CheckDetailPage({
               language={language}
               phase={state.phase}
               error={state.error}
-              onRetry={refresh}
+              onRetry={refreshAll}
             />
             <WarningCodesNotice codes={state.meta?.warningCodes ?? []} language={language} />
             {state.phase === "not_found" && (
@@ -1640,7 +1669,7 @@ export function CheckDetailPage({
           {check.statusReason && <strong>{reasonLabel(language, check.statusReason)}</strong>}
         </div>
         <div className="check-detail-actions">
-          <button className="button button--quiet" onClick={refresh}>
+          <button className="button button--quiet" onClick={refreshAll}>
             <Glyph>↻</Glyph>
             {tx(language, "Обновить", "Refresh")}
           </button>
@@ -1686,6 +1715,15 @@ export function CheckDetailPage({
           </span>
         </div>
       )}
+
+      <CheckHistory
+        checkId={check.checkId}
+        snapshot={historyState.snapshot}
+        window="30d"
+        language={language}
+        loading={historyState.loading}
+        error={historyState.error}
+      />
 
       <div
         className={`check-detail-summary ${

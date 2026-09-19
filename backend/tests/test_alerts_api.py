@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from alert_hub.api import alerts as alerts_api
 from alert_hub.application.prometheus import DatasourceHistoryResult
 from alert_hub.infrastructure.prometheus import (
+    ALERT_HISTORY_WINDOWS,
     FIXED_PROMQL,
     MatrixSeries,
     PrometheusQueryError,
@@ -18,6 +19,34 @@ from alert_hub.infrastructure.prometheus import (
     parse_alert_rules_response,
     parse_matrix_response,
 )
+
+
+def test_alert_history_windows_use_40_pills_with_inner_samples() -> None:
+    assert set(ALERT_HISTORY_WINDOWS) == {"24h", "7d", "30d"}
+    for spec in ALERT_HISTORY_WINDOWS.values():
+        assert spec.bucket_count == 40
+        assert spec.samples_per_bucket == 4
+        assert spec.bucket == spec.sample * spec.samples_per_bucket
+
+
+def test_alert_history_promql_aggregates_global_series_and_safely_scopes_incidents() -> None:
+    global_query = alert_history_promql("30d")
+    assert global_query.startswith("max by (alertname, alert_category) (")
+    assert "[16200s]" in global_query
+
+    scoped_query = alert_history_promql(
+        "24h",
+        match_labels={
+            "alertname": 'ApiDown"} or vector(1)',
+            "alert_category": "infrastructure",
+        },
+    )
+    assert not scoped_query.startswith("max by")
+    assert 'alert_category="infrastructure"' in scoped_query
+    assert 'alertname="ApiDown\\"} or vector(1)"' in scoped_query
+
+    with pytest.raises(ValueError, match="invalid Prometheus label name"):
+        alert_history_promql("24h", match_labels={"bad-label": "value"})
 
 
 def _vector(*samples: tuple[dict[str, str], float, float]) -> dict[str, Any]:
@@ -183,54 +212,53 @@ def test_alert_history_matrix_parser_bounds_total_points() -> None:
         )
 
 
-def test_alert_history_crosses_out_only_when_every_active_instance_is_silenced() -> None:
+def test_alert_history_preserves_sample_order_and_exact_instance_scope() -> None:
     starts_at = datetime(2026, 9, 7, tzinfo=UTC)
-    bucket = timedelta(hours=1)
-    sample_at = starts_at + bucket
+    sample = timedelta(minutes=15)
     labels_a = {
         "alertname": "ApiDown",
         "alert_category": "infrastructure",
         "alertstate": "firing",
         "instance": "api-a",
+        "check_id": "check-a",
     }
-    labels_b = {**labels_a, "instance": "api-b"}
+    labels_b = {**labels_a, "instance": "api-b", "check_id": "check-b"}
     result = DatasourceHistoryResult(
         "prom-1",
         "Primary Prometheus",
         [
-            MatrixSeries(labels_a, [RangeSample(2, sample_at)]),
-            MatrixSeries(labels_b, [RangeSample(2, sample_at)]),
+            MatrixSeries(
+                labels_a,
+                [
+                    RangeSample(2, starts_at + sample),
+                    RangeSample(1, starts_at + sample * 2),
+                ],
+            ),
+            MatrixSeries(labels_b, [RangeSample(2, starts_at + sample * 3)]),
         ],
     )
     identity_a = alerts_api._history_instance_identity("prom-1", labels_a)
-    identity_b = alerts_api._history_instance_identity("prom-1", labels_b)
     assert identity_a is not None
-    assert identity_b is not None
-    evidence = {identity_a: starts_at, identity_b: starts_at}
 
-    partly_silenced = alerts_api._history_response_series(
+    global_history = alerts_api._history_response_series(
         [result],
         starts_at=starts_at,
-        bucket=bucket,
         bucket_count=1,
-        mute_ranges={identity_a: [(starts_at, sample_at)]},
-        mute_observed_from=evidence,
+        sample=sample,
+        samples_per_bucket=4,
     )
-    assert partly_silenced[0]["states"] == ["firing"]
-    assert partly_silenced[0]["muted"] == [False]
+    assert global_history[0]["activity"] == [["firing", "pending", "firing", "inactive"]]
 
-    fully_silenced = alerts_api._history_response_series(
+    exact_history = alerts_api._history_response_series(
         [result],
         starts_at=starts_at,
-        bucket=bucket,
         bucket_count=1,
-        mute_ranges={
-            identity_a: [(starts_at, sample_at)],
-            identity_b: [(starts_at, sample_at)],
-        },
-        mute_observed_from=evidence,
+        sample=sample,
+        samples_per_bucket=4,
+        instance_identity=identity_a,
     )
-    assert fully_silenced[0]["muted"] == [True]
+    assert exact_history[0]["activity"] == [["firing", "pending", "inactive", "inactive"]]
+    assert "muted" not in exact_history[0]
 
 
 def test_alert_rules_are_grouped_by_dynamic_category_filterable_and_partial(
@@ -479,11 +507,10 @@ def test_observed_availability_uses_only_fixed_queries_and_marks_stale_and_unkno
     assert client.get("/api/v1/availability?window=1h", headers=auth).status_code == 422
 
 
-def test_alert_history_uses_fixed_range_query_and_marks_local_silence(
+def test_alert_history_uses_fixed_high_resolution_query_and_incident_identity(
     client: TestClient,
     auth: dict[str, str],
     app: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requested: list[dict[str, str]] = []
 
@@ -493,13 +520,14 @@ def test_alert_history_uses_fixed_range_query_and_marks_local_silence(
         requested.append(params)
         start = datetime.fromisoformat(params["start"].replace("Z", "+00:00")).timestamp()
         end = datetime.fromisoformat(params["end"].replace("Z", "+00:00")).timestamp()
+        step = int(params["step"].removesuffix("s"))
         return httpx.Response(
             200,
             request=request,
             json=_matrix(
                 (
                     {"alertname": "ApiDown", "alert_category": "infrastructure"},
-                    [(start, 1), (end, 2)],
+                    [(start, 2), (start + step, 1), (start + step * 2, 0), (end, 2)],
                 )
             ),
         )
@@ -539,56 +567,41 @@ def test_alert_history_uses_fixed_range_query_and_marks_local_silence(
     )
     assert ingest.status_code == 200, ingest.text
     incident_id = ingest.json()["incident_ids"][0]
-    silenced = client.post(
-        f"/api/v1/incidents/{incident_id}/silence",
-        headers=auth,
-        json={"reason": "planned maintenance"},
-    )
-    assert silenced.status_code == 200, silenced.text
-    repeated_firing = client.post(
-        f"/ingest/v1/events/{source['id']}",
-        headers={"Authorization": f"Bearer {source['token']}"},
-        json={
-            "schema_version": 1,
-            "external_event_id": "history-api-down-repeat",
-            "dedup_key": "history-api-down",
-            "status": "firing",
-            "title": "API down",
-            "severity": "critical",
-            "starts_at": fired_at.isoformat(),
-            "labels": {
-                "alertname": "ApiDown",
-                "alert_category": "infrastructure",
-                "prometheus_datasource_id": datasource_id,
-            },
-        },
-    )
-    assert repeated_firing.status_code == 200, repeated_firing.text
-    assert repeated_firing.json()["incident_ids"] == [incident_id]
 
-    response = client.get("/api/v1/alert-history?window=24h", headers=auth)
+    response = client.get(
+        "/api/v1/alert-history",
+        headers=auth,
+        params={"window": "24h", "incident_id": incident_id},
+    )
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["window"] == "24h"
-    assert body["bucket_seconds"] == 3_600
-    assert len(body["buckets"]) == 24
+    assert body["bucket_seconds"] == 2_160
+    assert body["sample_seconds"] == 540
+    assert body["samples_per_bucket"] == 4
+    assert len(body["buckets"]) == 40
     assert body["datasources"] == [{"id": datasource_id, "name": "Primary Prometheus"}]
     assert len(body["series"]) == 1
     history = body["series"][0]
-    assert history["states"][0] == "pending"
-    assert history["states"][-1] == "firing"
-    assert history["muted"][-1] is True
-    assert history["mute_source"] == "alert_hub"
+    assert history["activity"][0][:3] == ["firing", "pending", "inactive"]
+    assert history["activity"][-1][-1] == "firing"
+    assert "muted" not in history
+    assert "mute_source" not in history
     assert len(requested) == 1
-    assert requested[0]["query"] == alert_history_promql("24h")
+    assert requested[0]["query"] == alert_history_promql(
+        "24h",
+        match_labels={
+            "alertname": "ApiDown",
+            "alert_category": "infrastructure",
+        },
+    )
     assert "max by" not in requested[0]["query"]
-    assert requested[0]["step"] == "3600s"
+    assert requested[0]["step"] == "540s"
     assert client.get("/api/v1/alert-history?window=1h", headers=auth).status_code == 422
-
-    monkeypatch.setattr(alerts_api, "_MAX_ALERT_HISTORY_EVENTS", 1)
-    limited = client.get("/api/v1/alert-history?window=24h", headers=auth)
-    assert limited.status_code == 503
-    assert limited.json()["detail"] == "Alert history silence evidence exceeds the safe event limit"
+    assert (
+        client.get("/api/v1/alert-history?window=24h&incident_id=missing", headers=auth).status_code
+        == 404
+    )
 
 
 def test_alert_endpoints_report_not_configured(client: TestClient, auth: dict[str, str]) -> None:

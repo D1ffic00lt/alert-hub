@@ -95,12 +95,18 @@ unrelated address, verify the peer hostname fails closed.
 
 ### Checks data boundary
 
-The `/api/v1/alert-rules`, `/api/v1/alert-history`, and `/api/v1/availability` operations reuse the
-same authenticated, SSRF-checked Prometheus transport. The browser can select only datasource,
-exact dynamic category, uncategorized, rule state, rule-name search, pagination, and one of the
-three fixed history or availability windows; it cannot provide an upstream URL, timestamps, step,
-or PromQL. Alert history uses a single server-owned range expression, bounded matrix parser, and a
-50,000-event ceiling for its local incident-silence overlay.
+The `/api/v1/alert-rules`, `/api/v1/alert-history`, `/api/v1/checks/history`, and
+`/api/v1/availability` operations reuse the same authenticated, SSRF-checked Prometheus transport.
+Across those operations, the browser can select only datasource, exact dynamic category,
+uncategorized, rule state, rule-name search, pagination, exact `check_id`, exact `incident_id`, and
+one of the three fixed history or availability windows; it cannot provide an upstream URL,
+timestamps, step, sample count, or PromQL. Alert and Check history each use one server-owned range
+expression and the bounded matrix parser. Every window is fixed at 40 display intervals with four
+chronological samples per interval (160 samples per returned series). `incident_id` is resolved on
+the server to one exact Prometheus datasource and the incident's complete alert-label identity;
+the client cannot submit labels or broaden that scope. An optional `check_id` is likewise validated
+and encoded as an exact server-owned matcher before the history query is sent upstream. Alert Hub
+incident events do not overlay or replace Prometheus history.
 Categories come only from the bounded
 `alert_category` label returned by Prometheus and are never inferred from a rule name. Rule labels
 and annotations are count- and length-bounded, last evaluation errors are stripped of URLs and
@@ -108,10 +114,13 @@ credential-shaped values, and datasource failures are mapped to a small public c
 allowlist. Prometheus response bodies and raw exceptions never enter these responses.
 
 Checks reuses the validated Prometheus datasource transport and cannot select an upstream URL,
-metric name, or PromQL from request parameters. All twelve query expressions are fixed on the
-server, use one evaluation time, ignore environment proxies, reject redirects, and retain the
-existing DNS/address, timeout, sample, and body-size controls. One shared internal semaphore caps
-the complete refresh at 16 concurrent Prometheus requests across all fixed queries and datasources.
+metric name, or PromQL from request parameters. All twelve current-state expressions and the one
+history range expression are fixed on the server, ignore environment proxies, reject redirects,
+and retain the existing DNS/address, timeout, sample, and body-size controls. The current-state
+queries share one evaluation time. The history request has one server-selected end time, step, and
+lookback for its selected fixed window. One shared internal semaphore caps the complete
+current-state refresh at 16 concurrent Prometheus requests across all instant queries and
+datasources.
 `CHECKS_MAX_SERIES` adds a combined bound across all fixed query responses and the retained in-memory registry. A limit violation is a
 fail-closed `checks_limit_exceeded`, never a truncated normal summary.
 

@@ -13,6 +13,7 @@
     "/api/v1/channels/{channel_id}": ["patch", "delete"],
     "/api/v1/channels/{channel_id}/test": ["post"],
     "/api/v1/checks": ["get"],
+    "/api/v1/checks/history": ["get"],
     "/api/v1/checks/summary": ["get"],
     "/api/v1/checks/{check_id}": ["get"],
     "/api/v1/cluster/nodes": ["get"],

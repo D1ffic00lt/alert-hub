@@ -13,6 +13,8 @@ import {
 import { Link, useLocation, useNavigate as useRouterNavigate } from "react-router-dom";
 
 import { AlertsPage } from "./alerts/AlertsPage";
+import { IncidentAlertHistory } from "./alerts/AlertHistory";
+import { useIncidentAlertHistory } from "./alerts/hooks";
 import { createAsyncRequestLimiter } from "./api/concurrency";
 import { apiEndpointManager, type ApiEndpointSnapshot } from "./api/endpoints";
 import { CheckDetailPage, ChecksPage, ChecksWidget } from "./checks/ChecksViews";
@@ -4546,6 +4548,7 @@ function AlertHubRuntime() {
               navigate={navigate}
               setData={setData}
               readOnly={readOnly}
+              language={language}
               externalRefreshVersion={incidentsVersion}
               requestMode={
                 auth.state.status === "demo"
@@ -6220,6 +6223,7 @@ function IncidentDetailPage({
   navigate,
   setData,
   readOnly,
+  language,
   externalRefreshVersion,
   requestMode,
 }: {
@@ -6228,6 +6232,7 @@ function IncidentDetailPage({
   navigate: (path: string) => void;
   setData: React.Dispatch<React.SetStateAction<HubData>>;
   readOnly: boolean;
+  language: UiLanguage;
   externalRefreshVersion: number;
   requestMode: "live" | "offline" | "demo";
 }) {
@@ -6244,6 +6249,18 @@ function IncidentDetailPage({
   const detailLoading = requestMode !== "demo" && settledDetailRequestKey !== detailRequestKey;
   const detailLoadError =
     detailFailure?.requestKey === detailRequestKey ? detailFailure.kind : null;
+  const historyIncident = loadedIncident ?? summaryIncident;
+  const hasPrometheusHistory = Boolean(
+    historyIncident?.labels.prometheus_datasource_id?.trim() &&
+    historyIncident.labels.alertname?.trim(),
+  );
+  const incidentHistory = useIncidentAlertHistory(
+    getJson,
+    requestMode === "live" && hasPrometheusHistory,
+    incidentId,
+    "30d",
+    externalRefreshVersion,
+  );
   const incident = loadedIncident ?? (requestMode === "live" ? undefined : summaryIncident);
   const [busy, setBusy] = useState<string | null>(null);
   const [comment, setComment] = useState("");
@@ -6463,6 +6480,16 @@ function IncidentDetailPage({
         <div className="permission-message permission-message--warning" role="alert">
           <Icon symbol="!" /> {actionError}
         </div>
+      )}
+      {requestMode === "live" && hasPrometheusHistory && (
+        <IncidentAlertHistory
+          incidentTitle={incident.title}
+          snapshot={incidentHistory.snapshot}
+          window="30d"
+          language={language}
+          loading={incidentHistory.loading}
+          error={incidentHistory.error}
+        />
       )}
       {incident.checksRelationState === "available" && Boolean(incident.checkIds?.length) && (
         <nav className="incident-check-links" aria-label={tr("Связанные Checks", "Related Checks")}>
