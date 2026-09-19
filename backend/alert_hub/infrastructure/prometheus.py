@@ -8,7 +8,7 @@ import re
 import socket
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
 import httpx
@@ -49,8 +49,24 @@ type AvailabilityQueryName = Literal[
     "availability_last_sample_7d",
     "availability_last_sample_30d",
 ]
+type AlertHistoryWindow = Literal["24h", "7d", "30d"]
 type FixedQueryName = PublicQueryName | CheckQueryName | AvailabilityQueryName
 type ReachabilityLabelMode = Literal["canonical", "server"]
+
+
+@dataclass(frozen=True, slots=True)
+class AlertHistoryWindowSpec:
+    duration: timedelta
+    bucket: timedelta
+    bucket_count: int
+    prometheus_duration: str
+
+
+ALERT_HISTORY_WINDOWS: dict[AlertHistoryWindow, AlertHistoryWindowSpec] = {
+    "24h": AlertHistoryWindowSpec(timedelta(hours=24), timedelta(hours=1), 24, "1h"),
+    "7d": AlertHistoryWindowSpec(timedelta(days=7), timedelta(hours=6), 28, "6h"),
+    "30d": AlertHistoryWindowSpec(timedelta(days=30), timedelta(days=1), 30, "1d"),
+}
 
 REACHABILITY_PROMQL: dict[ReachabilityLabelMode, str] = {
     "canonical": 'probe_success{source_region!="",target_name!=""}',
@@ -128,11 +144,34 @@ def fixed_promql(
     return f"up{{job=~{json.dumps(regex)}}}"
 
 
+def alert_history_promql(window: AlertHistoryWindow) -> str:
+    """Return the fixed alert-state expression for one supported history window."""
+
+    lookback = ALERT_HISTORY_WINDOWS[window].prometheus_duration
+    return (
+        f'(max_over_time(ALERTS{{alertstate="firing",alertname!=""}}[{lookback}]) * 2) '
+        "or "
+        f'max_over_time(ALERTS{{alertstate="pending",alertname!=""}}[{lookback}])'
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class VectorSample:
     labels: dict[str, str]
     value: float
     timestamp: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RangeSample:
+    value: float
+    timestamp: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MatrixSeries:
+    labels: dict[str, str]
+    samples: list[RangeSample]
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +217,15 @@ class PrometheusClient(Protocol):
         url: str,
         credentials: Mapping[str, Any],
     ) -> list[AlertRule]: ...
+
+    async def alert_history(
+        self,
+        url: str,
+        credentials: Mapping[str, Any],
+        window: AlertHistoryWindow,
+        *,
+        evaluated_at: datetime,
+    ) -> list[MatrixSeries]: ...
 
 
 _URL_RE = re.compile(r"(?i)\bhttps?://[^\s\]})>,;]+")
@@ -391,6 +439,84 @@ def parse_vector_response(
     return samples
 
 
+def parse_matrix_response(
+    payload: object,
+    *,
+    max_samples: int,
+) -> list[MatrixSeries]:
+    if not isinstance(payload, dict):
+        raise PrometheusQueryError("invalid_response", "Prometheus response must be an object")
+    if payload.get("status") != "success":
+        error_type = str(payload.get("errorType") or "query_failed")
+        error = str(payload.get("error") or "Prometheus query failed")
+        raise PrometheusQueryError(error_type, error)
+    data = payload.get("data")
+    if not isinstance(data, dict) or data.get("resultType") != "matrix":
+        raise PrometheusQueryError(
+            "invalid_result_type", "Prometheus query did not return a range matrix"
+        )
+    result = data.get("result")
+    if not isinstance(result, list):
+        raise PrometheusQueryError("invalid_response", "Prometheus matrix result must be a list")
+    if len(result) > max_samples:
+        raise PrometheusQueryError("too_many_samples", "Prometheus result exceeds the sample limit")
+
+    series: list[MatrixSeries] = []
+    samples_seen = 0
+    for series_index, raw in enumerate(result):
+        if not isinstance(raw, dict):
+            raise PrometheusQueryError(
+                "invalid_series", f"Prometheus series {series_index} must be an object"
+            )
+        metric = raw.get("metric")
+        values = raw.get("values")
+        if not isinstance(metric, dict) or not isinstance(values, list):
+            raise PrometheusQueryError(
+                "invalid_series", f"Prometheus series {series_index} has an invalid shape"
+            )
+        samples_seen += len(values)
+        if samples_seen > max_samples:
+            raise PrometheusQueryError(
+                "too_many_samples", "Prometheus result exceeds the sample limit"
+            )
+        labels = {
+            key: label
+            for key, label in metric.items()
+            if isinstance(key, str) and isinstance(label, str)
+        }
+        parsed_samples: list[RangeSample] = []
+        for sample_index, value in enumerate(values):
+            if not isinstance(value, list) or len(value) != 2:
+                raise PrometheusQueryError(
+                    "invalid_sample",
+                    f"Prometheus sample {series_index}:{sample_index} has an invalid shape",
+                )
+            try:
+                timestamp = float(value[0])
+                sample_value = float(value[1])
+            except (TypeError, ValueError) as exc:
+                raise PrometheusQueryError(
+                    "invalid_sample",
+                    f"Prometheus sample {series_index}:{sample_index} has a non-numeric value",
+                ) from exc
+            if not math.isfinite(timestamp) or not math.isfinite(sample_value):
+                raise PrometheusQueryError(
+                    "invalid_sample",
+                    f"Prometheus sample {series_index}:{sample_index} contains a non-finite value",
+                )
+            try:
+                occurred_at = datetime.fromtimestamp(timestamp, tz=UTC)
+            except (OverflowError, OSError, ValueError) as exc:
+                raise PrometheusQueryError(
+                    "invalid_sample",
+                    f"Prometheus sample {series_index}:{sample_index} has an invalid timestamp",
+                ) from exc
+            parsed_samples.append(RangeSample(value=sample_value, timestamp=occurred_at))
+        parsed_samples.sort(key=lambda item: item.timestamp)
+        series.append(MatrixSeries(labels=labels, samples=parsed_samples))
+    return series
+
+
 class PrometheusHTTPClient:
     def __init__(
         self,
@@ -554,6 +680,31 @@ class PrometheusHTTPClient:
             max_rules=self.settings.prometheus_max_samples,
             max_instances=self.settings.prometheus_max_samples,
         )
+
+    async def alert_history(
+        self,
+        url: str,
+        credentials: Mapping[str, Any],
+        window: AlertHistoryWindow,
+        *,
+        evaluated_at: datetime,
+    ) -> list[MatrixSeries]:
+        spec = ALERT_HISTORY_WINDOWS[window]
+        end = evaluated_at.astimezone(UTC)
+        start = end - spec.duration + spec.bucket
+        payload = await self._request_json(
+            url,
+            credentials,
+            "/api/v1/query_range",
+            params={
+                "query": alert_history_promql(window),
+                "start": start.isoformat().replace("+00:00", "Z"),
+                "end": end.isoformat().replace("+00:00", "Z"),
+                "step": f"{int(spec.bucket.total_seconds())}s",
+                "timeout": f"{self.settings.prometheus_query_timeout_seconds:g}s",
+            },
+        )
+        return parse_matrix_response(payload, max_samples=self.settings.prometheus_max_samples)
 
 
 def basic_authorization_value(username: str, password: str) -> str:

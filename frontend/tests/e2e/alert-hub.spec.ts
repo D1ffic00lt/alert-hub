@@ -85,6 +85,7 @@ function deferredGate() {
 
 type MockState = {
   applicationSettingsRequest?: Record<string, unknown> | null;
+  alertHistoryRequests?: string[];
   alertRuleRequests?: string[];
   alertRulesGate?: Promise<void> | null;
   alertRulesStarted?: (() => void) | null;
@@ -885,6 +886,57 @@ async function installApi(page: Page, state: MockState) {
           },
         ],
         pagination: { page: 1, page_size: 200, total_items: 3, total_pages: 1 },
+        errors: [
+          {
+            datasource_id: "prom-3",
+            datasource_name: "Unavailable Prometheus",
+            code: "timeout",
+            detail: "Prometheus request timed out",
+          },
+        ],
+      });
+      return;
+    }
+    if (method === "GET" && path === "/alert-history") {
+      state.alertHistoryRequests?.push(url.search);
+      const window = url.searchParams.get("window") ?? "30d";
+      const bucketSeconds = window === "24h" ? 3_600 : window === "7d" ? 21_600 : 86_400;
+      const bucketCount = window === "24h" ? 24 : window === "7d" ? 28 : 30;
+      const generatedAt = new Date("2026-09-07T00:00:00Z");
+      const startsAt = new Date(generatedAt.getTime() - bucketCount * bucketSeconds * 1_000);
+      const states = Array.from({ length: bucketCount }, () => "inactive");
+      const muted = Array.from<boolean | null>({ length: bucketCount }).fill(false);
+      states[bucketCount - 5] = "pending";
+      states[bucketCount - 4] = "firing";
+      states[bucketCount - 3] = "firing";
+      states[bucketCount - 2] = "inactive";
+      states[bucketCount - 1] = "firing";
+      muted[bucketCount - 3] = true;
+      muted[bucketCount - 1] = true;
+      await fulfill(route, {
+        data_state: "partial",
+        generated_at: generatedAt.toISOString(),
+        window,
+        bucket_seconds: bucketSeconds,
+        buckets: Array.from({ length: bucketCount }, (_, index) => ({
+          starts_at: new Date(startsAt.getTime() + index * bucketSeconds * 1_000).toISOString(),
+          ends_at: new Date(startsAt.getTime() + (index + 1) * bucketSeconds * 1_000).toISOString(),
+        })),
+        datasources: [
+          { id: "prom-1", name: "Primary Prometheus" },
+          { id: "prom-2", name: "Secondary Prometheus" },
+        ],
+        series: [
+          {
+            datasource_id: "prom-1",
+            datasource_name: "Primary Prometheus",
+            name: "ApiDown",
+            category: "infrastructure",
+            states,
+            muted,
+            mute_source: "alert_hub",
+          },
+        ],
         errors: [
           {
             datasource_id: "prom-3",
@@ -2457,6 +2509,7 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   page,
 }) => {
   const state: MockState = {
+    alertHistoryRequests: [],
     alertRuleRequests: [],
     authoritativeUnauthorized: false,
     incidents: [],
@@ -2524,6 +2577,15 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   await search.focus();
   await expect(search).toBeFocused();
   const apiRule = page.locator(".alert-rule").filter({ hasText: "ApiDown" });
+  const history = apiRule.locator(".alert-history");
+  await expect(history).toBeVisible();
+  await expect(history.locator(".alert-history__segment")).toHaveCount(30);
+  await expect(history.locator(".alert-history__segment--firing")).toHaveCount(3);
+  await expect(history.locator(".alert-history__segment.is-muted")).toHaveCount(2);
+  await expect(history.getByText("Приглушено в Alert Hub", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "24h", exact: true }).click();
+  await expect.poll(() => state.alertHistoryRequests?.at(-1)).toContain("window=24h");
+  await expect(history.locator(".alert-history__segment")).toHaveCount(24);
   const primaryReplica = apiRule
     .locator(".alert-replica")
     .filter({ hasText: "Primary Prometheus" });

@@ -95,10 +95,13 @@ unrelated address, verify the peer hostname fails closed.
 
 ### Checks data boundary
 
-The `/api/v1/alert-rules` and `/api/v1/availability` operations reuse the same authenticated,
-SSRF-checked Prometheus transport. The browser can select only datasource, exact dynamic category,
-uncategorized, rule state, rule-name search, pagination, and one of the three fixed availability
-windows; it cannot provide an upstream URL or PromQL. Categories come only from the bounded
+The `/api/v1/alert-rules`, `/api/v1/alert-history`, and `/api/v1/availability` operations reuse the
+same authenticated, SSRF-checked Prometheus transport. The browser can select only datasource,
+exact dynamic category, uncategorized, rule state, rule-name search, pagination, and one of the
+three fixed history or availability windows; it cannot provide an upstream URL, timestamps, step,
+or PromQL. Alert history uses a single server-owned range expression, bounded matrix parser, and a
+50,000-event ceiling for its local incident-silence overlay.
+Categories come only from the bounded
 `alert_category` label returned by Prometheus and are never inferred from a rule name. Rule labels
 and annotations are count- and length-bounded, last evaluation errors are stripped of URLs and
 credential-shaped values, and datasource failures are mapped to a small public code/detail

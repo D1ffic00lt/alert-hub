@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   UNCATEGORIZED_FILTER,
+  buildAlertHistoryPath,
   buildAlertRulesPath,
+  historyForRule,
   mergeAvailability,
+  normalizeAlertHistory,
   normalizeAlertRules,
   normalizeAvailability,
 } from "../../app/alerts/model";
@@ -132,5 +135,92 @@ describe("Alerts API model", () => {
     expect(rows[0].windows["24h"]?.observedAvailabilityPercent).toBe(99.9);
     expect(rows[0].windows["7d"]?.dataState).toBe("stale");
     expect(rows[0].windows["30d"]?.observedAvailabilityPercent).toBeNull();
+  });
+
+  it("normalizes bounded alert history and aggregates replicas conservatively", () => {
+    expect(buildAlertHistoryPath("7d")).toBe("/alert-history?window=7d");
+    const snapshot = normalizeAlertHistory(
+      {
+        data_state: "partial",
+        generated_at: "2026-09-07T00:00:00Z",
+        window: "24h",
+        bucket_seconds: 3_600,
+        buckets: [
+          { starts_at: "2026-09-06T21:00:00Z", ends_at: "2026-09-06T22:00:00Z" },
+          { starts_at: "2026-09-06T22:00:00Z", ends_at: "2026-09-06T23:00:00Z" },
+          { starts_at: "2026-09-06T23:00:00Z", ends_at: "2026-09-07T00:00:00Z" },
+        ],
+        datasources: [
+          { id: "prom-1", name: "Primary" },
+          { id: "prom-2", name: "Secondary" },
+        ],
+        series: [
+          {
+            datasource_id: "prom-1",
+            datasource_name: "Primary",
+            name: "ApiDown",
+            category: "infrastructure",
+            states: ["inactive", "pending", "firing"],
+            muted: [false, true, true],
+            mute_source: "alert_hub",
+          },
+          {
+            datasource_id: "prom-2",
+            datasource_name: "Secondary",
+            name: "ApiDown",
+            category: "infrastructure",
+            states: ["broken", "pending", "inactive"],
+            muted: [null, false, null],
+          },
+        ],
+        errors: [
+          {
+            datasource_id: "prom-4",
+            datasource_name: "Unavailable",
+            code: "timeout",
+            detail: "Prometheus request timed out",
+          },
+        ],
+      },
+      "24h",
+    );
+    const rules = normalizeAlertRules({
+      data_state: "ok",
+      totals: {},
+      rules: [
+        {
+          id: "api-down",
+          name: "ApiDown",
+          category: "infrastructure",
+          state: "firing",
+          replicas: [
+            { id: "one", datasource_id: "prom-1", name: "ApiDown", state: "firing" },
+            { id: "two", datasource_id: "prom-2", name: "ApiDown", state: "pending" },
+            { id: "three", datasource_id: "prom-3", name: "ApiDown", state: "inactive" },
+          ],
+        },
+      ],
+      pagination: {},
+    });
+
+    expect(snapshot.series[1].states).toEqual(["unknown", "pending", "inactive"]);
+    expect(snapshot.series[1].muted).toEqual([null, false, null]);
+    expect(historyForRule(snapshot, rules.rules[0])).toEqual({
+      states: ["unknown", "pending", "firing"],
+      muted: [null, false, true],
+      quietPercent: 0,
+      coveragePercent: (2 / 3) * 100,
+    });
+
+    const neverFired = historyForRule(snapshot, {
+      ...rules.rules[0],
+      name: "NeverFired",
+      replicas: [{ ...rules.rules[0].replicas[0], name: "NeverFired" }],
+    });
+    expect(neverFired).toMatchObject({
+      states: ["unknown", "unknown", "unknown"],
+      quietPercent: null,
+      coveragePercent: 0,
+    });
   });
 });

@@ -3,6 +3,8 @@ export type AlertRuleState = "firing" | "pending" | "error" | "inactive";
 export type AlertRuleFilter = AlertRuleState | "error" | "all";
 export type AvailabilityWindow = "24h" | "7d" | "30d";
 export type AvailabilityDataState = "ok" | "stale" | "unknown";
+export type AlertHistoryWindow = "24h" | "7d" | "30d";
+export type AlertHistoryState = "inactive" | "pending" | "firing" | "unknown";
 
 export type DatasourceError = {
   datasourceId: string;
@@ -100,6 +102,39 @@ export type AvailabilityRow = {
   windows: Partial<Record<AvailabilityWindow, AvailabilityTarget>>;
 };
 
+export type AlertHistoryBucket = {
+  startsAt: string;
+  endsAt: string;
+};
+
+export type AlertHistorySeries = {
+  datasourceId: string;
+  datasourceName: string;
+  name: string;
+  category: string | null;
+  states: AlertHistoryState[];
+  muted: Array<boolean | null>;
+  muteSource: "alert_hub" | null;
+};
+
+export type AlertHistorySnapshot = {
+  dataState: AlertRulesDataState;
+  generatedAt: string | null;
+  window: AlertHistoryWindow;
+  bucketSeconds: number;
+  buckets: AlertHistoryBucket[];
+  datasources: Array<{ id: string; name: string }>;
+  series: AlertHistorySeries[];
+  errors: DatasourceError[];
+};
+
+export type AlertRuleHistory = {
+  states: AlertHistoryState[];
+  muted: Array<boolean | null>;
+  quietPercent: number | null;
+  coveragePercent: number;
+};
+
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
@@ -118,6 +153,11 @@ function nullableNumber(value: unknown): number | null {
 
 function nullableString(value: unknown): string | null {
   return typeof value === "string" && value ? value : null;
+}
+
+function validDateString(value: unknown): string | null {
+  if (typeof value !== "string" || !value) return null;
+  return Number.isNaN(new Date(value).getTime()) ? null : value;
 }
 
 function stringRecord(value: unknown): Record<string, string> {
@@ -162,6 +202,11 @@ export function buildAlertRulesPath(filters: {
   if (filters.state !== "all") params.set("state", filters.state);
   if (filters.query.trim()) params.set("q", filters.query.trim());
   return `/alert-rules?${params.toString()}`;
+}
+
+export function buildAlertHistoryPath(window: AlertHistoryWindow): string {
+  if (!["24h", "7d", "30d"].includes(window)) throw new Error("Unsupported alert history window");
+  return `/alert-history?window=${window}`;
 }
 
 export function normalizeAlertRules(payload: unknown): AlertRulesSnapshot {
@@ -271,6 +316,155 @@ export function normalizeAvailability(
       };
     }),
     errors: list(body.errors).map(datasourceError),
+  };
+}
+
+export function normalizeAlertHistory(
+  payload: unknown,
+  requestedWindow: AlertHistoryWindow,
+): AlertHistorySnapshot {
+  const body = record(payload);
+  const rawBuckets = list(body.buckets)
+    .flatMap((value) => {
+      const item = record(value);
+      const startsAt = validDateString(item.starts_at);
+      const endsAt = validDateString(item.ends_at);
+      if (!startsAt || !endsAt || new Date(startsAt).getTime() >= new Date(endsAt).getTime())
+        return [];
+      return [{ startsAt, endsAt }];
+    })
+    .slice(0, 60);
+  const bucketCount = rawBuckets.length;
+  const rawWindow = String(body.window);
+  const window: AlertHistoryWindow = ["24h", "7d", "30d"].includes(rawWindow)
+    ? (rawWindow as AlertHistoryWindow)
+    : requestedWindow;
+  const datasources = list(body.datasources).flatMap((value) => {
+    const item = record(value);
+    const id = String(item.id ?? "").trim();
+    if (!id) return [];
+    return [{ id, name: String(item.name ?? "Prometheus") }];
+  });
+  const validState = (value: unknown): AlertHistoryState =>
+    ["inactive", "pending", "firing", "unknown"].includes(String(value))
+      ? (value as AlertHistoryState)
+      : "unknown";
+  return {
+    dataState: dataState(body.data_state),
+    generatedAt: validDateString(body.generated_at),
+    window,
+    bucketSeconds: Math.max(0, Math.trunc(number(body.bucket_seconds))),
+    buckets: rawBuckets,
+    datasources,
+    series: list(body.series).flatMap((value) => {
+      const item = record(value);
+      const datasourceId = String(item.datasource_id ?? "").trim();
+      const name = String(item.name ?? "").trim();
+      if (!datasourceId || !name) return [];
+      const states = list(item.states).slice(0, bucketCount).map(validState);
+      while (states.length < bucketCount) states.push("unknown");
+      const muted = list(item.muted)
+        .slice(0, bucketCount)
+        .map((entry) => (typeof entry === "boolean" ? entry : null));
+      while (muted.length < bucketCount) muted.push(null);
+      return [
+        {
+          datasourceId,
+          datasourceName: String(item.datasource_name ?? "Prometheus"),
+          name,
+          category: nullableString(item.category),
+          states,
+          muted,
+          muteSource: item.mute_source === "alert_hub" ? "alert_hub" : null,
+        } satisfies AlertHistorySeries,
+      ];
+    }),
+    errors: list(body.errors).map(datasourceError),
+  };
+}
+
+export function historyForRule(
+  snapshot: AlertHistorySnapshot | null,
+  rule: AlertRule,
+): AlertRuleHistory | null {
+  if (!snapshot || snapshot.buckets.length === 0) return null;
+  const successfulDatasources = new Set(snapshot.datasources.map((item) => item.id));
+  const replicaHistories = rule.replicas.map((replica) => {
+    const series = snapshot.series.find(
+      (item) =>
+        item.datasourceId === replica.datasourceId &&
+        item.name === rule.name &&
+        item.category === rule.category,
+    );
+    if (series)
+      return { datasourceId: replica.datasourceId, states: series.states, muted: series.muted };
+    const fallback: AlertHistoryState = successfulDatasources.has(replica.datasourceId)
+      ? "inactive"
+      : "unknown";
+    return {
+      datasourceId: replica.datasourceId,
+      states: snapshot.buckets.map(() => fallback),
+      muted: snapshot.buckets.map(() => null),
+    };
+  });
+  const representedDatasources = new Set(replicaHistories.map((item) => item.datasourceId));
+  for (const series of snapshot.series) {
+    if (
+      series.name !== rule.name ||
+      series.category !== rule.category ||
+      representedDatasources.has(series.datasourceId)
+    )
+      continue;
+    replicaHistories.push({
+      datasourceId: series.datasourceId,
+      states: series.states,
+      muted: series.muted,
+    });
+    representedDatasources.add(series.datasourceId);
+  }
+  for (const failure of snapshot.errors) {
+    if (representedDatasources.has(failure.datasourceId)) continue;
+    replicaHistories.push({
+      datasourceId: failure.datasourceId,
+      states: snapshot.buckets.map(() => "unknown" as const),
+      muted: snapshot.buckets.map(() => null),
+    });
+    representedDatasources.add(failure.datasourceId);
+  }
+  if (!replicaHistories.length) return null;
+
+  const states: AlertHistoryState[] = [];
+  const muted: Array<boolean | null> = [];
+  for (let index = 0; index < snapshot.buckets.length; index += 1) {
+    const replicaStates = replicaHistories.map((item) => item.states[index] ?? "unknown");
+    const state: AlertHistoryState = replicaStates.includes("firing")
+      ? "firing"
+      : replicaStates.includes("pending")
+        ? "pending"
+        : replicaStates.includes("unknown")
+          ? "unknown"
+          : "inactive";
+    states.push(state);
+    const activeMuteValues = replicaHistories.flatMap((item, replicaIndex) =>
+      ["firing", "pending"].includes(replicaStates[replicaIndex] ?? "unknown")
+        ? [item.muted[index] ?? null]
+        : [],
+    );
+    muted.push(
+      activeMuteValues.length > 0 && activeMuteValues.every((value) => value === true)
+        ? true
+        : activeMuteValues.some((value) => value === false)
+          ? false
+          : null,
+    );
+  }
+  const observed = states.filter((state) => state !== "unknown").length;
+  const quiet = states.filter((state) => state === "inactive").length;
+  return {
+    states,
+    muted,
+    quietPercent: observed > 0 ? (quiet / observed) * 100 : null,
+    coveragePercent: (observed / states.length) * 100,
   };
 }
 

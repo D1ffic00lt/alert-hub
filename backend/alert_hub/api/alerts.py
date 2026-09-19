@@ -8,25 +8,30 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session, selectinload
 
 from alert_hub.api.dependencies import current_user, get_db, get_settings
 from alert_hub.api.prometheus import get_prometheus_client
 from alert_hub.application.prometheus import (
+    DatasourceHistoryResult,
     DatasourceQueryFailure,
     DatasourceQueryResult,
     DatasourceRulesResult,
     prepare_enabled_datasources,
+    query_datasource_history_targets,
     query_datasource_rules_targets,
     query_datasource_targets,
 )
+from alert_hub.domain.events import as_utc
 from alert_hub.infrastructure.db.base import utc_now
-from alert_hub.infrastructure.db.models import Incident, User
+from alert_hub.infrastructure.db.models import Incident, IncidentEvent, User
 from alert_hub.infrastructure.encryption import EnvelopeCipher
 from alert_hub.infrastructure.prometheus import (
+    ALERT_HISTORY_WINDOWS,
     AVAILABILITY_QUERY_NAMES,
+    AlertHistoryWindow,
     AlertRule,
     PrometheusClient,
     VectorSample,
@@ -54,7 +59,7 @@ _PUBLIC_FAILURE_DETAILS = {
     "rules_failed": "Prometheus could not return alert rules",
     "timeout": "Prometheus request timed out",
     "too_many_rules": "Prometheus returned more rules than the configured limit",
-    "too_many_samples": "Prometheus returned more series than the configured limit",
+    "too_many_samples": "Prometheus returned more samples than the configured limit",
     "transport": "Prometheus request failed",
     "unsafe_url": "Prometheus datasource address did not pass the network safety check",
 }
@@ -359,6 +364,352 @@ def _sample_map(result: DatasourceQueryResult | None) -> dict[tuple[tuple[str, s
     if result is None:
         return {}
     return {_series_key(sample): sample.value for sample in result.samples}
+
+
+HistoryState = Literal["inactive", "pending", "firing"]
+HistoryLogicalIdentity = tuple[str, str, str | None]
+HistoryInstanceIdentity = tuple[str, tuple[tuple[str, str], ...]]
+_MAX_ALERT_HISTORY_EVENTS = 50_000
+_HISTORY_IDENTITY_EXCLUDED_LABELS = frozenset(
+    {"__name__", "alertstate", "prometheus_datasource_id"}
+)
+
+
+def _history_state(value: float) -> HistoryState:
+    if value >= 1.5:
+        return "firing"
+    if value >= 0.5:
+        return "pending"
+    return "inactive"
+
+
+def _history_instance_identity(
+    datasource_id: str,
+    labels: dict[str, Any],
+) -> HistoryInstanceIdentity | None:
+    alertname = labels.get("alertname")
+    if not isinstance(alertname, str) or not alertname.strip():
+        return None
+    normalized: list[tuple[str, str]] = []
+    for key, value in labels.items():
+        if key in _HISTORY_IDENTITY_EXCLUDED_LABELS:
+            continue
+        if not isinstance(key, str) or not isinstance(value, str):
+            return None
+        normalized.append((key, value))
+    return datasource_id, tuple(sorted(normalized))
+
+
+def _record_mute_range(
+    ranges: dict[HistoryInstanceIdentity, list[tuple[datetime, datetime]]],
+    identity: HistoryInstanceIdentity,
+    muted_at: datetime,
+    unmuted_at: datetime,
+    *,
+    starts_at: datetime,
+    ends_at: datetime,
+) -> None:
+    range_start = max(muted_at, starts_at)
+    range_end = min(unmuted_at, ends_at)
+    if range_end > range_start:
+        ranges.setdefault(identity, []).append((range_start, range_end))
+
+
+def _mute_evidence(
+    db: Session,
+    *,
+    starts_at: datetime,
+    ends_at: datetime,
+) -> tuple[
+    dict[HistoryInstanceIdentity, list[tuple[datetime, datetime]]],
+    dict[HistoryInstanceIdentity, datetime],
+]:
+    datasource_label = func.json_extract(Incident.labels_json, "$.prometheus_datasource_id")
+    alertname_label = func.json_extract(Incident.labels_json, "$.alertname")
+    predicates = (
+        datasource_label.is_not(None),
+        alertname_label.is_not(None),
+        or_(Incident.last_event_at >= starts_at, Incident.status == "silenced"),
+    )
+    event_ids = db.scalars(
+        select(IncidentEvent.id)
+        .join(Incident, Incident.id == IncidentEvent.incident_id)
+        .where(*predicates)
+        .limit(_MAX_ALERT_HISTORY_EVENTS + 1)
+    ).all()
+    if len(event_ids) > _MAX_ALERT_HISTORY_EVENTS:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Alert history silence evidence exceeds the safe event limit",
+        )
+    incidents = db.scalars(
+        select(Incident).options(selectinload(Incident.events)).where(*predicates)
+    ).unique()
+    ranges: dict[HistoryInstanceIdentity, list[tuple[datetime, datetime]]] = {}
+    observed_from: dict[HistoryInstanceIdentity, datetime] = {}
+    for incident in incidents:
+        datasource_id = str(incident.labels_json.get("prometheus_datasource_id") or "").strip()
+        identity = _history_instance_identity(datasource_id, incident.labels_json)
+        if not datasource_id or identity is None:
+            continue
+        events = sorted(incident.events, key=lambda item: (item.occurred_at, item.id))
+        if events:
+            first_seen = events[0].occurred_at.astimezone(UTC)
+            observed_from[identity] = min(observed_from.get(identity, first_seen), first_seen)
+        projection_status = "open"
+        occurrence_starts_at: datetime | None = None
+        acknowledged_at: datetime | None = None
+        muted_at: datetime | None = None
+        for event in events:
+            occurred_at = event.occurred_at.astimezone(UTC)
+            payload = event.payload_json if isinstance(event.payload_json, dict) else {}
+            if event.event_type == "firing":
+                candidate = as_utc(payload.get("starts_at"), default=occurred_at)
+                if (
+                    occurrence_starts_at is None
+                    or candidate > occurrence_starts_at
+                    or projection_status == "resolved"
+                ):
+                    if projection_status == "silenced" and muted_at is not None:
+                        _record_mute_range(
+                            ranges,
+                            identity,
+                            muted_at,
+                            occurred_at,
+                            starts_at=starts_at,
+                            ends_at=ends_at,
+                        )
+                    occurrence_starts_at = candidate
+                    acknowledged_at = None
+                    muted_at = None
+                    projection_status = "open"
+                continue
+            if event.event_type == "resolved":
+                occurrence = payload.get("starts_at")
+                if (
+                    occurrence is not None
+                    and occurrence_starts_at is not None
+                    and as_utc(occurrence) < occurrence_starts_at
+                ):
+                    continue
+                if projection_status == "silenced" and muted_at is not None:
+                    _record_mute_range(
+                        ranges,
+                        identity,
+                        muted_at,
+                        occurred_at,
+                        starts_at=starts_at,
+                        ends_at=ends_at,
+                    )
+                muted_at = None
+                projection_status = "resolved"
+                continue
+            if event.event_type == "acknowledged" and projection_status != "resolved":
+                if projection_status == "silenced" and muted_at is not None:
+                    _record_mute_range(
+                        ranges,
+                        identity,
+                        muted_at,
+                        occurred_at,
+                        starts_at=starts_at,
+                        ends_at=ends_at,
+                    )
+                acknowledged_at = occurred_at
+                muted_at = None
+                projection_status = "acknowledged"
+                continue
+            if event.event_type == "unacknowledged" and projection_status == "acknowledged":
+                acknowledged_at = None
+                projection_status = "open"
+                continue
+            if event.event_type == "silenced" and projection_status != "resolved":
+                muted_at = muted_at or occurred_at
+                projection_status = "silenced"
+                continue
+            if event.event_type == "unsilenced" and projection_status == "silenced":
+                if muted_at is not None:
+                    _record_mute_range(
+                        ranges,
+                        identity,
+                        muted_at,
+                        occurred_at,
+                        starts_at=starts_at,
+                        ends_at=ends_at,
+                    )
+                muted_at = None
+                projection_status = "acknowledged" if acknowledged_at is not None else "open"
+        if muted_at is not None and projection_status == "silenced":
+            _record_mute_range(
+                ranges,
+                identity,
+                muted_at,
+                ends_at,
+                starts_at=starts_at,
+                ends_at=ends_at,
+            )
+    return ranges, observed_from
+
+
+def _history_response_series(
+    results: list[DatasourceHistoryResult],
+    *,
+    starts_at: datetime,
+    bucket: timedelta,
+    bucket_count: int,
+    mute_ranges: dict[HistoryInstanceIdentity, list[tuple[datetime, datetime]]],
+    mute_observed_from: dict[HistoryInstanceIdentity, datetime],
+) -> list[dict[str, Any]]:
+    bucket_seconds = bucket.total_seconds()
+    first_bucket_end = starts_at + bucket
+    priority = {"inactive": 0, "pending": 1, "firing": 2}
+    merged: dict[HistoryLogicalIdentity, dict[str, Any]] = {}
+    instance_states: dict[
+        HistoryLogicalIdentity, dict[HistoryInstanceIdentity, list[HistoryState]]
+    ] = {}
+    for result in results:
+        for item in result.series:
+            alertname = item.labels.get("alertname", "").strip()[:200]
+            raw_category = item.labels.get("alert_category")
+            category = raw_category.strip()[:2_048] if raw_category is not None else None
+            category = category or None
+            if not alertname:
+                continue
+            logical_identity = (result.datasource_id, alertname, category)
+            instance_identity = _history_instance_identity(result.datasource_id, item.labels)
+            if instance_identity is None:
+                continue
+            response = merged.setdefault(
+                logical_identity,
+                {
+                    "datasource_id": result.datasource_id,
+                    "datasource_name": result.datasource_name,
+                    "name": alertname,
+                    "category": category,
+                    "states": ["inactive"] * bucket_count,
+                },
+            )
+            states = instance_states.setdefault(logical_identity, {}).setdefault(
+                instance_identity, ["inactive"] * bucket_count
+            )
+            for sample in item.samples:
+                position = (sample.timestamp - first_bucket_end).total_seconds() / bucket_seconds
+                index = round(position)
+                if index < 0 or index >= bucket_count or abs(position - index) > 0.01:
+                    continue
+                state = _history_state(sample.value)
+                if priority[state] > priority[str(states[index])]:
+                    states[index] = state
+
+    for logical_identity, by_instance in instance_states.items():
+        states = merged[logical_identity]["states"]
+        for instance_history in by_instance.values():
+            for index, state in enumerate(instance_history):
+                if priority[state] > priority[str(states[index])]:
+                    states[index] = state
+
+    response_series: list[dict[str, Any]] = []
+    for logical_identity, response in merged.items():
+        by_instance = instance_states[logical_identity]
+        muted: list[bool | None] = []
+        for index in range(bucket_count):
+            bucket_start = starts_at + bucket * index
+            bucket_end = bucket_start + bucket
+            active_mute_values: list[bool | None] = []
+            for instance_identity, states in by_instance.items():
+                if states[index] not in {"firing", "pending"}:
+                    continue
+                ranges = mute_ranges.get(instance_identity, [])
+                observed_at = mute_observed_from.get(instance_identity)
+                if any(
+                    range_start < bucket_end and range_end > bucket_start
+                    for range_start, range_end in ranges
+                ):
+                    active_mute_values.append(True)
+                elif observed_at is not None and bucket_start >= observed_at:
+                    active_mute_values.append(False)
+                else:
+                    active_mute_values.append(None)
+            if active_mute_values and all(value is True for value in active_mute_values):
+                muted.append(True)
+            elif any(value is False for value in active_mute_values):
+                muted.append(False)
+            else:
+                muted.append(None)
+        response["muted"] = muted
+        response["mute_source"] = (
+            "alert_hub" if any(identity in mute_observed_from for identity in by_instance) else None
+        )
+        response_series.append(response)
+    response_series.sort(
+        key=lambda item: (
+            str(item["name"]).casefold(),
+            str(item["category"] or "").casefold(),
+            str(item["datasource_name"]).casefold(),
+            str(item["datasource_id"]),
+        )
+    )
+    return response_series
+
+
+@router.get("/alert-history")
+async def alert_history(
+    request: Request,
+    window: AlertHistoryWindow = Query(default="30d"),
+    db: Session = Depends(get_db),
+    prometheus: PrometheusClient = Depends(get_prometheus_client),
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    del user
+    generated_at = utc_now()
+    spec = ALERT_HISTORY_WINDOWS[window]
+    starts_at = generated_at - spec.duration
+    cipher: EnvelopeCipher | None = request.app.state.envelope_cipher
+    targets, failures, datasource_count = prepare_enabled_datasources(db, cipher)
+    mute_ranges, mute_observed_from = _mute_evidence(
+        db,
+        starts_at=starts_at,
+        ends_at=generated_at,
+    )
+    db.close()
+    results, transport_failures = await query_datasource_history_targets(
+        targets,
+        prometheus,
+        window,
+        evaluated_at=generated_at,
+    )
+    failures.extend(transport_failures)
+    series = _history_response_series(
+        results,
+        starts_at=starts_at,
+        bucket=spec.bucket,
+        bucket_count=spec.bucket_count,
+        mute_ranges=mute_ranges,
+        mute_observed_from=mute_observed_from,
+    )
+    buckets = [
+        {
+            "starts_at": starts_at + spec.bucket * index,
+            "ends_at": starts_at + spec.bucket * (index + 1),
+        }
+        for index in range(spec.bucket_count)
+    ]
+    return {
+        "data_state": _data_state(
+            datasource_count,
+            has_success=bool(results),
+            has_rules=bool(series),
+            failures=failures,
+        ),
+        "generated_at": generated_at,
+        "window": window,
+        "bucket_seconds": int(spec.bucket.total_seconds()),
+        "buckets": buckets,
+        "datasources": [
+            {"id": result.datasource_id, "name": result.datasource_name} for result in results
+        ],
+        "series": series,
+        "errors": [_failure_response(failure) for failure in failures],
+    }
 
 
 @router.get("/availability")
