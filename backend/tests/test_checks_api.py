@@ -63,10 +63,10 @@ class _StubCache:
         return self.result
 
 
-def _settings(tmp_path: Path, *, enabled: bool, **overrides: Any) -> Settings:
+def _settings(tmp_path: Path, **overrides: Any) -> Settings:
     return Settings(
         environment="test",
-        database_url=f"sqlite:///{tmp_path / ('checks-on.db' if enabled else 'checks-off.db')}",
+        database_url=f"sqlite:///{tmp_path / 'checks.db'}",
         auto_create_schema=True,
         node_id="checks-api-node",
         node_name="Checks API node",
@@ -80,7 +80,6 @@ def _settings(tmp_path: Path, *, enabled: bool, **overrides: Any) -> Settings:
         heartbeat_scan_seconds=0,
         notify_enabled=False,
         sync_enabled=False,
-        checks_enabled=enabled,
         **overrides,
     )
 
@@ -88,11 +87,9 @@ def _settings(tmp_path: Path, *, enabled: bool, **overrides: Any) -> Settings:
 def _client(
     tmp_path: Path,
     cache: _StubCache,
-    *,
-    enabled: bool = True,
     **settings_overrides: Any,
 ) -> tuple[TestClient, dict[str, str]]:
-    app = create_app(_settings(tmp_path, enabled=enabled, **settings_overrides))
+    app = create_app(_settings(tmp_path, **settings_overrides))
     app.state.checks_snapshot_cache = cache
     app.state.prometheus_client = _UnusedPrometheus()
     client = TestClient(app, base_url="http://testserver")
@@ -162,17 +159,30 @@ def _result(
     )
 
 
-def test_disabled_checks_authenticate_before_returning_no_data(tmp_path: Path) -> None:
-    cache = _StubCache(ChecksDataError("must_not_be_called"))
-    client, auth = _client(tmp_path, cache, enabled=False)
+def test_legacy_checks_enabled_false_cannot_disable_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CHECKS_ENABLED", "false")
+    snapshot = _snapshot(("always-on", "Always on", "core", (_result("always-on", success=True),)))
+    cache = _StubCache(snapshot)
+    client, auth = _client(tmp_path, cache)
     try:
-        for path in ("/api/v1/checks", "/api/v1/checks/summary", "/api/v1/checks/anything"):
+        paths = (
+            "/api/v1/checks",
+            "/api/v1/checks/summary",
+            "/api/v1/checks/always-on",
+        )
+        for path in paths:
             assert client.get(path).status_code == 401
+        assert cache.calls == 0
+
+        for path in paths:
             response = client.get(path, headers=auth)
             assert response.status_code == 200
-            assert response.json()["enabled"] is False
-            assert response.json()["data_state"] == "disabled"
-        assert cache.calls == 0
+            assert response.json()["enabled"] is True
+            assert response.json()["data_state"] == "ready"
+        assert cache.calls == 3
     finally:
         client.__exit__(None, None, None)
 
@@ -604,7 +614,7 @@ def test_checks_api_response_size_limit_fails_closed(
 
 
 def test_checks_openapi_declares_models_and_error_statuses(tmp_path: Path) -> None:
-    schema = create_app(_settings(tmp_path, enabled=True)).openapi()
+    schema = create_app(_settings(tmp_path)).openapi()
     paths = schema["paths"]
     assert set(paths["/api/v1/checks"]["get"]["responses"]) >= {"200", "401", "422", "503"}
     assert set(paths["/api/v1/checks/summary"]["get"]["responses"]) >= {

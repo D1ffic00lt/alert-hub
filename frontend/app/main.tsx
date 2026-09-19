@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import { AlertHubApp } from "./AlertHubApp";
 import "./globals.css";
+import "./shell.css";
 import { getAppName } from "./product";
 import { applyThemePreference, readThemePreference } from "./theme";
 

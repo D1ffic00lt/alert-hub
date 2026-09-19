@@ -84,7 +84,7 @@ Alert on at least:
 - outbox growth and delivery failure ratio;
 - sync lag, peer availability, and `alert_hub_clock_skew_suspected` when a peer event timestamp differs from local time beyond `CLOCK_SKEW_THRESHOLD_SECONDS`;
 - repeated Checks `unavailable`/`checks_limit_exceeded` responses and unexpected growth in
-  `unknown` or stale results when Checks is enabled;
+  `unknown` or stale results;
 - backup age/checksum/restore-test failure;
 - release digest/config checksum drift across nodes.
 
@@ -148,18 +148,16 @@ and every availability vector. Repeated `partial`, `unavailable`, `response_too_
 
 ## Checks
 
-Checks is an optional, read-only view of results produced by operator-managed external executors.
-Alert Hub neither ships nor runs a prober, owns schedules or subscriptions, stores executor
-credentials, nor performs network checks itself. Prometheus remains the operational source of
-truth; check samples, run history, status snapshots, and the in-memory registry are never written
-to SQLite.
+Checks is an always-present, read-only view of results produced by operator-managed external
+executors. Alert Hub neither ships nor runs a prober, owns schedules or subscriptions, stores
+executor credentials, nor performs network checks itself. Prometheus remains the operational
+source of truth; check samples, run history, status snapshots, and the in-memory registry are never
+written to SQLite.
 
-Set `CHECKS_ENABLED=true` on an API node only after at least one enabled Alert Hub Prometheus
-datasource can read the contract below. Every `/api/v1/checks*` operation still authenticates the
-caller when the feature is disabled. Disabled requests return `200`, `enabled: false`,
-`data_state: disabled`, and no check data; they do not query Prometheus. A successful refresh with
-no contract series returns `200`, `data_state: empty`, an empty list, and a zero summary. This is a
-normal state and does not affect Dashboard, alerts, incidents, readiness, or notification work.
+Every `/api/v1/checks*` operation authenticates the caller and queries the enabled Alert Hub
+Prometheus datasources through the fixed contract below. A successful refresh with no contract
+series returns `200`, `data_state: empty`, an empty list, and a zero summary. This is a normal state
+and does not affect Dashboard, alerts, incidents, readiness, or notification work.
 
 The authenticated operations are:
 
@@ -168,11 +166,12 @@ The authenticated operations are:
 - `GET /api/v1/checks/{check_id}` for normalized per-source/scenario/variant results, optional
   canaries/assertions, alert links, and an optional safe Grafana link.
 
-Response metadata separates acquisition state (`ready`, `empty`, `stale`, `unavailable`, or
-`disabled`) from each Check's `up`, `degraded`, `down`, `stale`, or `unknown` status. Ready snapshots
-include a server-generated `snapshot_id`, fetch/evaluation time, cache expiry, and bounded warning
-codes. A detail request returns `404` only when a reliable current inventory proves the Check is
-absent.
+Response metadata separates acquisition state (`ready`, `empty`, `stale`, or `unavailable`) from
+each Check's `up`, `degraded`, `down`, `stale`, or `unknown` status. The deprecated `disabled`
+value remains in the response schema so web clients can span rolling upgrades; current nodes never
+emit it. Ready snapshots include a server-generated `snapshot_id`, fetch/evaluation time, cache
+expiry, and bounded warning codes. A detail request returns `404` only when a reliable current
+inventory proves the Check is absent.
 
 ### Metric contract and executor connection
 
@@ -385,7 +384,6 @@ unavailable/limit responses.
 The production settings are:
 
 ```dotenv
-CHECKS_ENABLED=false
 CHECKS_STALE_AFTER_SECONDS=180
 CHECKS_MIN_FAILURE_SOURCES=1
 CHECKS_GRAFANA_BASE_URL=

@@ -288,13 +288,12 @@ def _snapshot_metadata(snapshot: ChecksSnapshot) -> dict[str, Any]:
 
 def _response_metadata(
     *,
-    enabled: bool,
     data_state: ChecksDataState,
     snapshot: ChecksSnapshot | None = None,
     error_code: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "enabled": enabled,
+        "enabled": True,
         "data_state": data_state,
         "snapshot_id": snapshot.snapshot_id if snapshot is not None else None,
         "fetched_at": snapshot.fetched_at if snapshot is not None else None,
@@ -319,7 +318,6 @@ def _bounded_response[ResponseModel: BaseModel](
 def _limited_list_response(limit: int, offset: int) -> ChecksListResponse:
     return ChecksListResponse(
         **_response_metadata(
-            enabled=True,
             data_state="unavailable",
             error_code="checks_limit_exceeded",
         ),
@@ -334,7 +332,6 @@ def _limited_list_response(limit: int, offset: int) -> ChecksListResponse:
 def _limited_summary_response() -> ChecksSummaryResponse:
     return ChecksSummaryResponse(
         **_response_metadata(
-            enabled=True,
             data_state="unavailable",
             error_code="checks_limit_exceeded",
         ),
@@ -352,7 +349,6 @@ def _limited_summary_response() -> ChecksSummaryResponse:
 def _limited_detail_response() -> CheckDetailResponse:
     return CheckDetailResponse(
         **_response_metadata(
-            enabled=True,
             data_state="unavailable",
             error_code="checks_limit_exceeded",
         ),
@@ -865,17 +861,6 @@ def _last_known_summary(
     )
 
 
-def _disabled_list(limit: int, offset: int) -> ChecksListResponse:
-    return ChecksListResponse(
-        **_response_metadata(enabled=False, data_state="disabled"),
-        items=[],
-        total=None,
-        limit=limit,
-        offset=offset,
-        last_known=None,
-    )
-
-
 _LIST_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     401: {"model": ErrorResponse, "description": "Authentication required"},
     422: {"model": ValidationErrorResponse, "description": "Invalid query parameters"},
@@ -912,9 +897,6 @@ async def list_checks(
     prometheus: PrometheusClient = Depends(get_prometheus_client),
 ) -> ChecksListResponse:
     del user
-    if not settings.checks_enabled:
-        return _disabled_list(limit, offset)
-
     selected_filters = _filters(status_filter, group, source, target, scenario, search)
     result = await _get_snapshot(request, db, prometheus, settings)
     if result.snapshot is not None:
@@ -925,7 +907,6 @@ async def list_checks(
         relations = _load_incident_relations(db, {check.check_id for check in page})
         payload = ChecksListResponse(
             **_response_metadata(
-                enabled=True,
                 data_state="ready" if result.snapshot.checks else "empty",
                 snapshot=result.snapshot,
             ),
@@ -945,7 +926,6 @@ async def list_checks(
     if result.last_known is None:
         return ChecksListResponse(
             **_response_metadata(
-                enabled=True,
                 data_state="unavailable",
                 error_code=result.error_code,
             ),
@@ -966,7 +946,6 @@ async def list_checks(
     )
     payload = ChecksListResponse(
         **_response_metadata(
-            enabled=True,
             data_state="unavailable",
             error_code=result.error_code,
         ),
@@ -1004,19 +983,6 @@ async def checks_summary(
     prometheus: PrometheusClient = Depends(get_prometheus_client),
 ) -> ChecksSummaryResponse:
     del user
-    if not settings.checks_enabled:
-        return ChecksSummaryResponse(
-            **_response_metadata(enabled=False, data_state="disabled"),
-            total=None,
-            up=None,
-            degraded=None,
-            down=None,
-            stale=None,
-            unknown=None,
-            problem_checks=[],
-            last_known=None,
-        )
-
     selected_filters = _filters(status_filter, group, source, target, scenario, search)
     result = await _get_snapshot(request, db, prometheus, settings)
     if result.snapshot is not None:
@@ -1028,7 +994,6 @@ async def checks_summary(
         values = _summary_values(checks, relations)
         payload = ChecksSummaryResponse(
             **_response_metadata(
-                enabled=True,
                 data_state="ready" if result.snapshot.checks else "empty",
                 snapshot=result.snapshot,
             ),
@@ -1045,7 +1010,6 @@ async def checks_summary(
     if result.last_known is None:
         return ChecksSummaryResponse(
             **_response_metadata(
-                enabled=True,
                 data_state="unavailable",
                 error_code=result.error_code,
             ),
@@ -1068,7 +1032,6 @@ async def checks_summary(
     current_values = _summary_values(current, relations)
     payload = ChecksSummaryResponse(
         **_response_metadata(
-            enabled=True,
             data_state="unavailable",
             error_code=result.error_code,
         ),
@@ -1097,12 +1060,6 @@ async def check_detail(
     prometheus: PrometheusClient = Depends(get_prometheus_client),
 ) -> CheckDetailResponse:
     del user
-    if not settings.checks_enabled:
-        return CheckDetailResponse(
-            **_response_metadata(enabled=False, data_state="disabled"),
-            check=None,
-            last_known=None,
-        )
     normalized_check_id = normalize_check_identifier(check_id)
     if normalized_check_id is None:
         raise HTTPException(status_code=422, detail="Invalid check identifier")
@@ -1117,7 +1074,6 @@ async def check_detail(
             response.status_code = 404
             return CheckDetailResponse(
                 **_response_metadata(
-                    enabled=True,
                     data_state=data_state,
                     snapshot=result.snapshot,
                 ),
@@ -1126,7 +1082,7 @@ async def check_detail(
             )
         relations = _load_incident_relations(db, {check_id}, include_items=True)
         payload = CheckDetailResponse(
-            **_response_metadata(enabled=True, data_state=data_state, snapshot=result.snapshot),
+            **_response_metadata(data_state=data_state, snapshot=result.snapshot),
             check=_detail_item(check, relations, settings),
             last_known=None,
         )
@@ -1140,7 +1096,6 @@ async def check_detail(
     if result.last_known is None:
         return CheckDetailResponse(
             **_response_metadata(
-                enabled=True,
                 data_state="unavailable",
                 error_code=result.error_code,
             ),
@@ -1152,7 +1107,6 @@ async def check_detail(
     if previous is None:
         return CheckDetailResponse(
             **_response_metadata(
-                enabled=True,
                 data_state="unavailable",
                 error_code=result.error_code,
             ),
@@ -1162,7 +1116,6 @@ async def check_detail(
     relations = _load_incident_relations(db, {check_id}, include_items=True)
     payload = CheckDetailResponse(
         **_response_metadata(
-            enabled=True,
             data_state="unavailable",
             error_code=result.error_code,
         ),

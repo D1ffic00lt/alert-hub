@@ -45,9 +45,9 @@ flowchart LR
     MCP["Local Alert Hub MCP\nread-only stdio"] -->|"HTTPS fixed GET tools"| PX
 ```
 
-Checks uses that existing Prometheus boundary as a read-only, optional read model. Alert Hub does
-not schedule or execute checks, manage an executor, ingest check results over HTTP, or introduce a
-prober service. The module issues only fixed server-owned instant-vector queries for the
+Checks uses that existing Prometheus boundary as an always-present, read-only read model. Alert Hub
+does not schedule or execute checks, manage an executor, ingest check results over HTTP, or
+introduce a prober service. The module issues only fixed server-owned instant-vector queries for the
 `synthetic_check_*` metric contract. Prometheus metric names and labels stop at the dedicated
 acquisition/normalization boundary; the domain layer receives protocol-neutral Check, Source,
 Target, Scenario, Variant, Canary, and Assertion values, and the API returns an explicit allowlist
@@ -81,11 +81,12 @@ text and raw/expected addresses never cross the boundary. The exported `instance
 prober processes separate while generic `source`/`source_id` remain the logical Source used for
 quorum. The API and UI report both coverage concepts explicitly.
 
-Every node evaluates its own configured Prometheus view and owns its own short-lived cache. Checks
-failure or disablement cannot affect local ingest, incident actions, notification work, peer sync,
-or readiness. A failed required Prometheus refresh becomes `data_state: unavailable`; a previous
-success is never silently served as current. Optional metric failures remove only the associated
-state, target, duration, TTFB, canary, assertion, or error-counter capability and add a warning.
+Every node evaluates its own configured Prometheus view and owns its own short-lived cache. When no
+`synthetic_check_*` series exist, Checks returns an empty view. Neither that empty state nor a Checks
+failure can affect local ingest, incident actions, notification work, peer sync, or readiness. A
+failed required Prometheus refresh becomes `data_state: unavailable`; a previous success is never
+silently served as current. Optional metric failures remove only the associated state, target,
+duration, TTFB, canary, assertion, or error-counter capability and add a warning.
 
 Only operator-managed reverse proxies terminate public HTTPS. Production host
 proxies target fixed web/API addresses on the managed edge bridge; a
