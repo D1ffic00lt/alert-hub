@@ -20,7 +20,7 @@ export type ChecksRequestResult = {
 };
 
 export type ChecksRequest = (path: string, signal: AbortSignal) => Promise<ChecksRequestResult>;
-export type ChecksRuntimeMode = "active" | "disabled" | "unavailable";
+export type ChecksRuntimeMode = "active" | "unavailable";
 
 export type ChecksOverviewState = {
   phase: "loading" | ChecksDataState;
@@ -53,7 +53,6 @@ export type CheckDetailState = {
 };
 
 function localState(mode: ChecksRuntimeMode): ChecksDataState | null {
-  if (mode === "disabled") return "disabled";
   if (mode === "unavailable") return "unavailable";
   return null;
 }
@@ -62,8 +61,7 @@ export function checksEnabledForRuntime(
   mode: ChecksRuntimeMode,
   knownEnabled: boolean | null,
 ): boolean | null {
-  if (mode === "disabled") return false;
-  if (mode === "unavailable") return knownEnabled === false ? false : true;
+  if (mode === "unavailable") return true;
   return knownEnabled;
 }
 

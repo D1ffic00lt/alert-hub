@@ -3,10 +3,10 @@
 Sources are configured through the authenticated UI/API and receive a random bearer token exactly once. Alert Hub stores only a keyed hash. Losing the token requires rotation; it cannot be read back from SQLite.
 
 The repository implements Alertmanager, normalized generic JSON, and heartbeat intake, plus
-backend-owned named Prometheus datasource queries for regional reachability and the optional Checks
-read model. Administrators may select validated `job` globs for the two `up` summaries, but
-Grafana-specific payload adapters and arbitrary browser-authored PromQL are not implemented. Source
-adapters never execute source-provided code or interpolation expressions. SMTP notification
+backend-owned named Prometheus datasource queries for regional reachability and the always-present
+read-only Checks model. Administrators may select validated `job` globs for the two `up` summaries,
+but Grafana-specific payload adapters and arbitrary browser-authored PromQL are not implemented.
+Source adapters never execute source-provided code or interpolation expressions. SMTP notification
 templates are a separate allowlisted-placeholder feature described in
 [operations](operations.md#smtp-notification-templates).
 
@@ -250,8 +250,8 @@ Checks is not another webhook source and does not appear in the Sources wizard. 
 operator-managed executor publishes the fixed `synthetic_check_*` gauges to Prometheus; Alert Hub
 queries all enabled Prometheus datasources at one evaluation time and normalizes their results.
 There is no Checks-specific scheduler, executor configuration, executor credential store,
-subscription importer, or prober inside Alert Hub. Removing every Checks metric, leaving the feature
-disabled, or omitting Grafana must not affect event intake or incident handling.
+subscription importer, or prober inside Alert Hub. Removing every Checks metric produces an empty
+Checks view; that state and omitting Grafana must not affect event intake or incident handling.
 
 For a minimal result, publish exactly one stable public identifier on both required metrics:
 

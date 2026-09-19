@@ -10,14 +10,11 @@ from alert_hub.main import create_app
 from alert_hub.settings import Settings
 
 
-def _authenticated_client(
-    tmp_path: Path, *, checks_enabled: bool
-) -> tuple[TestClient, dict[str, str]]:
-    database_name = "enabled.db" if checks_enabled else "disabled.db"
+def _authenticated_client(tmp_path: Path) -> tuple[TestClient, dict[str, str]]:
     app = create_app(
         Settings(
             environment="test",
-            database_url=f"sqlite:///{tmp_path / database_name}",
+            database_url=f"sqlite:///{tmp_path / 'checks-links.db'}",
             auto_create_schema=True,
             node_id="checks-link-node",
             signing_key="checks-link-signing-key-with-enough-entropy",
@@ -29,7 +26,6 @@ def _authenticated_client(
             heartbeat_scan_seconds=0,
             notify_enabled=False,
             sync_enabled=False,
-            checks_enabled=checks_enabled,
         )
     )
     client = TestClient(app, base_url="http://testserver")
@@ -47,7 +43,7 @@ def _authenticated_client(
 
 
 def test_incident_detail_returns_all_safe_historical_check_links(tmp_path: Path) -> None:
-    client, auth = _authenticated_client(tmp_path, checks_enabled=True)
+    client, auth = _authenticated_client(tmp_path)
     try:
         source = client.post(
             "/api/v1/sources",
@@ -97,8 +93,12 @@ def test_incident_detail_returns_all_safe_historical_check_links(tmp_path: Path)
         client.__exit__(None, None, None)
 
 
-def test_incident_links_are_absent_when_checks_are_disabled(tmp_path: Path) -> None:
-    client, auth = _authenticated_client(tmp_path, checks_enabled=False)
+def test_legacy_checks_enabled_false_does_not_hide_incident_links(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CHECKS_ENABLED", "false")
+    client, auth = _authenticated_client(tmp_path)
     try:
         source = client.post(
             "/api/v1/sources",
@@ -110,8 +110,8 @@ def test_incident_links_are_absent_when_checks_are_disabled(tmp_path: Path) -> N
             headers={"Authorization": f"Bearer {source['token']}"},
             json={
                 "schema_version": 1,
-                "external_event_id": "disabled-check-alert",
-                "dedup_key": "disabled-check-incident",
+                "external_event_id": "legacy-disabled-check-alert",
+                "dedup_key": "legacy-disabled-check-incident",
                 "status": "firing",
                 "title": "Alert remains available",
                 "severity": "warning",
@@ -121,8 +121,10 @@ def test_incident_links_are_absent_when_checks_are_disabled(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         incident = client.get("/api/v1/incidents", headers=auth).json()["items"][0]
-        assert incident["checks_relation_state"] == "disabled"
-        assert incident["related_checks"] == []
+        assert incident["checks_relation_state"] == "available"
+        assert incident["related_checks"] == [
+            {"check_id": "public-api", "href": "/checks/public-api"}
+        ]
     finally:
         client.__exit__(None, None, None)
 
