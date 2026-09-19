@@ -8,7 +8,9 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from alert_hub.api import checks as checks_api
 from alert_hub.application.checks import ChecksDataError, ChecksSnapshot
+from alert_hub.application.prometheus import DatasourceHistoryResult
 from alert_hub.domain.checks import (
     DEFAULT_CANARY,
     CheckAssertion,
@@ -19,7 +21,15 @@ from alert_hub.domain.checks import (
     NormalizedCheckResult,
 )
 from alert_hub.infrastructure.db.models import Incident
-from alert_hub.infrastructure.prometheus import FixedQueryName, VectorSample
+from alert_hub.infrastructure.prometheus import (
+    ALERT_HISTORY_WINDOWS,
+    AlertHistoryWindow,
+    FixedQueryName,
+    MatrixSeries,
+    RangeSample,
+    VectorSample,
+    check_history_promql,
+)
 from alert_hub.main import create_app
 from alert_hub.settings import Settings
 
@@ -39,6 +49,35 @@ class _UnusedPrometheus:
         allow_non_finite_values: bool = False,
     ) -> list[VectorSample]:
         raise AssertionError("the stub cache must prevent Prometheus queries")
+
+
+class _HistoryPrometheus(_UnusedPrometheus):
+    def __init__(self) -> None:
+        self.calls: list[tuple[AlertHistoryWindow, datetime, str | None]] = []
+
+    async def check_history(
+        self,
+        url: str,
+        credentials: Mapping[str, Any],
+        window: AlertHistoryWindow,
+        *,
+        evaluated_at: datetime,
+        check_id: str | None = None,
+    ) -> list[MatrixSeries]:
+        del url, credentials
+        self.calls.append((window, evaluated_at, check_id))
+        spec = ALERT_HISTORY_WINDOWS[window]
+        first = evaluated_at - spec.duration + spec.sample
+        return [
+            MatrixSeries(
+                {"check_id": "checkout", "source": "ru"},
+                [
+                    RangeSample(1, first),
+                    RangeSample(0, first + spec.sample),
+                    RangeSample(1, first + spec.sample * 2),
+                ],
+            )
+        ]
 
 
 class _StubCache:
@@ -159,6 +198,85 @@ def _result(
     )
 
 
+def test_check_history_preserves_chronology_and_merges_sources() -> None:
+    starts_at = datetime(2026, 9, 7, tzinfo=UTC)
+    sample = timedelta(minutes=15)
+    result = DatasourceHistoryResult(
+        "prom-1",
+        "Primary Prometheus",
+        [
+            MatrixSeries(
+                {"check_id": "checkout", "source": "a"},
+                [
+                    RangeSample(1, starts_at + sample),
+                    RangeSample(0, starts_at + sample * 2),
+                    RangeSample(1, starts_at + sample * 3),
+                    RangeSample(1, starts_at + sample * 4),
+                ],
+            ),
+            MatrixSeries(
+                {"check_id": "checkout", "source": "b"},
+                [
+                    RangeSample(0, starts_at + sample),
+                    RangeSample(0, starts_at + sample * 2),
+                    RangeSample(1, starts_at + sample * 3),
+                ],
+            ),
+            MatrixSeries(
+                {"check_id": "other", "source": "a"},
+                [RangeSample(1, starts_at + sample)],
+            ),
+        ],
+    )
+
+    series = checks_api._check_history_series(
+        [result],
+        starts_at=starts_at,
+        bucket_count=1,
+        sample=sample,
+        samples_per_bucket=4,
+        selected_check_id="checkout",
+    )
+    assert len(series) == 1
+    assert series[0]["activity"] == [["degraded", "down", "up", "degraded"]]
+
+
+def test_check_history_endpoint_is_batched_fixed_and_bounded(tmp_path: Path) -> None:
+    client, auth = _client(tmp_path, _StubCache(_snapshot()))
+    prometheus = _HistoryPrometheus()
+    client.app.state.prometheus_client = prometheus
+    try:
+        datasource = client.post(
+            "/api/v1/prometheus-datasources",
+            headers=auth,
+            json={"name": "Primary Prometheus", "url": "https://1.1.1.1:9090"},
+        )
+        assert datasource.status_code == 201, datasource.text
+
+        response = client.get(
+            "/api/v1/checks/history",
+            headers=auth,
+            params={"window": "30d", "check_id": "checkout"},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["enabled"] is True
+        assert body["data_state"] == "ok"
+        assert len(body["buckets"]) == 40
+        assert body["samples_per_bucket"] == 4
+        assert body["series"][0]["activity"][0][:4] == ["up", "down", "up", "degraded"]
+        assert [call[0] for call in prometheus.calls] == ["30d"]
+        assert [call[2] for call in prometheus.calls] == ["checkout"]
+        assert check_history_promql("30d", check_id="checkout") == (
+            'last_over_time(synthetic_check_status{check_id="checkout"}[16200s])'
+        )
+        escaped = check_history_promql("24h", check_id='checkout"} or vector(1)')
+        assert 'check_id="checkout\\"} or vector(1)"' in escaped
+        assert client.get("/api/v1/checks/history?window=1h", headers=auth).status_code == 422
+    finally:
+        client.__exit__(None, None, None)
+
+
 def test_legacy_checks_enabled_false_cannot_disable_checks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -175,6 +293,7 @@ def test_legacy_checks_enabled_false_cannot_disable_checks(
         )
         for path in paths:
             assert client.get(path).status_code == 401
+        assert client.get("/api/v1/checks/history").status_code == 401
         assert cache.calls == 0
 
         for path in paths:
@@ -182,6 +301,10 @@ def test_legacy_checks_enabled_false_cannot_disable_checks(
             assert response.status_code == 200
             assert response.json()["enabled"] is True
             assert response.json()["data_state"] == "ready"
+        history = client.get("/api/v1/checks/history", headers=auth)
+        assert history.status_code == 200
+        assert history.json()["enabled"] is True
+        assert history.json()["data_state"] == "not_configured"
         assert cache.calls == 3
     finally:
         client.__exit__(None, None, None)

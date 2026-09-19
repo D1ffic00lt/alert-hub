@@ -135,20 +135,26 @@ replicas link to Incidents with exact `alertname` and `prometheus_datasource_id`
 resolve, silence, and bulk actions remain only in Incidents.
 
 `GET /api/v1/alert-history?window=24h|7d|30d` issues one backend-owned Prometheus range query per
-enabled datasource. The windows are represented as 24 one-hour, 28 six-hour, or 30 one-day buckets.
-The UI combines matching HA replicas conservatively: firing outranks pending, a failed datasource
-remains unknown, and missing alert series from a datasource that answered are inactive. The shown
-percentage is the share of observed buckets with no firing or pending rule; it is a quiet-interval
-summary, not availability, uptime, or an SLO.
+enabled datasource. Every window is represented by 40 equal display intervals, and every interval
+contains four chronological samples. The sample/bucket lengths are 540 seconds/36 minutes for
+`24h`, 3,780 seconds/4 hours 12 minutes for `7d`, and 16,200 seconds/18 hours for `30d`.
 
-A diagonal slash means that every active Prometheus instance and every active HA replica with
-evidence was silenced by an Alert Hub incident action during that bucket. This overlay requires an
-exact `prometheus_datasource_id` and full Prometheus alert-label identity; instance labels stay in
-the backend and are not returned to the browser. When that relationship or historical event
-evidence is absent, the silence state is unknown and the UI does not claim that the alert was
-unmuted. This does not represent Alertmanager-native silences. Prometheus remains the
-alert-state time-series source of truth; only the existing incident event journal supplies the
-local silence overlay, and no range samples are stored in SQLite.
+The UI renders those intervals as one row of 40 narrow vertical pills. Each pill preserves sample
+order from top (earlier) to bottom (later), so a firing → pending → quiet change remains three
+ordered portions of one pill rather than one collapsed state. Alert history has exactly three
+visual states: quiet, pending, and firing, using the shared success, warning, and danger colors.
+There is no unknown or silenced pill color. The UI combines matching HA replicas conservatively at
+each inner sample: firing outranks pending, and missing alert series from a datasource that answered
+are inactive. A failed datasource is omitted from the merge and reported as a partial/error state
+outside the pills. The shown percentage is the share of inner samples with no firing or pending
+rule; it is a quiet-interval summary, not availability, uptime, or an SLO.
+
+Supplying `incident_id`, for example
+`GET /api/v1/alert-history?window=30d&incident_id=INCIDENT_ID`, scopes the query to the incident's
+exact `prometheus_datasource_id` and complete Prometheus alert-label identity. The endpoint returns
+`404` when the incident does not exist or is not linked to that identity. Incident silence events
+do not alter this history: Prometheus remains the alert-state time-series source of truth, and no
+range samples are stored in SQLite.
 
 `GET /api/v1/availability?window=24h|7d|30d` evaluates backend-owned expressions over
 `probe_success`. Canonical datasources use `source_region × target_name`; datasource configured in
@@ -179,9 +185,20 @@ and does not affect Dashboard, alerts, incidents, readiness, or notification wor
 The authenticated operations are:
 
 - `GET /api/v1/checks` for the filtered, paginated list;
+- `GET /api/v1/checks/history?window=24h|7d|30d` for all Check history, with optional exact
+  `check_id` scope;
 - `GET /api/v1/checks/summary` for the same filtered population without pagination;
 - `GET /api/v1/checks/{check_id}` for normalized per-source/scenario/variant results, optional
   canaries/assertions, alert links, and an optional safe Grafana link.
+
+Check history uses the same 40 intervals and four ordered inner samples per interval as alert
+history. A fixed `last_over_time(synthetic_check_status...)` range expression supplies the latest
+completed-run value for each sample. A supplied `check_id` becomes an exact server-owned matcher
+before that query is sent to Prometheus. All observed source/instance values successful means `up`,
+all failed means `down`, and mixed or missing expected evidence means `degraded`. These are the only
+three pill states and use the same shared success, warning, and danger colors. The list renders a
+compact strip for each Check; Check detail renders the full strip. Datasource failures remain
+explicit outside the pills, and no range samples are stored in SQLite.
 
 Response metadata separates acquisition state (`ready`, `empty`, `stale`, or `unavailable`) from
 each Check's `up`, `degraded`, `down`, `stale`, or `unknown` status. The deprecated `disabled`
@@ -381,7 +398,7 @@ tuple created during a cold failed refresh.
 | Samples in one Prometheus vector response         | 10,000 (`PROMETHEUS_MAX_SAMPLES`)                                   |
 | One Prometheus HTTP response                      | 2 MiB (`PROMETHEUS_MAX_RESPONSE_BYTES`)                             |
 | Prometheus query timeout                          | 8 seconds (`PROMETHEUS_QUERY_TIMEOUT_SECONDS`)                      |
-| Incident events considered for alert history      | 50,000 maximum; excess fails the history read closed                |
+| Samples in one history series                     | 160 (40 display intervals × 4 chronological samples)                |
 | Concurrent Prometheus requests per Checks refresh | 16 (internal shared cap across all queries and datasources)         |
 | Checks cache TTL                                  | 5 seconds (`CHECKS_CACHE_TTL_SECONDS`, allowed range 0.1–5)         |
 | Future timestamp tolerance                        | 30 seconds (`CHECKS_FUTURE_TOLERANCE_SECONDS`, allowed range 0–300) |

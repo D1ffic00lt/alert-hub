@@ -1,5 +1,5 @@
 /* Alert Hub application shell and notification worker. */
-const SHELL_CACHE = "alert-hub-v8-shell";
+const SHELL_CACHE = "alert-hub-v9-shell";
 // Keep the authenticated read-cache prefix stable so a service-worker upgrade
 // does not erase a verified session partition needed for a cold offline start.
 const DATA_CACHE = "alert-hub-v2-read-model";

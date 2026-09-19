@@ -22,20 +22,23 @@ continue to own detailed infrastructure time-series.
 
 The authenticated Alerts read model uses the same outbound Prometheus boundary. Rule inventory is
 read directly from `/api/v1/rules?type=alert`; alert-state history is calculated on demand from
-`ALERTS` with one fixed range query for exactly `24h`, `7d`, or `30d`; observed availability is
-calculated with fixed `avg_over_time`, `count_over_time`, and `last_over_time` expressions over the
-same three windows. None of those time-series are persisted in SQLite. The Alerts catalog groups
-rules by the arbitrary Prometheus label `alert_category`, with a separate uncategorized group when
-the label is absent.
+`ALERTS` with one fixed range query for exactly `24h`, `7d`, or `30d`. Every window has 40 display
+intervals and every interval contains four ordered samples, so the UI can retain state changes
+inside one interval instead of reducing it to one value. Observed availability is calculated with
+fixed `avg_over_time`, `count_over_time`, and `last_over_time` expressions over the same three
+windows. None of those time-series are persisted in SQLite. The Alerts catalog groups rules by the
+arbitrary Prometheus label `alert_category`, with a separate uncategorized group when the label is
+absent.
 Replicas with the same category and alert name are one logical rule while their datasource, file,
 group, state, instance counts, evaluation health, error, labels, and annotations remain separate.
-The alert-history strip presents inactive, pending, firing, and unknown buckets. It calls inactive
-buckets quiet intervals rather than uptime or an SLO. Prometheus instance labels remain available
-inside the backend so a slash is overlaid only when every active instance has an exact local
-incident relationship and was silenced in Alert Hub; those labels are not returned to the browser.
-Unknown silence evidence stays unknown and is not presented as unmuted. Availability evidence is not mixed into that catalog; the regional
-matrix and Checks remain their own screens. A datasource failure produces an explicit partial
-result when another datasource answered.
+The state-history strip renders 40 narrow vertical pills. Each pill is a single clipped shape whose
+four samples appear in chronological order from top (earlier) to bottom (later); adjacent equal
+samples collapse visually without changing their duration. Alert history has exactly three visual
+states: quiet, pending, and firing, using the shared success, warning, and danger colors. Unknown
+and Alert Hub silence are not fourth fills; datasource failures remain explicit partial/error
+metadata outside the pills. An optional `incident_id` scopes the same query to the incident's exact
+Prometheus datasource and full alert-label identity. Availability evidence is not mixed into the
+Alerts catalog; the regional matrix and Checks remain their own screens.
 
 ```mermaid
 flowchart LR
@@ -53,16 +56,18 @@ flowchart LR
 
 Checks uses that existing Prometheus boundary as an always-present, read-only read model. Alert Hub
 does not schedule or execute checks, manage an executor, ingest check results over HTTP, or
-introduce a prober service. The module issues only fixed server-owned instant-vector queries for the
-`synthetic_check_*` metric contract. Prometheus metric names and labels stop at the dedicated
-acquisition/normalization boundary; the domain layer receives protocol-neutral Check, Source,
-Target, Scenario, Variant, Canary, and Assertion values, and the API returns an explicit allowlist
-of normalized fields.
+introduce a prober service. The module issues fixed server-owned instant-vector queries for the
+`synthetic_check_*` read model and one fixed bounded range expression over
+`synthetic_check_status` for Check history. When history is requested for one Check, the server
+encodes the validated `check_id` as an exact matcher before issuing that query. Prometheus metric
+names and labels stop at the dedicated acquisition/normalization boundary; the domain layer
+receives protocol-neutral Check, Source, Target, Scenario, Variant, Canary, and Assertion values,
+and the API returns an explicit allowlist of normalized fields.
 
 ```mermaid
 flowchart LR
     EXEC["Operator-managed check executor"] -->|"exports synthetic_check_*"| PROM["Existing Prometheus"]
-    PROM -->|"fixed queries at one evaluation time"| NORM["Acquisition and normalization"]
+    PROM -->|"fixed instant and bounded range queries"| NORM["Acquisition and normalization"]
     NORM -->|"normalized result keys"| AGG["Checks domain aggregation"]
     AGG -->|"authenticated envelopes"| CHECKAPI["/api/v1/checks*"]
     CHECKAPI --> CHECKUI["Dashboard, list, and detail views"]

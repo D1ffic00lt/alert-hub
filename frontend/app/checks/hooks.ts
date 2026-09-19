@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  buildCheckHistoryPath,
   buildChecksQuery,
   buildChecksSummaryQuery,
   type CheckDetail,
   type CheckFilters,
+  type CheckHistorySnapshot,
+  type CheckHistoryWindow,
   type CheckListItem,
   type ChecksDataState,
   type ChecksMeta,
   type CheckSummary,
+  normalizeCheckHistory,
   normalizeCheckDetail,
   normalizeChecksList,
   normalizeChecksSummary,
@@ -50,6 +54,13 @@ export type CheckDetailState = {
   check: CheckDetail | null;
   error: string | null;
   refreshing: boolean;
+};
+
+export type CheckHistoryViewState = {
+  snapshot: CheckHistorySnapshot | null;
+  loading: boolean;
+  refreshing: boolean;
+  error: string | null;
 };
 
 function localState(mode: ChecksRuntimeMode): ChecksDataState | null {
@@ -340,6 +351,82 @@ export function useChecksList(
         offset: filters.offset,
         error: phase === "unavailable" ? "network_unavailable" : null,
         refreshing: false,
+      },
+      refresh,
+    ];
+  }
+  return [state, refresh];
+}
+
+export function useCheckHistory(
+  request: ChecksRequest,
+  mode: ChecksRuntimeMode,
+  window: CheckHistoryWindow = "30d",
+  checkId?: string,
+): [CheckHistoryViewState, () => void] {
+  const [revision, setRevision] = useState(0);
+  const refresh = useCallback(() => setRevision((value) => value + 1), []);
+  const [state, setState] = useState<CheckHistoryViewState>(() => ({
+    snapshot: null,
+    loading: mode === "active",
+    refreshing: false,
+    error: mode === "unavailable" ? "network_unavailable" : null,
+  }));
+  const requestEpoch = useRef(0);
+
+  useEffect(() => {
+    if (mode !== "active") {
+      requestEpoch.current += 1;
+      return undefined;
+    }
+    const epoch = ++requestEpoch.current;
+    const controller = new AbortController();
+    queueMicrotask(() => {
+      if (controller.signal.aborted || epoch !== requestEpoch.current) return;
+      setState((current) => ({
+        ...current,
+        loading: current.snapshot === null,
+        refreshing: current.snapshot !== null,
+        error: null,
+      }));
+    });
+    void request(buildCheckHistoryPath(window, checkId), controller.signal)
+      .then((response) => {
+        if (controller.signal.aborted || epoch !== requestEpoch.current) return;
+        const snapshot = normalizeCheckHistory(response.payload, window);
+        if (response.status >= 500 || snapshot.dataState === "unavailable") {
+          setState({
+            snapshot: null,
+            loading: false,
+            refreshing: false,
+            error: "check_history_unavailable",
+          });
+          return;
+        }
+        setState({ snapshot, loading: false, refreshing: false, error: null });
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || epoch !== requestEpoch.current) return;
+        setState({
+          snapshot: null,
+          loading: false,
+          refreshing: false,
+          error:
+            error instanceof Error && error.name !== "AbortError"
+              ? error.message
+              : "check_history_unavailable",
+        });
+      });
+    return () => controller.abort();
+  }, [checkId, mode, request, revision, window]);
+
+  if (mode !== "active") {
+    return [
+      {
+        snapshot: null,
+        loading: false,
+        refreshing: false,
+        error: mode === "unavailable" ? "network_unavailable" : null,
       },
       refresh,
     ];

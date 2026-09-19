@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, cast
@@ -224,6 +224,7 @@ async def query_datasource_history_targets(
     window: AlertHistoryWindow,
     *,
     evaluated_at: datetime,
+    match_labels: Mapping[str, str] | None = None,
 ) -> tuple[list[DatasourceHistoryResult], list[DatasourceQueryFailure]]:
     async def query_one(
         target: DatasourceQueryTarget,
@@ -234,6 +235,41 @@ async def query_datasource_history_targets(
                 target.credentials,
                 window,
                 evaluated_at=evaluated_at,
+                match_labels=match_labels,
+            )
+        except PrometheusQueryError as exc:
+            return DatasourceQueryFailure(
+                target.datasource_id,
+                target.datasource_name,
+                exc.code,
+                exc.detail,
+            )
+        return DatasourceHistoryResult(target.datasource_id, target.datasource_name, series)
+
+    raw_results = await asyncio.gather(*(query_one(target) for target in targets))
+    successes = [item for item in raw_results if isinstance(item, DatasourceHistoryResult)]
+    failures = [item for item in raw_results if isinstance(item, DatasourceQueryFailure)]
+    return successes, failures
+
+
+async def query_datasource_check_history_targets(
+    targets: list[DatasourceQueryTarget],
+    client: PrometheusClient,
+    window: AlertHistoryWindow,
+    *,
+    evaluated_at: datetime,
+    check_id: str | None = None,
+) -> tuple[list[DatasourceHistoryResult], list[DatasourceQueryFailure]]:
+    async def query_one(
+        target: DatasourceQueryTarget,
+    ) -> DatasourceHistoryResult | DatasourceQueryFailure:
+        try:
+            series = await client.check_history(
+                target.url,
+                target.credentials,
+                window,
+                evaluated_at=evaluated_at,
+                check_id=check_id,
             )
         except PrometheusQueryError as exc:
             return DatasourceQueryFailure(

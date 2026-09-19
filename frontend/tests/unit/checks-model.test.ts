@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  buildCheckHistoryPath,
   buildChecksQuery,
   buildChecksSummaryQuery,
   checkIdentity,
   groupChecks,
   hasActiveCheckFilters,
+  historyForCheck,
+  normalizeCheckHistory,
   normalizeCheckDetail,
   normalizeCheckListItem,
   normalizeChecksList,
@@ -391,5 +394,62 @@ describe("Checks API model", () => {
     expect(safeExternalUrl("https://grafana.example.test/d/checks")).toBe(
       "https://grafana.example.test/d/checks",
     );
+  });
+
+  it("normalizes and merges chronological Check history", () => {
+    expect(buildCheckHistoryPath("30d", "checkout / api")).toBe(
+      "/checks/history?window=30d&check_id=checkout+%2F+api",
+    );
+    const snapshot = normalizeCheckHistory(
+      {
+        enabled: true,
+        data_state: "partial",
+        generated_at: "2026-09-07T00:00:00Z",
+        window: "30d",
+        bucket_seconds: 64_800,
+        sample_seconds: 16_200,
+        samples_per_bucket: 4,
+        buckets: [
+          { starts_at: "2026-09-05T12:00:00Z", ends_at: "2026-09-06T06:00:00Z" },
+          { starts_at: "2026-09-06T06:00:00Z", ends_at: "2026-09-07T00:00:00Z" },
+        ],
+        datasources: [
+          { id: "prom-1", name: "Primary" },
+          { id: "prom-2", name: "Secondary" },
+        ],
+        series: [
+          {
+            datasource_id: "prom-1",
+            datasource_name: "Primary",
+            check_id: "checkout",
+            activity: [
+              ["down", "degraded", "up", "up"],
+              ["up", "up", "up", "up"],
+            ],
+          },
+          {
+            datasource_id: "prom-2",
+            datasource_name: "Secondary",
+            check_id: "checkout",
+            activity: [
+              ["up", "up", "up", "up"],
+              ["up", "degraded", "down", "up"],
+            ],
+          },
+        ],
+        errors: [{ datasource_id: "prom-3", code: "timeout" }],
+      },
+      "30d",
+    );
+
+    expect(historyForCheck(snapshot, "checkout")).toEqual({
+      periods: [
+        ["critical", "warning", "healthy", "healthy"],
+        ["healthy", "warning", "critical", "healthy"],
+      ],
+      healthyPercent: 50,
+      partial: true,
+    });
+    expect(historyForCheck(snapshot, "missing")).toBeNull();
   });
 });
