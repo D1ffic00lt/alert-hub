@@ -1,20 +1,26 @@
 import { useEffect, useMemo, useState } from "react";
 
 import {
+  type AlertHistorySnapshot,
+  type AlertHistoryWindow,
   type AlertRule,
   type AlertRuleFilter,
   type AlertRuleReplica,
   type AlertRulesSnapshot,
   UNCATEGORIZED_FILTER,
+  buildAlertHistoryPath,
   buildAlertRulesPath,
+  normalizeAlertHistory,
   normalizeAlertRules,
 } from "./model";
+import { AlertHistory } from "./AlertHistory";
 
 type Language = "ru" | "en";
 type RuntimeMode = "active" | "demo" | "unavailable";
 type Request = (path: string, signal: AbortSignal) => Promise<{ payload: unknown }>;
 
 const PAGE_SIZE = 200;
+const HISTORY_WINDOWS: AlertHistoryWindow[] = ["24h", "7d", "30d"];
 
 function tx(language: Language, russian: string, english: string) {
   return language === "ru" ? russian : english;
@@ -188,6 +194,77 @@ function demoRules(): AlertRulesSnapshot {
     pagination: { page: 1, page_size: PAGE_SIZE, total_items: 4, total_pages: 1 },
     errors: [],
   });
+}
+
+function demoHistory(window: AlertHistoryWindow): AlertHistorySnapshot {
+  const count = window === "24h" ? 24 : window === "7d" ? 28 : 30;
+  const bucketSeconds = window === "24h" ? 3_600 : window === "7d" ? 21_600 : 86_400;
+  const generatedAt = new Date("2026-09-07T00:00:00Z");
+  const startsAt = new Date(generatedAt.getTime() - count * bucketSeconds * 1_000);
+  const buckets = Array.from({ length: count }, (_, index) => ({
+    starts_at: new Date(startsAt.getTime() + index * bucketSeconds * 1_000).toISOString(),
+    ends_at: new Date(startsAt.getTime() + (index + 1) * bucketSeconds * 1_000).toISOString(),
+  }));
+  const apiStates = Array.from({ length: count }, () => "inactive");
+  const apiMuted: Array<boolean | null> = Array.from({ length: count }, () => false);
+  apiStates[Math.max(0, count - 9)] = "pending";
+  apiStates[Math.max(0, count - 6)] = "firing";
+  apiMuted[Math.max(0, count - 6)] = true;
+  apiStates[count - 1] = "firing";
+  const latencyStates = Array.from({ length: count }, () => "inactive");
+  latencyStates[Math.max(0, count - 3)] = "pending";
+  return normalizeAlertHistory(
+    {
+      data_state: "ok",
+      generated_at: generatedAt.toISOString(),
+      window,
+      bucket_seconds: bucketSeconds,
+      buckets,
+      datasources: [
+        { id: "prom-ru", name: "RU Prometheus" },
+        { id: "prom-nl", name: "NL Prometheus" },
+        { id: "prom-de", name: "DE Prometheus" },
+      ],
+      series: [
+        {
+          datasource_id: "prom-ru",
+          datasource_name: "RU Prometheus",
+          name: "ApiDown",
+          category: "infrastructure",
+          states: apiStates,
+          muted: apiMuted,
+          mute_source: "alert_hub",
+        },
+        {
+          datasource_id: "prom-nl",
+          datasource_name: "NL Prometheus",
+          name: "XrayLatencyHigh",
+          category: "xray",
+          states: latencyStates,
+          muted: Array.from({ length: count }, () => null),
+          mute_source: null,
+        },
+      ],
+      errors: [],
+    },
+    window,
+  );
+}
+
+function withDatasourceFailures(
+  snapshot: AlertHistorySnapshot | null,
+  failures: AlertRulesSnapshot["errors"],
+): AlertHistorySnapshot | null {
+  if (!snapshot || failures.length === 0) return snapshot;
+  const errors = [...snapshot.errors];
+  const seen = new Set(errors.map((item) => `${item.datasourceId}\u0000${item.code}`));
+  for (const failure of failures) {
+    const key = `${failure.datasourceId}\u0000${failure.code}`;
+    if (seen.has(key)) continue;
+    errors.push(failure);
+    seen.add(key);
+  }
+  return { ...snapshot, dataState: "partial", errors };
 }
 
 function formatDate(language: Language, value: string | null) {
@@ -366,10 +443,18 @@ function RuleDisclosure({
   rule,
   language,
   navigate,
+  history,
+  historyWindow,
+  historyLoading,
+  historyError,
 }: {
   rule: AlertRule;
   language: Language;
   navigate: (path: string) => void;
+  history: AlertHistorySnapshot | null;
+  historyWindow: AlertHistoryWindow;
+  historyLoading: boolean;
+  historyError: string | null;
 }) {
   const problematic = rule.state !== "inactive" || rule.hasError;
   const [open, setOpen] = useState(problematic);
@@ -397,6 +482,14 @@ function RuleDisclosure({
           <span>Pending&nbsp;{rule.pendingInstances}</span>
         </span>
       </summary>
+      <AlertHistory
+        rule={rule}
+        snapshot={history}
+        window={historyWindow}
+        language={language}
+        loading={historyLoading}
+        error={historyError}
+      />
       <div className="alert-replicas">
         {rule.replicas.map((replica) => (
           <ReplicaCard replica={replica} language={language} navigate={navigate} key={replica.id} />
@@ -417,10 +510,18 @@ function CategoryDisclosure({
   group,
   language,
   navigate,
+  history,
+  historyWindow,
+  historyLoading,
+  historyError,
 }: {
   group: CategoryGroup;
   language: Language;
   navigate: (path: string) => void;
+  history: AlertHistorySnapshot | null;
+  historyWindow: AlertHistoryWindow;
+  historyLoading: boolean;
+  historyError: string | null;
 }) {
   const [open, setOpen] = useState(group.problematic);
   const firing = group.rules.filter((rule) => rule.state === "firing").length;
@@ -458,6 +559,10 @@ function CategoryDisclosure({
             rule={rule}
             language={language}
             navigate={navigate}
+            history={history}
+            historyWindow={historyWindow}
+            historyLoading={historyLoading}
+            historyError={historyError}
             key={`${rule.id}:${rule.state}:${String(rule.hasError)}`}
           />
         ))}
@@ -549,6 +654,12 @@ export function AlertsPage({
   );
   const [rulesLoading, setRulesLoading] = useState(runtimeMode === "active");
   const [rulesError, setRulesError] = useState<string | null>(null);
+  const [historyWindow, setHistoryWindow] = useState<AlertHistoryWindow>("30d");
+  const [history, setHistory] = useState<AlertHistorySnapshot | null>(() =>
+    runtimeMode === "demo" ? demoHistory("30d") : null,
+  );
+  const [historyLoading, setHistoryLoading] = useState(runtimeMode === "active");
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 250);
@@ -605,6 +716,32 @@ export function AlertsPage({
     stateFilter,
   ]);
 
+  useEffect(() => {
+    if (runtimeMode !== "active") return undefined;
+    const controller = new AbortController();
+    queueMicrotask(() => {
+      if (!controller.signal.aborted) setHistoryLoading(true);
+    });
+    void request(buildAlertHistoryPath(historyWindow), controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        setHistory(normalizeAlertHistory(result.payload, historyWindow));
+        setHistoryError(null);
+      })
+      .catch((reason: unknown) => {
+        if (controller.signal.aborted) return;
+        setHistoryError(
+          reason instanceof Error
+            ? reason.message
+            : tx(language, "Не удалось загрузить историю.", "Could not load alert history."),
+        );
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setHistoryLoading(false);
+      });
+    return () => controller.abort();
+  }, [externalRefreshVersion, historyWindow, language, refreshVersion, request, runtimeMode]);
+
   const groups = useMemo<CategoryGroup[]>(() => {
     const byCategory = new Map<string, CategoryGroup>();
     for (const rule of rules?.rules ?? []) {
@@ -628,6 +765,14 @@ export function AlertsPage({
   }, [rules]);
 
   const unavailable = runtimeMode === "unavailable";
+  const windowHistory =
+    runtimeMode === "demo"
+      ? demoHistory(historyWindow)
+      : history?.window === historyWindow
+        ? history
+        : null;
+  const visibleHistory = withDatasourceFailures(windowHistory, rules?.errors ?? []);
+  const visibleHistoryLoading = runtimeMode === "active" && historyLoading;
   const showTotals = rules !== null && rules.dataState !== "unavailable" && !unavailable;
   const resetFilters = () => {
     setDatasourceId("");
@@ -644,7 +789,7 @@ export function AlertsPage({
   }
 
   return (
-    <div className="page-stack alerts-page" aria-busy={rulesLoading}>
+    <div className="page-stack alerts-page" aria-busy={rulesLoading || visibleHistoryLoading}>
       <header className="alerts-heading">
         <span>
           <small>{tx(language, "Каталог Prometheus", "Prometheus catalog")}</small>
@@ -832,6 +977,48 @@ export function AlertsPage({
           </button>
         </div>
 
+        <div className="alert-history-toolbar">
+          <span>
+            <b>{tx(language, "История алертов", "Alert history")}</b>
+            <small>
+              {tx(
+                language,
+                "Доля спокойных интервалов, не SLO. Перечёркивание означает silence в Alert Hub.",
+                "Quiet intervals, not an SLO. A slash means silenced in Alert Hub.",
+              )}
+            </small>
+          </span>
+          <div
+            className="alert-history-window"
+            role="group"
+            aria-label={tx(language, "Окно истории", "History window")}
+          >
+            {HISTORY_WINDOWS.map((window) => (
+              <button
+                className={historyWindow === window ? "active" : ""}
+                type="button"
+                aria-pressed={historyWindow === window}
+                onClick={() => setHistoryWindow(window)}
+                disabled={unavailable}
+                key={window}
+              >
+                {window}
+              </button>
+            ))}
+          </div>
+          <small className={historyError ? "alert-history-toolbar__error" : ""} role="status">
+            {visibleHistoryLoading
+              ? tx(language, "Обновляем…", "Refreshing…")
+              : historyError
+                ? tx(language, "История частично недоступна", "History is partly unavailable")
+                : visibleHistory?.dataState === "partial"
+                  ? tx(language, "Часть datasources недоступна", "Some datasources are unavailable")
+                  : visibleHistory?.generatedAt
+                    ? `${tx(language, "Обновлено", "Updated")} ${formatDate(language, visibleHistory.generatedAt)}`
+                    : ""}
+          </small>
+        </div>
+
         {rulesError && !rules ? (
           <div className="alerts-empty" role="alert">
             <b>{tx(language, "Правила недоступны", "Alert rules unavailable")}</b>
@@ -847,6 +1034,10 @@ export function AlertsPage({
                 group={group}
                 language={language}
                 navigate={navigate}
+                history={visibleHistory}
+                historyWindow={historyWindow}
+                historyLoading={visibleHistoryLoading}
+                historyError={historyError}
                 key={`${group.key}:${String(group.problematic)}`}
               />
             ))}

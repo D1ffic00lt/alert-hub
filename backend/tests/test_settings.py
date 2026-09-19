@@ -137,7 +137,6 @@ def test_grafana_url_is_normalized_and_never_accepts_credentials() -> None:
 def test_checks_settings_have_safe_bounded_defaults() -> None:
     settings = Settings()
 
-    assert settings.checks_enabled is False
     assert settings.checks_stale_after_seconds == 180
     assert settings.checks_min_failure_sources == 1
     assert settings.checks_cache_ttl_seconds == 5

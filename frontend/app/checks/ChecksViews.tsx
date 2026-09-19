@@ -437,12 +437,12 @@ function StateMessage({
         };
       case "disabled":
         return {
-          icon: "○",
-          title: tx(language, "Модуль Checks отключён", "Checks is disabled"),
+          icon: "!",
+          title: tx(language, "Checks требует обновления API", "Checks requires an API update"),
           message: tx(
             language,
-            "Администратор может включить его серверной настройкой CHECKS_ENABLED.",
-            "An administrator can enable it with the server-side CHECKS_ENABLED setting.",
+            "Текущий API-узел вернул устаревшее состояние disabled. Обновите узел и повторите запрос.",
+            "The current API node returned the legacy disabled state. Update the node and retry.",
           ),
         };
       case "unavailable":
@@ -490,7 +490,7 @@ function StateMessage({
           <code className="checks-state__code">{error}</code>
         )}
       </div>
-      {onRetry && phase === "unavailable" && (
+      {onRetry && (phase === "unavailable" || phase === "disabled") && (
         <button className="button button--quiet button--small" onClick={onRetry}>
           {tx(language, "Повторить", "Retry")}
         </button>
@@ -561,7 +561,6 @@ export function ChecksWidget({
   navigate: Navigate;
   onRetry: () => void;
 }) {
-  if (state.phase === "disabled") return null;
   const problems = problemChecks(state.problems);
   return (
     <Panel
@@ -577,7 +576,7 @@ export function ChecksWidget({
       <WarningCodesNotice codes={state.meta?.warningCodes ?? []} language={language} compact />
       {state.phase === "loading" ? (
         <ChecksWidgetSkeleton language={language} />
-      ) : state.phase === "unavailable" ? (
+      ) : state.phase === "disabled" || state.phase === "unavailable" ? (
         <StateMessage
           language={language}
           phase={state.phase}

@@ -85,6 +85,7 @@ function deferredGate() {
 
 type MockState = {
   applicationSettingsRequest?: Record<string, unknown> | null;
+  alertHistoryRequests?: string[];
   alertRuleRequests?: string[];
   alertRulesGate?: Promise<void> | null;
   alertRulesStarted?: (() => void) | null;
@@ -101,7 +102,7 @@ type MockState = {
   checksMissingOnPrimary?: string[];
   checksGate?: Promise<void> | null;
   checksItems?: Array<Record<string, unknown>>;
-  checksMode?: "disabled" | "ready" | "unavailable";
+  checksMode?: "ready" | "unavailable";
   checksSummarySearches?: string[];
   checksWarningCodes?: string[];
   incidentBulkRequests?: Array<Record<string, unknown>>;
@@ -364,15 +365,10 @@ async function installApi(page: Page, state: MockState) {
       if (gate) await gate;
     }
     if (method === "GET" && (path === "/checks" || path === "/checks/summary")) {
-      const checksMode = state.checksMode ?? "disabled";
+      const checksMode = state.checksMode ?? "ready";
       const common = {
-        enabled: checksMode !== "disabled",
-        data_state:
-          checksMode === "disabled"
-            ? "disabled"
-            : checksMode === "unavailable"
-              ? "unavailable"
-              : "ready",
+        enabled: true,
+        data_state: checksMode === "unavailable" ? "unavailable" : "ready",
         snapshot_id: checksMode === "ready" ? "e2e-checks-snapshot" : null,
         fetched_at: checksMode === "ready" ? "2026-09-05T12:00:00Z" : null,
         evaluated_at: checksMode === "ready" ? "2026-09-05T12:00:01Z" : null,
@@ -456,7 +452,7 @@ async function installApi(page: Page, state: MockState) {
       return;
     }
     if (method === "GET" && path.startsWith("/checks/")) {
-      const checksMode = state.checksMode ?? "disabled";
+      const checksMode = state.checksMode ?? "ready";
       const checkId = decodeURIComponent(path.slice("/checks/".length));
       const check =
         state.checksMissingOnPrimary?.includes(checkId) &&
@@ -464,13 +460,8 @@ async function installApi(page: Page, state: MockState) {
           ? null
           : (state.checksDetails?.[checkId] ?? null);
       const common = {
-        enabled: checksMode !== "disabled",
-        data_state:
-          checksMode === "disabled"
-            ? "disabled"
-            : checksMode === "unavailable"
-              ? "unavailable"
-              : "ready",
+        enabled: true,
+        data_state: checksMode === "unavailable" ? "unavailable" : "ready",
         snapshot_id: checksMode === "ready" ? "e2e-checks-snapshot" : null,
         fetched_at: checksMode === "ready" ? "2026-09-05T12:00:00Z" : null,
         evaluated_at: checksMode === "ready" ? "2026-09-05T12:00:01Z" : null,
@@ -480,8 +471,6 @@ async function installApi(page: Page, state: MockState) {
       };
       if (checksMode === "unavailable") {
         await fulfill(route, { ...common, check: null }, 503);
-      } else if (checksMode === "disabled") {
-        await fulfill(route, { ...common, check: null });
       } else if (!check) {
         await fulfill(route, { ...common, check: null, error_code: "check_not_found" }, 404);
       } else {
@@ -885,6 +874,57 @@ async function installApi(page: Page, state: MockState) {
           },
         ],
         pagination: { page: 1, page_size: 200, total_items: 3, total_pages: 1 },
+        errors: [
+          {
+            datasource_id: "prom-3",
+            datasource_name: "Unavailable Prometheus",
+            code: "timeout",
+            detail: "Prometheus request timed out",
+          },
+        ],
+      });
+      return;
+    }
+    if (method === "GET" && path === "/alert-history") {
+      state.alertHistoryRequests?.push(url.search);
+      const window = url.searchParams.get("window") ?? "30d";
+      const bucketSeconds = window === "24h" ? 3_600 : window === "7d" ? 21_600 : 86_400;
+      const bucketCount = window === "24h" ? 24 : window === "7d" ? 28 : 30;
+      const generatedAt = new Date("2026-09-07T00:00:00Z");
+      const startsAt = new Date(generatedAt.getTime() - bucketCount * bucketSeconds * 1_000);
+      const states = Array.from({ length: bucketCount }, () => "inactive");
+      const muted = Array.from<boolean | null>({ length: bucketCount }).fill(false);
+      states[bucketCount - 5] = "pending";
+      states[bucketCount - 4] = "firing";
+      states[bucketCount - 3] = "firing";
+      states[bucketCount - 2] = "inactive";
+      states[bucketCount - 1] = "firing";
+      muted[bucketCount - 3] = true;
+      muted[bucketCount - 1] = true;
+      await fulfill(route, {
+        data_state: "partial",
+        generated_at: generatedAt.toISOString(),
+        window,
+        bucket_seconds: bucketSeconds,
+        buckets: Array.from({ length: bucketCount }, (_, index) => ({
+          starts_at: new Date(startsAt.getTime() + index * bucketSeconds * 1_000).toISOString(),
+          ends_at: new Date(startsAt.getTime() + (index + 1) * bucketSeconds * 1_000).toISOString(),
+        })),
+        datasources: [
+          { id: "prom-1", name: "Primary Prometheus" },
+          { id: "prom-2", name: "Secondary Prometheus" },
+        ],
+        series: [
+          {
+            datasource_id: "prom-1",
+            datasource_name: "Primary Prometheus",
+            name: "ApiDown",
+            category: "infrastructure",
+            states,
+            muted,
+            mute_source: "alert_hub",
+          },
+        ],
         errors: [
           {
             datasource_id: "prom-3",
@@ -2339,15 +2379,13 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
   );
 });
 
-test("Checks disabled route is explicit and a refresh failure clears the previous success", async ({
-  page,
-}) => {
+test("a Checks refresh failure clears the previous success", async ({ page }) => {
   const fixtures = checksFixtures();
   const state: MockState = {
     authoritativeUnauthorized: false,
     checksDetails: fixtures.details,
     checksItems: fixtures.items,
-    checksMode: "disabled",
+    checksMode: "ready",
     lateTokenRequests: [],
     logoutRequests: 0,
     primaryUnavailable: false,
@@ -2363,11 +2401,7 @@ test("Checks disabled route is explicit and a refresh failure clears the previou
     history.pushState({}, "", "/checks");
     dispatchEvent(new PopStateEvent("popstate"));
   });
-  await expect(page.getByText("Модуль Checks отключён")).toBeVisible();
-
-  state.checksMode = "ready";
   state.checksWarningCodes = ["check_ttfb_unavailable"];
-  await page.getByRole("button", { name: "Обновить", exact: true }).click();
   await expect(page.getByText("Simple check")).toBeVisible();
   await page.getByRole("link", { name: "Открыть Check Simple check" }).click();
   await expect(page.locator(".check-detail-hero")).toContainText("Работает");
@@ -2457,6 +2491,7 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   page,
 }) => {
   const state: MockState = {
+    alertHistoryRequests: [],
     alertRuleRequests: [],
     authoritativeUnauthorized: false,
     incidents: [],
@@ -2524,6 +2559,15 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   await search.focus();
   await expect(search).toBeFocused();
   const apiRule = page.locator(".alert-rule").filter({ hasText: "ApiDown" });
+  const history = apiRule.locator(".alert-history");
+  await expect(history).toBeVisible();
+  await expect(history.locator(".alert-history__segment")).toHaveCount(30);
+  await expect(history.locator(".alert-history__segment--firing")).toHaveCount(3);
+  await expect(history.locator(".alert-history__segment.is-muted")).toHaveCount(2);
+  await expect(history.getByText("Приглушено в Alert Hub", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "24h", exact: true }).click();
+  await expect.poll(() => state.alertHistoryRequests?.at(-1)).toContain("window=24h");
+  await expect(history.locator(".alert-history__segment")).toHaveCount(24);
   const primaryReplica = apiRule
     .locator(".alert-replica")
     .filter({ hasText: "Primary Prometheus" });
@@ -3657,6 +3701,127 @@ test("discards a delayed audit page after the authenticated session changes", as
   ).toEqual([expect.objectContaining({ request_id: "new-request" })]);
 });
 
+test("demo shell stays aligned without horizontal overflow across viewports", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "EventSource", { configurable: true, value: undefined });
+    window.localStorage.setItem("alert-hub-ui-theme", "dark");
+  });
+  await page.route("**/api/v1/auth/refresh", (route) => fulfill(route, {}, 401));
+  await page.route("**/api/v1/auth/bootstrap/status", (route) =>
+    fulfill(route, { bootstrap_required: false }),
+  );
+
+  await page.goto("/");
+  await page.getByRole("button", { name: /Открыть демо/ }).click();
+  await expect(page.getByRole("main")).toBeVisible();
+
+  const shellLayout = () =>
+    page.evaluate(() => {
+      const header = document.querySelector<HTMLElement>(".app-header")!.getBoundingClientRect();
+      const sidebar = document.querySelector<HTMLElement>(".sidebar")!;
+      const sidebarRect = sidebar.getBoundingClientRect();
+      const main = document.querySelector<HTMLElement>(".main-content")!.getBoundingClientRect();
+      const mobileNav = document.querySelector<HTMLElement>(".mobile-nav")!;
+      return {
+        headerAtTop: Math.abs(header.top) <= 1,
+        mainRightOfSidebar: main.left >= sidebarRect.right - 1,
+        mobileNavVisible: getComputedStyle(mobileNav).display !== "none",
+        noHorizontalOverflow: document.documentElement.scrollWidth <= window.innerWidth + 1,
+        sidebarUnderHeader: Math.abs(sidebarRect.top - header.bottom) <= 1,
+        sidebarVisible: getComputedStyle(sidebar).display !== "none",
+      };
+    });
+
+  await expect.poll(shellLayout).toMatchObject({
+    headerAtTop: true,
+    mainRightOfSidebar: true,
+    noHorizontalOverflow: true,
+    sidebarUnderHeader: true,
+    sidebarVisible: true,
+  });
+
+  await page.setViewportSize({ width: 820, height: 900 });
+  await expect.poll(shellLayout).toMatchObject({
+    headerAtTop: true,
+    mainRightOfSidebar: true,
+    noHorizontalOverflow: true,
+    sidebarUnderHeader: true,
+    sidebarVisible: true,
+  });
+
+  const tabletNav = page.locator(".sidebar__nav");
+  const tabletNavLabels = await tabletNav
+    .locator("button")
+    .evaluateAll((buttons) => buttons.map((button) => button.getAttribute("aria-label")));
+  expect(tabletNavLabels.length).toBeGreaterThan(0);
+  expect(tabletNavLabels.every((label) => Boolean(label?.trim()))).toBe(true);
+  await expect(page.getByRole("button", { name: "Уведомления", exact: true })).toBeVisible();
+  await expect(tabletNav.getByRole("button", { name: "Обзор", exact: true })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+
+  await tabletNav.getByRole("button", { name: "Настройки", exact: true }).click();
+  await expect(tabletNav.getByRole("button", { name: "Настройки", exact: true })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.getByRole("button", { name: "Светлая", exact: true }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await page.getByRole("button", { name: "Тёмная", exact: true }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(shellLayout).toMatchObject({
+    mobileNavVisible: true,
+    noHorizontalOverflow: true,
+    sidebarVisible: false,
+  });
+  await expect(page.locator(".sidebar")).toBeHidden();
+  await expect(page.locator(".mobile-nav")).toBeVisible();
+});
+
+test("demo mode provides a populated Checks inventory and incident links", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "EventSource", { configurable: true, value: undefined });
+    window.localStorage.setItem("alert-hub-ui-language", "ru");
+  });
+  await page.route("**/api/v1/auth/refresh", (route) => fulfill(route, {}, 401));
+  await page.route("**/api/v1/auth/bootstrap/status", (route) =>
+    fulfill(route, { bootstrap_required: false }),
+  );
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Открыть демо", exact: true }).click();
+
+  const widget = page.locator(".checks-widget");
+  await expect(widget.getByRole("heading", { name: "Автоматизированные проверки" })).toBeVisible();
+  await expect(widget.locator(".checks-summary__item--all strong")).toHaveText("6");
+  await widget.getByRole("button", { name: /Открыть Checks/ }).click();
+
+  await expect(page.getByRole("heading", { name: "Checks", level: 1 })).toBeVisible();
+  await expect(page.locator(".checks-table tbody tr")).toHaveCount(6);
+  await expect(page.locator(".checks-summary__item--up strong")).toHaveText("2");
+  await expect(page.locator(".checks-summary__item--degraded strong")).toHaveText("1");
+  await expect(page.locator(".checks-summary__item--down strong")).toHaveText("1");
+  await expect(page.locator(".checks-summary__item--stale strong")).toHaveText("1");
+  await expect(page.locator(".checks-summary__item--unknown strong")).toHaveText("1");
+
+  await page.getByRole("link", { name: "Открыть Check Подключение VLESS NL", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Подключение VLESS NL", level: 1 })).toBeVisible();
+  const links = page.locator(".check-links-panel");
+  await expect(links).toContainText("Точка VLESS недоступна");
+  await links.getByRole("button", { name: /Подробнее/ }).click();
+
+  await expect(
+    page.getByRole("heading", { name: "Точка VLESS недоступна", level: 1 }),
+  ).toBeVisible();
+  const relatedChecks = page.getByRole("navigation", { name: "Связанные Checks" });
+  await expect(relatedChecks.getByRole("link", { name: /vless-nl-edge/ })).toBeVisible();
+});
+
 test("demo shell is accessible and responsive on a phone viewport", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 768 });
   await page.addInitScript(() => {
@@ -3840,7 +4005,7 @@ test("demo shell is accessible and responsive on a phone viewport", async ({ pag
   await page.getByRole("button", { name: "Настройки", exact: true }).click();
   await page.getByRole("button", { name: "EN", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
-  await expect(page.locator(".sidebar .brand small")).toHaveText("Monitoring center");
+  await expect(page.locator(".app-header__brand .brand small")).toHaveText("Monitoring center");
   await expect(page).toHaveTitle("E2E Operations — Monitoring center");
   await expect(page.getByRole("button", { name: "EN", exact: true })).toHaveAttribute(
     "aria-pressed",

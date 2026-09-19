@@ -120,7 +120,6 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("PEER_PUBLIC_URL", "PRIVATE_PEER_URL"),
     )
     grafana_url: str | None = None
-    checks_enabled: bool = False
     checks_stale_after_seconds: int = Field(default=180, gt=0, le=86_400)
     checks_min_failure_sources: int = Field(default=1, ge=1, le=1_000)
     checks_grafana_base_url: str | None = None

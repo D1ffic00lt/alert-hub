@@ -21,15 +21,21 @@ projection. This remains an eventually consistent operational summary; Prometheu
 continue to own detailed infrastructure time-series.
 
 The authenticated Alerts read model uses the same outbound Prometheus boundary. Rule inventory is
-read directly from `/api/v1/rules?type=alert`; observed availability is calculated on demand with
-fixed `avg_over_time`, `count_over_time`, and `last_over_time` expressions for exactly `24h`, `7d`,
-or `30d`. Neither result is persisted in SQLite. The Alerts catalog groups rules by the arbitrary
-Prometheus label `alert_category`, with a separate uncategorized group when the label is absent.
+read directly from `/api/v1/rules?type=alert`; alert-state history is calculated on demand from
+`ALERTS` with one fixed range query for exactly `24h`, `7d`, or `30d`; observed availability is
+calculated with fixed `avg_over_time`, `count_over_time`, and `last_over_time` expressions over the
+same three windows. None of those time-series are persisted in SQLite. The Alerts catalog groups
+rules by the arbitrary Prometheus label `alert_category`, with a separate uncategorized group when
+the label is absent.
 Replicas with the same category and alert name are one logical rule while their datasource, file,
 group, state, instance counts, evaluation health, error, labels, and annotations remain separate.
-Availability evidence is not mixed into that catalog; the regional matrix and Checks remain their
-own screens. A datasource failure produces an explicit partial result when another datasource
-answered.
+The alert-history strip presents inactive, pending, firing, and unknown buckets. It calls inactive
+buckets quiet intervals rather than uptime or an SLO. Prometheus instance labels remain available
+inside the backend so a slash is overlaid only when every active instance has an exact local
+incident relationship and was silenced in Alert Hub; those labels are not returned to the browser.
+Unknown silence evidence stays unknown and is not presented as unmuted. Availability evidence is not mixed into that catalog; the regional
+matrix and Checks remain their own screens. A datasource failure produces an explicit partial
+result when another datasource answered.
 
 ```mermaid
 flowchart LR
@@ -45,9 +51,9 @@ flowchart LR
     MCP["Local Alert Hub MCP\nread-only stdio"] -->|"HTTPS fixed GET tools"| PX
 ```
 
-Checks uses that existing Prometheus boundary as a read-only, optional read model. Alert Hub does
-not schedule or execute checks, manage an executor, ingest check results over HTTP, or introduce a
-prober service. The module issues only fixed server-owned instant-vector queries for the
+Checks uses that existing Prometheus boundary as an always-present, read-only read model. Alert Hub
+does not schedule or execute checks, manage an executor, ingest check results over HTTP, or
+introduce a prober service. The module issues only fixed server-owned instant-vector queries for the
 `synthetic_check_*` metric contract. Prometheus metric names and labels stop at the dedicated
 acquisition/normalization boundary; the domain layer receives protocol-neutral Check, Source,
 Target, Scenario, Variant, Canary, and Assertion values, and the API returns an explicit allowlist
@@ -81,11 +87,12 @@ text and raw/expected addresses never cross the boundary. The exported `instance
 prober processes separate while generic `source`/`source_id` remain the logical Source used for
 quorum. The API and UI report both coverage concepts explicitly.
 
-Every node evaluates its own configured Prometheus view and owns its own short-lived cache. Checks
-failure or disablement cannot affect local ingest, incident actions, notification work, peer sync,
-or readiness. A failed required Prometheus refresh becomes `data_state: unavailable`; a previous
-success is never silently served as current. Optional metric failures remove only the associated
-state, target, duration, TTFB, canary, assertion, or error-counter capability and add a warning.
+Every node evaluates its own configured Prometheus view and owns its own short-lived cache. When no
+`synthetic_check_*` series exist, Checks returns an empty view. Neither that empty state nor a Checks
+failure can affect local ingest, incident actions, notification work, peer sync, or readiness. A
+failed required Prometheus refresh becomes `data_state: unavailable`; a previous success is never
+silently served as current. Optional metric failures remove only the associated state, target,
+duration, TTFB, canary, assertion, or error-counter capability and add a warning.
 
 Only operator-managed reverse proxies terminate public HTTPS. Production host
 proxies target fixed web/API addresses on the managed edge bridge; a

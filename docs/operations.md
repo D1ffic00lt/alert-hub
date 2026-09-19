@@ -84,7 +84,7 @@ Alert on at least:
 - outbox growth and delivery failure ratio;
 - sync lag, peer availability, and `alert_hub_clock_skew_suspected` when a peer event timestamp differs from local time beyond `CLOCK_SKEW_THRESHOLD_SECONDS`;
 - repeated Checks `unavailable`/`checks_limit_exceeded` responses and unexpected growth in
-  `unknown` or stale results when Checks is enabled;
+  `unknown` or stale results;
 - backup age/checksum/restore-test failure;
 - release digest/config checksum drift across nodes.
 
@@ -134,6 +134,22 @@ category/uncategorized, `datasource_id`, `state`, and rule-name `q` filters. Fir
 replicas link to Incidents with exact `alertname` and `prometheus_datasource_id`; acknowledge,
 resolve, silence, and bulk actions remain only in Incidents.
 
+`GET /api/v1/alert-history?window=24h|7d|30d` issues one backend-owned Prometheus range query per
+enabled datasource. The windows are represented as 24 one-hour, 28 six-hour, or 30 one-day buckets.
+The UI combines matching HA replicas conservatively: firing outranks pending, a failed datasource
+remains unknown, and missing alert series from a datasource that answered are inactive. The shown
+percentage is the share of observed buckets with no firing or pending rule; it is a quiet-interval
+summary, not availability, uptime, or an SLO.
+
+A diagonal slash means that every active Prometheus instance and every active HA replica with
+evidence was silenced by an Alert Hub incident action during that bucket. This overlay requires an
+exact `prometheus_datasource_id` and full Prometheus alert-label identity; instance labels stay in
+the backend and are not returned to the browser. When that relationship or historical event
+evidence is absent, the silence state is unknown and the UI does not claim that the alert was
+unmuted. This does not represent Alertmanager-native silences. Prometheus remains the
+alert-state time-series source of truth; only the existing incident event journal supplies the
+local silence overlay, and no range samples are stored in SQLite.
+
 `GET /api/v1/availability?window=24h|7d|30d` evaluates backend-owned expressions over
 `probe_success`. Canonical datasources use `source_region × target_name`; datasource configured in
 server mode use `source_server × target_server`. Missing samples remain unknown, and a last sample
@@ -142,24 +158,23 @@ are observed measurements, not contractual objectives, and no range samples are 
 This endpoint remains available to purpose-built monitoring surfaces but is not rendered inside
 the Alerts catalog.
 
-The existing Prometheus response byte and sample limits apply independently to the rules response
-and every availability vector. Repeated `partial`, `unavailable`, `response_too_large`, or
+The existing Prometheus response byte and sample limits apply independently to the rules response,
+each alert-history matrix, and every availability vector. Repeated `partial`, `unavailable`,
+`response_too_large`, or
 `too_many_samples` results should be investigated at the named datasource.
 
 ## Checks
 
-Checks is an optional, read-only view of results produced by operator-managed external executors.
-Alert Hub neither ships nor runs a prober, owns schedules or subscriptions, stores executor
-credentials, nor performs network checks itself. Prometheus remains the operational source of
-truth; check samples, run history, status snapshots, and the in-memory registry are never written
-to SQLite.
+Checks is an always-present, read-only view of results produced by operator-managed external
+executors. Alert Hub neither ships nor runs a prober, owns schedules or subscriptions, stores
+executor credentials, nor performs network checks itself. Prometheus remains the operational
+source of truth; check samples, run history, status snapshots, and the in-memory registry are never
+written to SQLite.
 
-Set `CHECKS_ENABLED=true` on an API node only after at least one enabled Alert Hub Prometheus
-datasource can read the contract below. Every `/api/v1/checks*` operation still authenticates the
-caller when the feature is disabled. Disabled requests return `200`, `enabled: false`,
-`data_state: disabled`, and no check data; they do not query Prometheus. A successful refresh with
-no contract series returns `200`, `data_state: empty`, an empty list, and a zero summary. This is a
-normal state and does not affect Dashboard, alerts, incidents, readiness, or notification work.
+Every `/api/v1/checks*` operation authenticates the caller and queries the enabled Alert Hub
+Prometheus datasources through the fixed contract below. A successful refresh with no contract
+series returns `200`, `data_state: empty`, an empty list, and a zero summary. This is a normal state
+and does not affect Dashboard, alerts, incidents, readiness, or notification work.
 
 The authenticated operations are:
 
@@ -168,11 +183,12 @@ The authenticated operations are:
 - `GET /api/v1/checks/{check_id}` for normalized per-source/scenario/variant results, optional
   canaries/assertions, alert links, and an optional safe Grafana link.
 
-Response metadata separates acquisition state (`ready`, `empty`, `stale`, `unavailable`, or
-`disabled`) from each Check's `up`, `degraded`, `down`, `stale`, or `unknown` status. Ready snapshots
-include a server-generated `snapshot_id`, fetch/evaluation time, cache expiry, and bounded warning
-codes. A detail request returns `404` only when a reliable current inventory proves the Check is
-absent.
+Response metadata separates acquisition state (`ready`, `empty`, `stale`, or `unavailable`) from
+each Check's `up`, `degraded`, `down`, `stale`, or `unknown` status. The deprecated `disabled`
+value remains in the response schema so web clients can span rolling upgrades; current nodes never
+emit it. Ready snapshots include a server-generated `snapshot_id`, fetch/evaluation time, cache
+expiry, and bounded warning codes. A detail request returns `404` only when a reliable current
+inventory proves the Check is absent.
 
 ### Metric contract and executor connection
 
@@ -365,6 +381,7 @@ tuple created during a cold failed refresh.
 | Samples in one Prometheus vector response         | 10,000 (`PROMETHEUS_MAX_SAMPLES`)                                   |
 | One Prometheus HTTP response                      | 2 MiB (`PROMETHEUS_MAX_RESPONSE_BYTES`)                             |
 | Prometheus query timeout                          | 8 seconds (`PROMETHEUS_QUERY_TIMEOUT_SECONDS`)                      |
+| Incident events considered for alert history      | 50,000 maximum; excess fails the history read closed                |
 | Concurrent Prometheus requests per Checks refresh | 16 (internal shared cap across all queries and datasources)         |
 | Checks cache TTL                                  | 5 seconds (`CHECKS_CACHE_TTL_SECONDS`, allowed range 0.1–5)         |
 | Future timestamp tolerance                        | 30 seconds (`CHECKS_FUTURE_TOLERANCE_SECONDS`, allowed range 0–300) |
@@ -385,7 +402,6 @@ unavailable/limit responses.
 The production settings are:
 
 ```dotenv
-CHECKS_ENABLED=false
 CHECKS_STALE_AFTER_SECONDS=180
 CHECKS_MIN_FAILURE_SOURCES=1
 CHECKS_GRAFANA_BASE_URL=

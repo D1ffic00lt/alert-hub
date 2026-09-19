@@ -1641,7 +1641,6 @@ def test_web_only_production_deploy_does_not_receive_crypto_secrets() -> None:
     }
     checks_settings = {
         "CHECKS_CACHE_TTL_SECONDS",
-        "CHECKS_ENABLED",
         "CHECKS_FUTURE_TOLERANCE_SECONDS",
         "CHECKS_GRAFANA_BASE_URL",
         "CHECKS_MAX_SERIES",
@@ -1736,7 +1735,6 @@ def test_production_checks_settings_are_allowlisted_validated_and_snapshotted() 
     provisioner = PROVISIONER_PATH.read_text(encoding="utf-8")
     environment_example = (REPOSITORY / ".env.example").read_text(encoding="utf-8")
     checks_defaults = {
-        "CHECKS_ENABLED": "false",
         "CHECKS_STALE_AFTER_SECONDS": "180",
         "CHECKS_MIN_FAILURE_SOURCES": "1",
         "CHECKS_GRAFANA_BASE_URL": "",
@@ -1752,7 +1750,6 @@ def test_production_checks_settings_are_allowlisted_validated_and_snapshotted() 
         assert f"{setting}={default}\n" in environment_example
         assert setting in provisioner
 
-    assert 'validate_boolean "${CHECKS_ENABLED}"' in runtime
     assert 'validate_bounded_integer "${CHECKS_STALE_AFTER_SECONDS}" 1 86400' in runtime
     assert 'validate_bounded_integer "${CHECKS_MIN_FAILURE_SOURCES}" 1 1000' in runtime
     assert 'validate_single_line "${CHECKS_GRAFANA_BASE_URL}"' in runtime
