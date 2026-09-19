@@ -5,6 +5,7 @@ import {
   buildAlertHistoryPath,
   buildAlertRulesPath,
   historyForRule,
+  historyForScope,
   mergeAvailability,
   normalizeAlertHistory,
   normalizeAlertRules,
@@ -137,14 +138,19 @@ describe("Alerts API model", () => {
     expect(rows[0].windows["30d"]?.observedAvailabilityPercent).toBeNull();
   });
 
-  it("normalizes bounded alert history and aggregates replicas conservatively", () => {
+  it("normalizes chronological alert activity and aggregates replicas conservatively", () => {
     expect(buildAlertHistoryPath("7d")).toBe("/alert-history?window=7d");
+    expect(buildAlertHistoryPath("30d", { incidentId: "incident / one" })).toBe(
+      "/alert-history?window=30d&incident_id=incident+%2F+one",
+    );
     const snapshot = normalizeAlertHistory(
       {
         data_state: "partial",
         generated_at: "2026-09-07T00:00:00Z",
         window: "24h",
         bucket_seconds: 3_600,
+        sample_seconds: 900,
+        samples_per_bucket: 4,
         buckets: [
           { starts_at: "2026-09-06T21:00:00Z", ends_at: "2026-09-06T22:00:00Z" },
           { starts_at: "2026-09-06T22:00:00Z", ends_at: "2026-09-06T23:00:00Z" },
@@ -160,17 +166,29 @@ describe("Alerts API model", () => {
             datasource_name: "Primary",
             name: "ApiDown",
             category: "infrastructure",
-            states: ["inactive", "pending", "firing"],
-            muted: [false, true, true],
-            mute_source: "alert_hub",
+            activity: [
+              ["inactive", "firing", "pending", "inactive"],
+              ["inactive", "inactive", "inactive", "inactive"],
+              ["firing", "firing", "pending", "inactive"],
+            ],
           },
           {
             datasource_id: "prom-2",
             datasource_name: "Secondary",
             name: "ApiDown",
             category: "infrastructure",
-            states: ["broken", "pending", "inactive"],
-            muted: [null, false, null],
+            activity: [
+              ["inactive", "inactive", "pending", "inactive"],
+              ["inactive", "pending", "inactive", "inactive"],
+              ["inactive", "inactive", "inactive", "inactive"],
+            ],
+          },
+          {
+            datasource_id: "prom-2",
+            datasource_name: "Secondary",
+            name: "Broken",
+            category: "infrastructure",
+            activity: [["broken"]],
           },
         ],
         errors: [
@@ -203,14 +221,24 @@ describe("Alerts API model", () => {
       pagination: {},
     });
 
-    expect(snapshot.series[1].states).toEqual(["unknown", "pending", "inactive"]);
-    expect(snapshot.series[1].muted).toEqual([null, false, null]);
+    expect(snapshot.series).toHaveLength(2);
     expect(historyForRule(snapshot, rules.rules[0])).toEqual({
-      states: ["unknown", "pending", "firing"],
-      muted: [null, false, true],
-      quietPercent: 0,
-      coveragePercent: (2 / 3) * 100,
+      periods: [
+        ["healthy", "critical", "warning", "healthy"],
+        ["healthy", "warning", "healthy", "healthy"],
+        ["critical", "critical", "warning", "healthy"],
+      ],
+      healthyPercent: 50,
+      partial: true,
     });
+    expect(historyForScope(snapshot)?.periods[0]).toEqual([
+      "healthy",
+      "critical",
+      "warning",
+      "healthy",
+    ]);
+
+    expect(historyForScope({ ...snapshot, series: [] })).toBeNull();
 
     const neverFired = historyForRule(snapshot, {
       ...rules.rules[0],
@@ -218,9 +246,8 @@ describe("Alerts API model", () => {
       replicas: [{ ...rules.rules[0].replicas[0], name: "NeverFired" }],
     });
     expect(neverFired).toMatchObject({
-      states: ["unknown", "unknown", "unknown"],
-      quietPercent: null,
-      coveragePercent: 0,
+      healthyPercent: 100,
+      partial: true,
     });
   });
 });

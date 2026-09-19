@@ -1,3 +1,10 @@
+import {
+  mergeStateHistoryActivities,
+  type StateHistoryBucket,
+  type StateHistoryTimeline,
+  type StateHistoryTone,
+} from "../state-history/model";
+
 export const CHECK_STATUSES = ["up", "degraded", "down", "stale", "unknown"] as const;
 
 export type CheckStatus = (typeof CHECK_STATUSES)[number];
@@ -163,6 +170,37 @@ export type ChecksSummaryResponse = {
 export type CheckDetailResponse = {
   meta: ChecksMeta;
   check: CheckDetail | null;
+};
+
+export type CheckHistoryWindow = "24h" | "7d" | "30d";
+export type CheckHistoryState = "up" | "degraded" | "down";
+export type CheckHistoryDataState =
+  "ok" | "partial" | "empty" | "unavailable" | "not_configured" | "disabled";
+
+export type CheckHistorySeries = {
+  datasourceId: string;
+  datasourceName: string;
+  checkId: string;
+  activity: CheckHistoryState[][];
+};
+
+export type CheckHistorySnapshot = {
+  enabled: boolean;
+  dataState: CheckHistoryDataState;
+  generatedAt: string | null;
+  window: CheckHistoryWindow;
+  bucketSeconds: number;
+  sampleSeconds: number;
+  samplesPerBucket: number;
+  buckets: StateHistoryBucket[];
+  datasources: Array<{ id: string; name: string }>;
+  series: CheckHistorySeries[];
+  errors: Array<{
+    datasourceId: string;
+    datasourceName: string;
+    code: string;
+    detail: string;
+  }>;
 };
 
 export type CheckFilters = {
@@ -618,6 +656,124 @@ export function normalizeCheckDetail(payload: unknown): CheckDetailResponse {
   };
   if (Array.isArray(activeAlertValue)) check.activeAlerts = activeAlertValue.length;
   return { meta, check };
+}
+
+export function buildCheckHistoryPath(window: CheckHistoryWindow, checkId?: string): string {
+  if (!["24h", "7d", "30d"].includes(window)) throw new Error("Unsupported check history window");
+  const query = new URLSearchParams({ window });
+  if (checkId) query.set("check_id", checkId);
+  return `/checks/history?${query.toString()}`;
+}
+
+export function normalizeCheckHistory(
+  payload: unknown,
+  requestedWindow: CheckHistoryWindow,
+): CheckHistorySnapshot {
+  const body = record(payload);
+  const validDate = (value: unknown): string | null => {
+    const normalized = stringOrNull(value);
+    return normalized && !Number.isNaN(new Date(normalized).getTime()) ? normalized : null;
+  };
+  const buckets = array(body.buckets)
+    .flatMap((value) => {
+      const item = record(value);
+      const startsAt = validDate(item.starts_at);
+      const endsAt = validDate(item.ends_at);
+      if (!startsAt || !endsAt || Date.parse(startsAt) >= Date.parse(endsAt)) return [];
+      return [{ startsAt, endsAt }];
+    })
+    .slice(0, 40);
+  const samplesPerBucket = Math.max(
+    1,
+    Math.min(64, Math.trunc(finiteNumber(body.samples_per_bucket) ?? 1)),
+  );
+  const validState = (value: unknown): CheckHistoryState | null =>
+    ["up", "degraded", "down"].includes(String(value)) ? (value as CheckHistoryState) : null;
+  const rawWindow = String(body.window);
+  const window = ["24h", "7d", "30d"].includes(rawWindow)
+    ? (rawWindow as CheckHistoryWindow)
+    : requestedWindow;
+  const rawDataState = String(body.data_state);
+  const dataState = [
+    "ok",
+    "partial",
+    "empty",
+    "unavailable",
+    "not_configured",
+    "disabled",
+  ].includes(rawDataState)
+    ? (rawDataState as CheckHistoryDataState)
+    : "unavailable";
+  return {
+    enabled: body.enabled !== false,
+    dataState,
+    generatedAt: validDate(body.generated_at),
+    window,
+    bucketSeconds: Math.max(0, Math.trunc(finiteNumber(body.bucket_seconds) ?? 0)),
+    sampleSeconds: Math.max(0, Math.trunc(finiteNumber(body.sample_seconds) ?? 0)),
+    samplesPerBucket,
+    buckets,
+    datasources: array(body.datasources).flatMap((value) => {
+      const item = record(value);
+      const id = stringOrNull(item.id);
+      return id ? [{ id, name: stringOrNull(item.name) ?? "Prometheus" }] : [];
+    }),
+    series: array(body.series).flatMap((value) => {
+      const item = record(value);
+      const datasourceId = stringOrNull(item.datasource_id);
+      const checkId = stringOrNull(item.check_id);
+      if (!datasourceId || !checkId) return [];
+      const activity = array(item.activity)
+        .slice(0, buckets.length)
+        .map((period) => array(period).slice(0, samplesPerBucket).map(validState));
+      if (
+        activity.length !== buckets.length ||
+        activity.some(
+          (period) => period.length !== samplesPerBucket || period.some((state) => state === null),
+        )
+      )
+        return [];
+      return [
+        {
+          datasourceId,
+          datasourceName: stringOrNull(item.datasource_name) ?? "Prometheus",
+          checkId,
+          activity: activity as CheckHistoryState[][],
+        } satisfies CheckHistorySeries,
+      ];
+    }),
+    errors: array(body.errors).map((value) => {
+      const item = record(value);
+      return {
+        datasourceId: stringOrNull(item.datasource_id) ?? "",
+        datasourceName: stringOrNull(item.datasource_name) ?? "Prometheus",
+        code: stringOrNull(item.code) ?? "prometheus_unavailable",
+        detail: stringOrNull(item.detail) ?? "Prometheus datasource could not be queried",
+      };
+    }),
+  };
+}
+
+function checkHistoryTone(state: CheckHistoryState): StateHistoryTone {
+  if (state === "down") return "critical";
+  if (state === "degraded") return "warning";
+  return "healthy";
+}
+
+export function historyForCheck(
+  snapshot: CheckHistorySnapshot | null,
+  checkId: string,
+): StateHistoryTimeline | null {
+  if (!snapshot || snapshot.buckets.length === 0) return null;
+  const activities = snapshot.series
+    .filter((series) => series.checkId === checkId)
+    .map((series) =>
+      series.activity.map((period) => period.map((state) => checkHistoryTone(state))),
+    );
+  return mergeStateHistoryActivities(
+    activities,
+    snapshot.dataState === "partial" || snapshot.errors.length > 0,
+  );
 }
 
 export function problemChecks(items: CheckListItem[], limit = 5): CheckListItem[] {

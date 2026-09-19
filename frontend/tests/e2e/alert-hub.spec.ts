@@ -99,6 +99,8 @@ type MockState = {
   clusterStatus?: unknown;
   clusterApiAlertRequests?: Array<Record<string, unknown>>;
   checksDetails?: Record<string, Record<string, unknown>>;
+  checkHistoryRequests?: string[];
+  checkHistoryPartial?: boolean;
   checksMissingOnPrimary?: string[];
   checksGate?: Promise<void> | null;
   checksItems?: Array<Record<string, unknown>>;
@@ -449,6 +451,68 @@ async function installApi(page: Page, state: MockState) {
         ...counts,
         problem_checks: problemChecks,
       });
+      return;
+    }
+    if (method === "GET" && path === "/checks/history") {
+      state.checkHistoryRequests?.push(url.search);
+      const checksMode = state.checksMode ?? "disabled";
+      const window = url.searchParams.get("window") ?? "30d";
+      const bucketSeconds = window === "24h" ? 2_160 : window === "7d" ? 15_120 : 64_800;
+      const bucketCount = 40;
+      const samplesPerBucket = 4;
+      const generatedAt = new Date("2026-09-07T00:00:00Z");
+      const startsAt = new Date(generatedAt.getTime() - bucketCount * bucketSeconds * 1_000);
+      const requestedCheckId = url.searchParams.get("check_id");
+      const checkIds = (state.checksItems ?? [])
+        .map((item) => String(item.check_id ?? ""))
+        .filter((checkId) => checkId && (!requestedCheckId || checkId === requestedCheckId));
+      const common = {
+        enabled: checksMode !== "disabled",
+        data_state:
+          checksMode === "disabled"
+            ? "disabled"
+            : checksMode === "unavailable"
+              ? "unavailable"
+              : state.checkHistoryPartial
+                ? "partial"
+                : "ok",
+        generated_at: generatedAt.toISOString(),
+        window,
+        bucket_seconds: bucketSeconds,
+        sample_seconds: Math.trunc(bucketSeconds / samplesPerBucket),
+        samples_per_bucket: samplesPerBucket,
+        buckets: Array.from({ length: bucketCount }, (_, index) => ({
+          starts_at: new Date(startsAt.getTime() + index * bucketSeconds * 1_000).toISOString(),
+          ends_at: new Date(startsAt.getTime() + (index + 1) * bucketSeconds * 1_000).toISOString(),
+        })),
+        datasources: checksMode === "ready" ? [{ id: "prom-1", name: "Primary Prometheus" }] : [],
+        series:
+          checksMode === "ready"
+            ? checkIds.map((checkId) => {
+                const activity = Array.from({ length: bucketCount }, () =>
+                  Array.from({ length: samplesPerBucket }, () => "up"),
+                );
+                activity[bucketCount - 5] = ["down", "degraded", "up", "up"];
+                return {
+                  datasource_id: "prom-1",
+                  datasource_name: "Primary Prometheus",
+                  check_id: checkId,
+                  activity,
+                };
+              })
+            : [],
+        errors: state.checkHistoryPartial
+          ? [
+              {
+                datasource_id: "prom-2",
+                datasource_name: "Secondary Prometheus",
+                code: "timeout",
+                detail: "Prometheus request timed out",
+              },
+            ]
+          : [],
+      };
+      await fulfill(route, common, checksMode === "unavailable" ? 503 : 200);
       return;
     }
     if (method === "GET" && path.startsWith("/checks/")) {
@@ -888,24 +952,24 @@ async function installApi(page: Page, state: MockState) {
     if (method === "GET" && path === "/alert-history") {
       state.alertHistoryRequests?.push(url.search);
       const window = url.searchParams.get("window") ?? "30d";
-      const bucketSeconds = window === "24h" ? 3_600 : window === "7d" ? 21_600 : 86_400;
-      const bucketCount = window === "24h" ? 24 : window === "7d" ? 28 : 30;
+      const bucketSeconds = window === "24h" ? 2_160 : window === "7d" ? 15_120 : 64_800;
+      const bucketCount = 40;
+      const samplesPerBucket = 4;
       const generatedAt = new Date("2026-09-07T00:00:00Z");
       const startsAt = new Date(generatedAt.getTime() - bucketCount * bucketSeconds * 1_000);
-      const states = Array.from({ length: bucketCount }, () => "inactive");
-      const muted = Array.from<boolean | null>({ length: bucketCount }).fill(false);
-      states[bucketCount - 5] = "pending";
-      states[bucketCount - 4] = "firing";
-      states[bucketCount - 3] = "firing";
-      states[bucketCount - 2] = "inactive";
-      states[bucketCount - 1] = "firing";
-      muted[bucketCount - 3] = true;
-      muted[bucketCount - 1] = true;
+      const activity = Array.from({ length: bucketCount }, () =>
+        Array.from({ length: samplesPerBucket }, () => "inactive"),
+      );
+      activity[bucketCount - 5] = ["firing", "pending", "inactive", "inactive"];
+      activity[bucketCount - 3] = Array.from({ length: samplesPerBucket }, () => "firing");
+      activity[bucketCount - 1] = ["firing", "pending", "inactive", "inactive"];
       await fulfill(route, {
         data_state: "partial",
         generated_at: generatedAt.toISOString(),
         window,
         bucket_seconds: bucketSeconds,
+        sample_seconds: Math.trunc(bucketSeconds / samplesPerBucket),
+        samples_per_bucket: samplesPerBucket,
         buckets: Array.from({ length: bucketCount }, (_, index) => ({
           starts_at: new Date(startsAt.getTime() + index * bucketSeconds * 1_000).toISOString(),
           ends_at: new Date(startsAt.getTime() + (index + 1) * bucketSeconds * 1_000).toISOString(),
@@ -920,9 +984,7 @@ async function installApi(page: Page, state: MockState) {
             datasource_name: "Primary Prometheus",
             name: "ApiDown",
             category: "infrastructure",
-            states,
-            muted,
-            mute_source: "alert_hub",
+            activity,
           },
         ],
         errors: [
@@ -2077,7 +2139,11 @@ test("incident detail timeline can show newest events first or last", async ({ p
     target: "api",
     starts_at: "2026-09-15T10:00:00Z",
     last_event_at: "2026-09-15T12:00:00Z",
-    labels: {},
+    labels: {
+      alertname: "ApiDown",
+      alert_category: "infrastructure",
+      prometheus_datasource_id: "prom-1",
+    },
     annotations: {},
     timeline: [
       {
@@ -2099,6 +2165,7 @@ test("incident detail timeline can show newest events first or last", async ({ p
     ],
   };
   const state: MockState = {
+    alertHistoryRequests: [],
     authoritativeUnauthorized: false,
     incidentDetails: { [incident.id]: incident },
     incidents: [incident],
@@ -2119,6 +2186,11 @@ test("incident detail timeline can show newest events first or last", async ({ p
 
   const labels = page.locator(".timeline-item__content b");
   await expect(page.getByRole("heading", { name: incident.title })).toBeVisible();
+  const incidentHistory = page.locator(".incident-detail-page > .state-history--standalone");
+  await expect(incidentHistory.locator(".state-history__pill")).toHaveCount(40);
+  await expect
+    .poll(() => new URLSearchParams(state.alertHistoryRequests?.at(-1) ?? "").get("incident_id"))
+    .toBe(incident.id);
   await expect(page.getByRole("combobox", { name: "Порядок событий" })).toHaveValue("newest_first");
   await expect(labels).toHaveText(["Newest event", "Oldest event"]);
 
@@ -2191,6 +2263,8 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
     authoritativeUnauthorized: false,
     checksDetails: fixtures.details,
     checksGate: dashboardGate.promise,
+    checkHistoryRequests: [],
+    checkHistoryPartial: true,
     checksItems: fixtures.items,
     checksMode: "ready",
     checksSummarySearches: [],
@@ -2259,6 +2333,11 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
     complexCoverage.locator(".check-coverage-counts > span").filter({ hasText: "Instances" }),
   ).toContainText("1/3");
   await expect(complexCoverage.locator(".check-instance-coverage")).toContainText("de-central");
+  const compactCheckHistory = complexCoverage.locator(".check-history--compact");
+  await expect(compactCheckHistory.locator(".state-history__pill")).toHaveCount(40);
+  await expect(
+    compactCheckHistory.getByRole("status", { name: "Некоторые datasources недоступны." }),
+  ).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });
   const longIdRow = page.getByRole("link", { name: "Открыть Check Simple check" });
@@ -2276,6 +2355,11 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
   detailGate.release();
   state.checksGate = null;
   await expect(page.getByRole("heading", { name: "Simple check" })).toBeVisible();
+  const checkDetailHistory = page.locator(".check-detail-page > .check-history");
+  await expect(checkDetailHistory.locator(".state-history__pill")).toHaveCount(40);
+  await expect
+    .poll(() => new URLSearchParams(state.checkHistoryRequests?.at(-1) ?? "").get("check_id"))
+    .toBe(fixtures.longCheckId);
   await expect(page.locator(".check-detail-hero .check-identity__id")).toHaveText(
     fixtures.longCheckId,
   );
@@ -2561,13 +2645,30 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   const apiRule = page.locator(".alert-rule").filter({ hasText: "ApiDown" });
   const history = apiRule.locator(".alert-history");
   await expect(history).toBeVisible();
-  await expect(history.locator(".alert-history__segment")).toHaveCount(30);
-  await expect(history.locator(".alert-history__segment--firing")).toHaveCount(3);
-  await expect(history.locator(".alert-history__segment.is-muted")).toHaveCount(2);
-  await expect(history.getByText("Приглушено в Alert Hub", { exact: true })).toBeVisible();
+  const pills = history.locator(".state-history__pill");
+  await expect(pills).toHaveCount(40);
+  const mixedPill = pills.nth(35);
+  const chronologicalSlices = mixedPill.locator(".state-history__slice");
+  await expect(chronologicalSlices).toHaveCount(3);
+  await expect(chronologicalSlices.nth(0)).toHaveClass(/state-history__slice--critical/);
+  await expect(chronologicalSlices.nth(1)).toHaveClass(/state-history__slice--warning/);
+  await expect(chronologicalSlices.nth(2)).toHaveClass(/state-history__slice--healthy/);
+  const pillGeometry = await pills.first().evaluate((pill) => {
+    const bounds = pill.getBoundingClientRect();
+    const style = getComputedStyle(pill);
+    return {
+      width: bounds.width,
+      height: bounds.height,
+      radius: Number.parseFloat(style.borderTopLeftRadius),
+    };
+  });
+  expect(pillGeometry.height).toBeGreaterThan(pillGeometry.width * 2);
+  expect(pillGeometry.radius).toBeGreaterThanOrEqual(pillGeometry.width / 2 - 1);
+  await expect(history.getByText("Приглушено в Alert Hub", { exact: true })).toHaveCount(0);
+  await expect(history.getByText("Unknown", { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "24h", exact: true }).click();
   await expect.poll(() => state.alertHistoryRequests?.at(-1)).toContain("window=24h");
-  await expect(history.locator(".alert-history__segment")).toHaveCount(24);
+  await expect(history.locator(".state-history__pill")).toHaveCount(40);
   const primaryReplica = apiRule
     .locator(".alert-replica")
     .filter({ hasText: "Primary Prometheus" });

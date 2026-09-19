@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 from urllib.parse import quote
 
@@ -26,7 +26,12 @@ from alert_hub.application.checks import (
     problem_checks,
     summarize_checks,
 )
-from alert_hub.application.prometheus import prepare_enabled_datasources
+from alert_hub.application.prometheus import (
+    DatasourceHistoryResult,
+    DatasourceQueryFailure,
+    prepare_enabled_datasources,
+    query_datasource_check_history_targets,
+)
 from alert_hub.domain.checks import (
     DEFAULT_CANARY,
     DEFAULT_SCENARIO,
@@ -45,7 +50,11 @@ from alert_hub.domain.checks import (
 )
 from alert_hub.infrastructure.db.models import Incident, IncidentEvent, User
 from alert_hub.infrastructure.encryption import EnvelopeCipher
-from alert_hub.infrastructure.prometheus import PrometheusClient
+from alert_hub.infrastructure.prometheus import (
+    ALERT_HISTORY_WINDOWS,
+    AlertHistoryWindow,
+    PrometheusClient,
+)
 from alert_hub.settings import Settings
 
 logger = logging.getLogger("alert_hub.checks")
@@ -363,6 +372,92 @@ def _cache(request: Request) -> ChecksSnapshotCache:
 
 def _public_error_code(value: str) -> str:
     return value if value in _PUBLIC_ERROR_CODES else "prometheus_unavailable"
+
+
+CheckHistoryState = Literal["up", "degraded", "down"]
+
+
+def _check_history_failure(failure: DatasourceQueryFailure) -> dict[str, str]:
+    return {
+        "datasource_id": failure.datasource_id,
+        "datasource_name": failure.datasource_name,
+        "code": _public_error_code(failure.code),
+        "detail": "Prometheus datasource could not be queried",
+    }
+
+
+def _check_history_series(
+    results: list[DatasourceHistoryResult],
+    *,
+    starts_at: datetime,
+    bucket_count: int,
+    sample: timedelta,
+    samples_per_bucket: int,
+    selected_check_id: str | None,
+) -> list[dict[str, Any]]:
+    sample_seconds = sample.total_seconds()
+    first_sample_end = starts_at + sample
+    total_samples = bucket_count * samples_per_bucket
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for result in results:
+        for item in result.series:
+            check_id = item.labels.get("check_id", "").strip()[:128]
+            if not check_id or (selected_check_id is not None and check_id != selected_check_id):
+                continue
+            series_identity = tuple(sorted(item.labels.items()))
+            response = merged.setdefault(
+                (result.datasource_id, check_id),
+                {
+                    "datasource_id": result.datasource_id,
+                    "datasource_name": result.datasource_name,
+                    "check_id": check_id,
+                    "expected_series": set(),
+                    "observations": [
+                        [{} for _ in range(samples_per_bucket)] for _ in range(bucket_count)
+                    ],
+                },
+            )
+            response["expected_series"].add(series_identity)
+            observations = response["observations"]
+            for history_sample in item.samples:
+                position = (
+                    history_sample.timestamp - first_sample_end
+                ).total_seconds() / sample_seconds
+                index = round(position)
+                if index < 0 or index >= total_samples or abs(position - index) > 0.01:
+                    continue
+                bucket_index, sample_index = divmod(index, samples_per_bucket)
+                observations[bucket_index][sample_index][series_identity] = history_sample.value
+
+    response_series: list[dict[str, Any]] = []
+    for response in merged.values():
+        expected_series = response.pop("expected_series")
+        activity: list[list[CheckHistoryState]] = []
+        for bucket in response.pop("observations"):
+            states: list[CheckHistoryState] = []
+            for observations in bucket:
+                values = list(observations.values())
+                if len(observations) != len(expected_series) or any(
+                    value not in {0.0, 1.0} for value in values
+                ):
+                    states.append("degraded")
+                elif all(value >= 0.5 for value in values):
+                    states.append("up")
+                elif all(value < 0.5 for value in values):
+                    states.append("down")
+                else:
+                    states.append("degraded")
+            activity.append(states)
+        response["activity"] = activity
+        response_series.append(response)
+    response_series.sort(
+        key=lambda item: (
+            str(item["check_id"]).casefold(),
+            str(item["datasource_name"]).casefold(),
+            str(item["datasource_id"]),
+        )
+    )
+    return response_series
 
 
 async def _get_snapshot(
@@ -962,7 +1057,74 @@ async def list_checks(
     )
 
 
-# Keep this static route above /{check_id}; otherwise "summary" is parsed as an identifier.
+# Keep static routes above /{check_id}; otherwise they are parsed as identifiers.
+@router.get("/history")
+async def checks_history(
+    request: Request,
+    window: AlertHistoryWindow = Query(default="30d"),
+    check_id: str | None = Query(default=None, min_length=1, max_length=128),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+    prometheus: PrometheusClient = Depends(get_prometheus_client),
+) -> dict[str, Any]:
+    del user
+    generated_at = datetime.now(UTC)
+    spec = ALERT_HISTORY_WINDOWS[window]
+    starts_at = generated_at - spec.duration
+    buckets = [
+        {
+            "starts_at": starts_at + spec.bucket * index,
+            "ends_at": starts_at + spec.bucket * (index + 1),
+        }
+        for index in range(spec.bucket_count)
+    ]
+    cipher = cast(EnvelopeCipher | None, request.app.state.envelope_cipher)
+    targets, failures, datasource_count = prepare_enabled_datasources(db, cipher)
+    db.close()
+    results, transport_failures = await query_datasource_check_history_targets(
+        targets,
+        prometheus,
+        window,
+        evaluated_at=generated_at,
+        check_id=check_id,
+    )
+    failures.extend(transport_failures)
+    series = _check_history_series(
+        results,
+        starts_at=starts_at,
+        bucket_count=spec.bucket_count,
+        sample=spec.sample,
+        samples_per_bucket=spec.samples_per_bucket,
+        selected_check_id=check_id,
+    )
+    data_state = (
+        "not_configured"
+        if datasource_count == 0
+        else "partial"
+        if failures and results
+        else "unavailable"
+        if failures
+        else "empty"
+        if not series
+        else "ok"
+    )
+    return {
+        "enabled": True,
+        "data_state": data_state,
+        "generated_at": generated_at,
+        "window": window,
+        "bucket_seconds": int(spec.bucket.total_seconds()),
+        "sample_seconds": int(spec.sample.total_seconds()),
+        "samples_per_bucket": spec.samples_per_bucket,
+        "buckets": buckets,
+        "datasources": [
+            {"id": result.datasource_id, "name": result.datasource_name} for result in results
+        ],
+        "series": series,
+        "errors": [_check_history_failure(failure) for failure in failures],
+    }
+
+
 @router.get(
     "/summary",
     response_model=ChecksSummaryResponse,

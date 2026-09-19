@@ -247,7 +247,7 @@ async function dispatchWaitable(
 describe("service worker fetch boundaries", () => {
   it("does not intercept backend or unknown navigations as SPA shell requests", async () => {
     const { caches, listeners } = createHarness();
-    const shell = await caches.open("alert-hub-v8-shell");
+    const shell = await caches.open("alert-hub-v9-shell");
     await shell.put("/", new Response("known-good-shell"));
 
     const metricsResponse = await dispatchFetch(
@@ -292,7 +292,7 @@ describe("service worker fetch boundaries", () => {
 
   it("keeps a last-known-good runtime config for transient gateway failure", async () => {
     const { caches, controls, listeners, networkCalls } = createHarness();
-    const shell = await caches.open("alert-hub-v8-shell");
+    const shell = await caches.open("alert-hub-v9-shell");
     await shell.put("/runtime-config.js", new Response("stale-runtime-config"));
 
     const runtime = await dispatchFetch(
@@ -328,7 +328,7 @@ describe("service worker fetch boundaries", () => {
 
   it("only replaces the offline shell with same-origin HTML from an SPA route", async () => {
     const { caches, controls, listeners } = createHarness();
-    const shell = await caches.open("alert-hub-v8-shell");
+    const shell = await caches.open("alert-hub-v9-shell");
     const response = await dispatchFetch(
       listeners.fetch,
       request("/incidents", "navigate", "document"),
@@ -348,7 +348,7 @@ describe("service worker fetch boundaries", () => {
 
   it("serves the last-known-good shell for load-balancer 5xx but not 4xx", async () => {
     const { caches, controls, listeners } = createHarness();
-    const shell = await caches.open("alert-hub-v8-shell");
+    const shell = await caches.open("alert-hub-v9-shell");
     await shell.put("/", new Response("known-good-shell"));
 
     controls.navigationStatus = 502;
@@ -425,7 +425,7 @@ describe("service worker push contract", () => {
       openedWindows,
     } = createHarness();
     controls.manifestOffline = true;
-    const shell = await caches.open("alert-hub-v8-shell");
+    const shell = await caches.open("alert-hub-v9-shell");
     await shell.put(
       "/manifest.webmanifest",
       new Response('{"name":"Cached Operations"}', {
@@ -516,7 +516,7 @@ describe("service worker cache lifecycle", () => {
         ],
       },
     });
-    const shell = await caches.open("alert-hub-v8-shell");
+    const shell = await caches.open("alert-hub-v9-shell");
     expect(await shell.match(`${origin}/assets/index-safe.js`)).toBeDefined();
     expect(await shell.match(`${origin}/runtime-config.js`)).toBeUndefined();
     expect(await shell.match("https://evil.invalid/assets/index.js")).toBeUndefined();

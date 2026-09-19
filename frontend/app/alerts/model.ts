@@ -1,10 +1,16 @@
+import {
+  mergeStateHistoryActivities,
+  type StateHistoryTimeline,
+  type StateHistoryTone,
+} from "../state-history/model";
+
 export type AlertRulesDataState = "ok" | "partial" | "empty" | "unavailable" | "not_configured";
 export type AlertRuleState = "firing" | "pending" | "error" | "inactive";
 export type AlertRuleFilter = AlertRuleState | "error" | "all";
 export type AvailabilityWindow = "24h" | "7d" | "30d";
 export type AvailabilityDataState = "ok" | "stale" | "unknown";
 export type AlertHistoryWindow = "24h" | "7d" | "30d";
-export type AlertHistoryState = "inactive" | "pending" | "firing" | "unknown";
+export type AlertHistoryState = "inactive" | "pending" | "firing";
 
 export type DatasourceError = {
   datasourceId: string;
@@ -112,9 +118,7 @@ export type AlertHistorySeries = {
   datasourceName: string;
   name: string;
   category: string | null;
-  states: AlertHistoryState[];
-  muted: Array<boolean | null>;
-  muteSource: "alert_hub" | null;
+  activity: AlertHistoryState[][];
 };
 
 export type AlertHistorySnapshot = {
@@ -122,18 +126,15 @@ export type AlertHistorySnapshot = {
   generatedAt: string | null;
   window: AlertHistoryWindow;
   bucketSeconds: number;
+  sampleSeconds: number;
+  samplesPerBucket: number;
   buckets: AlertHistoryBucket[];
   datasources: Array<{ id: string; name: string }>;
   series: AlertHistorySeries[];
   errors: DatasourceError[];
 };
 
-export type AlertRuleHistory = {
-  states: AlertHistoryState[];
-  muted: Array<boolean | null>;
-  quietPercent: number | null;
-  coveragePercent: number;
-};
+export type AlertRuleHistory = StateHistoryTimeline;
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
@@ -204,9 +205,14 @@ export function buildAlertRulesPath(filters: {
   return `/alert-rules?${params.toString()}`;
 }
 
-export function buildAlertHistoryPath(window: AlertHistoryWindow): string {
+export function buildAlertHistoryPath(
+  window: AlertHistoryWindow,
+  scope?: { incidentId?: string },
+): string {
   if (!["24h", "7d", "30d"].includes(window)) throw new Error("Unsupported alert history window");
-  return `/alert-history?window=${window}`;
+  const params = new URLSearchParams({ window });
+  if (scope?.incidentId) params.set("incident_id", scope.incidentId);
+  return `/alert-history?${params.toString()}`;
 }
 
 export function normalizeAlertRules(payload: unknown): AlertRulesSnapshot {
@@ -333,7 +339,7 @@ export function normalizeAlertHistory(
         return [];
       return [{ startsAt, endsAt }];
     })
-    .slice(0, 60);
+    .slice(0, 40);
   const bucketCount = rawBuckets.length;
   const rawWindow = String(body.window);
   const window: AlertHistoryWindow = ["24h", "7d", "30d"].includes(rawWindow)
@@ -345,15 +351,19 @@ export function normalizeAlertHistory(
     if (!id) return [];
     return [{ id, name: String(item.name ?? "Prometheus") }];
   });
-  const validState = (value: unknown): AlertHistoryState =>
-    ["inactive", "pending", "firing", "unknown"].includes(String(value))
-      ? (value as AlertHistoryState)
-      : "unknown";
+  const samplesPerBucket = Math.max(
+    1,
+    Math.min(64, Math.trunc(number(body.samples_per_bucket, 1))),
+  );
+  const validState = (value: unknown): AlertHistoryState | null =>
+    ["inactive", "pending", "firing"].includes(String(value)) ? (value as AlertHistoryState) : null;
   return {
     dataState: dataState(body.data_state),
     generatedAt: validDateString(body.generated_at),
     window,
     bucketSeconds: Math.max(0, Math.trunc(number(body.bucket_seconds))),
+    sampleSeconds: Math.max(0, Math.trunc(number(body.sample_seconds))),
+    samplesPerBucket,
     buckets: rawBuckets,
     datasources,
     series: list(body.series).flatMap((value) => {
@@ -361,26 +371,40 @@ export function normalizeAlertHistory(
       const datasourceId = String(item.datasource_id ?? "").trim();
       const name = String(item.name ?? "").trim();
       if (!datasourceId || !name) return [];
-      const states = list(item.states).slice(0, bucketCount).map(validState);
-      while (states.length < bucketCount) states.push("unknown");
-      const muted = list(item.muted)
+      const activity = list(item.activity)
         .slice(0, bucketCount)
-        .map((entry) => (typeof entry === "boolean" ? entry : null));
-      while (muted.length < bucketCount) muted.push(null);
+        .map((period) => list(period).slice(0, samplesPerBucket).map(validState));
+      if (
+        activity.length !== bucketCount ||
+        activity.some(
+          (period) => period.length !== samplesPerBucket || period.some((state) => state === null),
+        )
+      )
+        return [];
       return [
         {
           datasourceId,
           datasourceName: String(item.datasource_name ?? "Prometheus"),
           name,
           category: nullableString(item.category),
-          states,
-          muted,
-          muteSource: item.mute_source === "alert_hub" ? "alert_hub" : null,
+          activity: activity as AlertHistoryState[][],
         } satisfies AlertHistorySeries,
       ];
     }),
     errors: list(body.errors).map(datasourceError),
   };
+}
+
+function alertHistoryTone(state: AlertHistoryState): StateHistoryTone {
+  if (state === "firing") return "critical";
+  if (state === "pending") return "warning";
+  return "healthy";
+}
+
+function emptyAlertActivity(snapshot: AlertHistorySnapshot): AlertHistoryState[][] {
+  return snapshot.buckets.map(() =>
+    Array.from({ length: snapshot.samplesPerBucket }, () => "inactive" as const),
+  );
 }
 
 export function historyForRule(
@@ -389,83 +413,46 @@ export function historyForRule(
 ): AlertRuleHistory | null {
   if (!snapshot || snapshot.buckets.length === 0) return null;
   const successfulDatasources = new Set(snapshot.datasources.map((item) => item.id));
-  const replicaHistories = rule.replicas.map((replica) => {
+  const datasourceIds = new Set(
+    rule.replicas
+      .map((replica) => replica.datasourceId)
+      .filter((datasourceId) => successfulDatasources.has(datasourceId)),
+  );
+  for (const series of snapshot.series) {
+    if (series.name === rule.name && series.category === rule.category)
+      datasourceIds.add(series.datasourceId);
+  }
+  const activities = [...datasourceIds].flatMap((datasourceId) => {
+    if (!successfulDatasources.has(datasourceId)) return [];
     const series = snapshot.series.find(
       (item) =>
-        item.datasourceId === replica.datasourceId &&
+        item.datasourceId === datasourceId &&
         item.name === rule.name &&
         item.category === rule.category,
     );
-    if (series)
-      return { datasourceId: replica.datasourceId, states: series.states, muted: series.muted };
-    const fallback: AlertHistoryState = successfulDatasources.has(replica.datasourceId)
-      ? "inactive"
-      : "unknown";
-    return {
-      datasourceId: replica.datasourceId,
-      states: snapshot.buckets.map(() => fallback),
-      muted: snapshot.buckets.map(() => null),
-    };
+    return [series?.activity ?? emptyAlertActivity(snapshot)];
   });
-  const representedDatasources = new Set(replicaHistories.map((item) => item.datasourceId));
-  for (const series of snapshot.series) {
-    if (
-      series.name !== rule.name ||
-      series.category !== rule.category ||
-      representedDatasources.has(series.datasourceId)
-    )
-      continue;
-    replicaHistories.push({
-      datasourceId: series.datasourceId,
-      states: series.states,
-      muted: series.muted,
-    });
-    representedDatasources.add(series.datasourceId);
-  }
-  for (const failure of snapshot.errors) {
-    if (representedDatasources.has(failure.datasourceId)) continue;
-    replicaHistories.push({
-      datasourceId: failure.datasourceId,
-      states: snapshot.buckets.map(() => "unknown" as const),
-      muted: snapshot.buckets.map(() => null),
-    });
-    representedDatasources.add(failure.datasourceId);
-  }
-  if (!replicaHistories.length) return null;
+  return mergeStateHistoryActivities(
+    activities.map((activity) => activity.map((period) => period.map(alertHistoryTone))),
+    snapshot.dataState === "partial" || snapshot.errors.length > 0,
+  );
+}
 
-  const states: AlertHistoryState[] = [];
-  const muted: Array<boolean | null> = [];
-  for (let index = 0; index < snapshot.buckets.length; index += 1) {
-    const replicaStates = replicaHistories.map((item) => item.states[index] ?? "unknown");
-    const state: AlertHistoryState = replicaStates.includes("firing")
-      ? "firing"
-      : replicaStates.includes("pending")
-        ? "pending"
-        : replicaStates.includes("unknown")
-          ? "unknown"
-          : "inactive";
-    states.push(state);
-    const activeMuteValues = replicaHistories.flatMap((item, replicaIndex) =>
-      ["firing", "pending"].includes(replicaStates[replicaIndex] ?? "unknown")
-        ? [item.muted[index] ?? null]
-        : [],
-    );
-    muted.push(
-      activeMuteValues.length > 0 && activeMuteValues.every((value) => value === true)
-        ? true
-        : activeMuteValues.some((value) => value === false)
-          ? false
-          : null,
-    );
-  }
-  const observed = states.filter((state) => state !== "unknown").length;
-  const quiet = states.filter((state) => state === "inactive").length;
-  return {
-    states,
-    muted,
-    quietPercent: observed > 0 ? (quiet / observed) * 100 : null,
-    coveragePercent: (observed / states.length) * 100,
-  };
+export function historyForScope(
+  snapshot: AlertHistorySnapshot | null,
+): StateHistoryTimeline | null {
+  if (
+    !snapshot ||
+    snapshot.buckets.length === 0 ||
+    snapshot.datasources.length === 0 ||
+    snapshot.series.length === 0
+  )
+    return null;
+  const activities = snapshot.series.map((series) => series.activity);
+  return mergeStateHistoryActivities(
+    activities.map((activity) => activity.map((period) => period.map(alertHistoryTone))),
+    snapshot.dataState === "partial" || snapshot.errors.length > 0,
+  );
 }
 
 export function mergeAvailability(snapshots: AvailabilitySnapshot[]): AvailabilityRow[] {

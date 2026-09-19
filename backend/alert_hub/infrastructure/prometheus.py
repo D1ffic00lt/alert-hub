@@ -59,13 +59,21 @@ class AlertHistoryWindowSpec:
     duration: timedelta
     bucket: timedelta
     bucket_count: int
+    sample: timedelta
+    samples_per_bucket: int
     prometheus_duration: str
 
 
 ALERT_HISTORY_WINDOWS: dict[AlertHistoryWindow, AlertHistoryWindowSpec] = {
-    "24h": AlertHistoryWindowSpec(timedelta(hours=24), timedelta(hours=1), 24, "1h"),
-    "7d": AlertHistoryWindowSpec(timedelta(days=7), timedelta(hours=6), 28, "6h"),
-    "30d": AlertHistoryWindowSpec(timedelta(days=30), timedelta(days=1), 30, "1d"),
+    "24h": AlertHistoryWindowSpec(
+        timedelta(hours=24), timedelta(minutes=36), 40, timedelta(minutes=9), 4, "540s"
+    ),
+    "7d": AlertHistoryWindowSpec(
+        timedelta(days=7), timedelta(hours=4, minutes=12), 40, timedelta(minutes=63), 4, "3780s"
+    ),
+    "30d": AlertHistoryWindowSpec(
+        timedelta(days=30), timedelta(hours=18), 40, timedelta(hours=4, minutes=30), 4, "16200s"
+    ),
 }
 
 REACHABILITY_PROMQL: dict[ReachabilityLabelMode, str] = {
@@ -144,15 +152,59 @@ def fixed_promql(
     return f"up{{job=~{json.dumps(regex)}}}"
 
 
-def alert_history_promql(window: AlertHistoryWindow) -> str:
-    """Return the fixed alert-state expression for one supported history window."""
+_PROMETHEUS_LABEL_NAME_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*\Z")
+_ALERT_HISTORY_RESERVED_MATCH_LABELS = frozenset({"__name__", "alertstate"})
+
+
+def _exact_label_matchers(match_labels: Mapping[str, str]) -> str:
+    matchers: list[str] = []
+    for name, value in sorted(match_labels.items()):
+        if not _PROMETHEUS_LABEL_NAME_RE.fullmatch(name):
+            raise ValueError(f"invalid Prometheus label name: {name!r}")
+        if name in _ALERT_HISTORY_RESERVED_MATCH_LABELS:
+            raise ValueError(f"reserved alert-history label matcher: {name!r}")
+        if not isinstance(value, str):
+            raise ValueError(f"Prometheus label value for {name!r} must be a string")
+        matchers.append(f"{name}={json.dumps(value)}")
+    return ",".join(matchers)
+
+
+def validate_alert_history_match_labels(match_labels: Mapping[str, str]) -> None:
+    """Reject labels that cannot be represented as safe exact PromQL matchers."""
+
+    _exact_label_matchers(match_labels)
+
+
+def alert_history_promql(
+    window: AlertHistoryWindow,
+    *,
+    match_labels: Mapping[str, str] | None = None,
+) -> str:
+    """Return the fixed alert-state expression for one high-resolution history sample."""
 
     lookback = ALERT_HISTORY_WINDOWS[window].prometheus_duration
-    return (
-        f'(max_over_time(ALERTS{{alertstate="firing",alertname!=""}}[{lookback}]) * 2) '
+    exact_matchers = _exact_label_matchers(match_labels) if match_labels is not None else ""
+    common_matchers = exact_matchers or 'alertname!=""'
+    expression = (
+        f'(max_over_time(ALERTS{{alertstate="firing",{common_matchers}}}[{lookback}]) * 2) '
         "or "
-        f'max_over_time(ALERTS{{alertstate="pending",alertname!=""}}[{lookback}])'
+        f'max_over_time(ALERTS{{alertstate="pending",{common_matchers}}}[{lookback}])'
     )
+    if match_labels is not None:
+        return expression
+    return f"max by (alertname, alert_category) ({expression})"
+
+
+def check_history_promql(
+    window: AlertHistoryWindow,
+    *,
+    check_id: str | None = None,
+) -> str:
+    """Return the fixed completed-check expression for one history sample."""
+
+    lookback = ALERT_HISTORY_WINDOWS[window].prometheus_duration
+    matcher = 'check_id!=""' if check_id is None else f"check_id={json.dumps(check_id)}"
+    return f"last_over_time(synthetic_check_status{{{matcher}}}[{lookback}])"
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +277,17 @@ class PrometheusClient(Protocol):
         window: AlertHistoryWindow,
         *,
         evaluated_at: datetime,
+        match_labels: Mapping[str, str] | None = None,
+    ) -> list[MatrixSeries]: ...
+
+    async def check_history(
+        self,
+        url: str,
+        credentials: Mapping[str, Any],
+        window: AlertHistoryWindow,
+        *,
+        evaluated_at: datetime,
+        check_id: str | None = None,
     ) -> list[MatrixSeries]: ...
 
 
@@ -688,19 +751,46 @@ class PrometheusHTTPClient:
         window: AlertHistoryWindow,
         *,
         evaluated_at: datetime,
+        match_labels: Mapping[str, str] | None = None,
     ) -> list[MatrixSeries]:
         spec = ALERT_HISTORY_WINDOWS[window]
         end = evaluated_at.astimezone(UTC)
-        start = end - spec.duration + spec.bucket
+        start = end - spec.duration + spec.sample
         payload = await self._request_json(
             url,
             credentials,
             "/api/v1/query_range",
             params={
-                "query": alert_history_promql(window),
+                "query": alert_history_promql(window, match_labels=match_labels),
                 "start": start.isoformat().replace("+00:00", "Z"),
                 "end": end.isoformat().replace("+00:00", "Z"),
-                "step": f"{int(spec.bucket.total_seconds())}s",
+                "step": f"{int(spec.sample.total_seconds())}s",
+                "timeout": f"{self.settings.prometheus_query_timeout_seconds:g}s",
+            },
+        )
+        return parse_matrix_response(payload, max_samples=self.settings.prometheus_max_samples)
+
+    async def check_history(
+        self,
+        url: str,
+        credentials: Mapping[str, Any],
+        window: AlertHistoryWindow,
+        *,
+        evaluated_at: datetime,
+        check_id: str | None = None,
+    ) -> list[MatrixSeries]:
+        spec = ALERT_HISTORY_WINDOWS[window]
+        end = evaluated_at.astimezone(UTC)
+        start = end - spec.duration + spec.sample
+        payload = await self._request_json(
+            url,
+            credentials,
+            "/api/v1/query_range",
+            params={
+                "query": check_history_promql(window, check_id=check_id),
+                "start": start.isoformat().replace("+00:00", "Z"),
+                "end": end.isoformat().replace("+00:00", "Z"),
+                "step": f"{int(spec.sample.total_seconds())}s",
                 "timeout": f"{self.settings.prometheus_query_timeout_seconds:g}s",
             },
         )
