@@ -1,3 +1,5 @@
+import { FloatingChartTooltip } from "../chart-tooltip";
+import { useChartTooltip } from "../use-chart-tooltip";
 import {
   stateHistoryRuns,
   type StateHistoryBucket,
@@ -68,6 +70,7 @@ export function StateHistoryPills({
   compact?: boolean;
   className?: string;
 }) {
+  const { activeTooltip: activePeriod, hideTooltip, showTooltip, tooltipId } = useChartTooltip();
   const samples = timeline?.periods.flat() ?? [];
   const counts = samples.reduce<Record<StateHistoryTone, number>>(
     (result, tone) => ({ ...result, [tone]: result[tone] + 1 }),
@@ -85,29 +88,54 @@ export function StateHistoryPills({
     : tx(language, `История ${subject} недоступна`, `${subject} history is unavailable`);
 
   const pills = timeline ? (
-    <div className="state-history__pills" role="img" aria-label={ariaLabel}>
-      {timeline.periods.map((period, index) => {
-        const bucket = buckets[index];
-        const title = bucket
-          ? `${formatBucket(language, bucket)} · ${periodSummary(period, labels)}`
-          : periodSummary(period, labels);
-        return (
-          <span
-            className="state-history__pill"
-            title={title}
-            aria-hidden="true"
-            key={bucket?.startsAt ?? index}
-          >
-            {stateHistoryRuns(period).map((run, runIndex) => (
-              <i
-                className={`state-history__slice state-history__slice--${run.tone}`}
-                style={{ flexGrow: run.units }}
-                key={`${run.tone}-${runIndex}`}
-              />
-            ))}
-          </span>
-        );
-      })}
+    <div className="state-history__pills-wrap">
+      <div className="state-history__pills" role={compact ? "img" : "list"} aria-label={ariaLabel}>
+        {timeline.periods.map((period, index) => {
+          const bucket = buckets[index];
+          const title = bucket
+            ? `${formatBucket(language, bucket)} · ${periodSummary(period, labels)}`
+            : periodSummary(period, labels);
+          const active = activePeriod?.index === index;
+          return (
+            <span
+              className={`state-history__pill${active ? " state-history__pill--active" : ""}`}
+              role={compact ? undefined : "listitem"}
+              aria-label={compact ? undefined : title}
+              aria-hidden={compact || undefined}
+              aria-describedby={!compact && active ? tooltipId : undefined}
+              tabIndex={compact ? undefined : 0}
+              key={bucket?.startsAt ?? index}
+              onPointerEnter={(event) => showTooltip(index, event.currentTarget)}
+              onPointerLeave={(event) => {
+                if (document.activeElement !== event.currentTarget) hideTooltip(index);
+              }}
+              onFocus={(event) => showTooltip(index, event.currentTarget)}
+              onBlur={() => hideTooltip(index)}
+            >
+              {stateHistoryRuns(period).map((run, runIndex) => (
+                <i
+                  className={`state-history__slice state-history__slice--${run.tone}`}
+                  style={{ flexGrow: run.units }}
+                  aria-hidden="true"
+                  key={`${run.tone}-${runIndex}`}
+                />
+              ))}
+            </span>
+          );
+        })}
+      </div>
+      {activePeriod ? (
+        <FloatingChartTooltip
+          id={tooltipId}
+          position={activePeriod.position}
+          hiddenFromAssistiveTechnology={compact}
+        >
+          {buckets[activePeriod.index] ? (
+            <strong>{formatBucket(language, buckets[activePeriod.index])}</strong>
+          ) : null}
+          <span>{periodSummary(timeline.periods[activePeriod.index] ?? [], labels)}</span>
+        </FloatingChartTooltip>
+      ) : null}
     </div>
   ) : null;
 
@@ -152,17 +180,6 @@ export function StateHistoryPills({
       {pills ? (
         <>
           {pills}
-          <ul className="sr-only">
-            {timeline?.periods.map((period, index) => {
-              const bucket = buckets[index];
-              if (!bucket) return null;
-              return (
-                <li key={`accessible-${bucket.startsAt}`}>
-                  {formatBucket(language, bucket)}: {periodSummary(period, labels)}.
-                </li>
-              );
-            })}
-          </ul>
           <footer className="state-history__footer">
             <ul className="state-history__legend" aria-label={tx(language, "Легенда", "Legend")}>
               {(["healthy", "warning", "critical"] as StateHistoryTone[]).map((tone) => (

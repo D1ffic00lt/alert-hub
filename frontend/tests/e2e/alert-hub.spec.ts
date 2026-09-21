@@ -25,6 +25,24 @@ async function fulfill(route: Route, body: unknown, status = 200) {
   });
 }
 
+async function expectTooltipInsideViewport(page: Page) {
+  const bounds = await page.getByRole("tooltip").evaluate((tooltip) => {
+    const rect = tooltip.getBoundingClientRect();
+    return {
+      bottom: rect.bottom,
+      height: window.innerHeight,
+      left: rect.left,
+      right: rect.right,
+      top: rect.top,
+      width: window.innerWidth,
+    };
+  });
+  expect(bounds.left).toBeGreaterThanOrEqual(0);
+  expect(bounds.right).toBeLessThanOrEqual(bounds.width);
+  expect(bounds.top).toBeGreaterThanOrEqual(0);
+  expect(bounds.bottom).toBeLessThanOrEqual(bounds.height);
+}
+
 async function installClientFailoverRuntime(page: Page, primary: string, reserve: string) {
   await page.route("**/runtime-config.js", (route) =>
     route.fulfill({
@@ -2653,6 +2671,9 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   await expect(chronologicalSlices.nth(0)).toHaveClass(/state-history__slice--critical/);
   await expect(chronologicalSlices.nth(1)).toHaveClass(/state-history__slice--warning/);
   await expect(chronologicalSlices.nth(2)).toHaveClass(/state-history__slice--healthy/);
+  await expect(chronologicalSlices.nth(1)).not.toHaveCSS("transform", "none");
+  await mixedPill.hover();
+  await expect(page.getByRole("tooltip")).toContainText("%");
   const pillGeometry = await pills.first().evaluate((pill) => {
     const bounds = pill.getBoundingClientRect();
     const style = getComputedStyle(pill);
@@ -2713,6 +2734,9 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
         theme,
       );
       await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      await history.locator(".state-history__pill").first().hover();
+      await expect(page.getByRole("tooltip")).toBeVisible();
+      await expectTooltipInsideViewport(page);
       const overflow = await page.evaluate(() => ({
         clientWidth: document.documentElement.clientWidth,
         scrollWidth: document.documentElement.scrollWidth,
@@ -3882,6 +3906,60 @@ test("demo shell stays aligned without horizontal overflow across viewports", as
   });
   await expect(page.locator(".sidebar")).toBeHidden();
   await expect(page.locator(".mobile-nav")).toBeVisible();
+});
+
+test("demo charts reveal verified values on hover and keyboard focus", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "EventSource", { configurable: true, value: undefined });
+    window.localStorage.setItem("alert-hub-ui-language", "ru");
+  });
+  await page.route("**/api/v1/auth/refresh", (route) => fulfill(route, {}, 401));
+  await page.route("**/api/v1/auth/bootstrap/status", (route) =>
+    fulfill(route, { bootstrap_required: false }),
+  );
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Открыть демо", exact: true }).click();
+
+  const incidentChart = page
+    .locator(".statistics-chart-panel")
+    .filter({ has: page.getByRole("heading", { name: "Динамика инцидентов" }) });
+  await incidentChart.locator(".statistics-chart__datum").first().hover();
+  await expect(page.getByRole("tooltip")).toContainText("Начались");
+  await expect(page.getByRole("tooltip")).toContainText("Разрешены");
+
+  const deliveryChart = page
+    .locator(".statistics-chart-panel")
+    .filter({ has: page.getByRole("heading", { name: "Доставка уведомлений" }) });
+  await deliveryChart.locator(".statistics-chart__datum").nth(1).focus();
+  await expect(page.getByRole("tooltip")).toContainText("Успешно");
+  await expect(page.getByRole("tooltip")).toContainText("Ошибки");
+  await expect(page.locator(".sparkline i").first()).toHaveAttribute("title", /Активны сейчас/);
+
+  for (const viewport of [
+    { width: 1280, height: 900 },
+    { width: 820, height: 900 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    for (const theme of ["light", "dark"] as const) {
+      await page.evaluate(
+        (value) => document.documentElement.setAttribute("data-theme", value),
+        theme,
+      );
+      await incidentChart.locator(".statistics-chart__datum").nth(2).hover();
+      await expect(page.getByRole("tooltip")).toContainText("Начались");
+      await expectTooltipInsideViewport(page);
+      await deliveryChart.locator(".statistics-chart__datum").nth(2).hover();
+      await expect(page.getByRole("tooltip")).toContainText("Успешно");
+      await expectTooltipInsideViewport(page);
+      const overflow = await page.evaluate(() => ({
+        clientWidth: document.documentElement.clientWidth,
+        scrollWidth: document.documentElement.scrollWidth,
+      }));
+      expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
+    }
+  }
 });
 
 test("demo mode provides a populated Checks inventory and incident links", async ({ page }) => {

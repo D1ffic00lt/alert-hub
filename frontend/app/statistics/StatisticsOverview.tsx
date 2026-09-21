@@ -2,6 +2,8 @@ import { useId } from "react";
 
 import "./statistics.css";
 
+import { FloatingChartTooltip } from "../chart-tooltip";
+import { useChartTooltip } from "../use-chart-tooltip";
 import { formatStatisticsDuration } from "./format";
 import {
   isStatisticsSnapshotEmpty,
@@ -281,6 +283,7 @@ function IncidentTrendChart({
 }) {
   const titleId = useId();
   const descriptionId = useId();
+  const { activeTooltip: activePoint, hideTooltip, showTooltip, tooltipId } = useChartTooltip();
   if (points.length === 0) {
     return (
       <article className="statistics-panel statistics-chart-panel">
@@ -339,7 +342,7 @@ function IncidentTrendChart({
         <svg
           className="statistics-chart"
           viewBox={`0 0 ${width} ${height}`}
-          role="img"
+          role="group"
           aria-labelledby={`${titleId} ${descriptionId}`}
         >
           {[0, 0.5, 1].map((ratio) => {
@@ -368,30 +371,78 @@ function IncidentTrendChart({
             className="statistics-chart__line statistics-chart__line--resolved"
             points={line("incidentsResolved")}
           />
-          {points.map((point, index) => (
-            <g key={point.startsAt}>
-              <circle
-                className="statistics-chart__point statistics-chart__point--started"
-                cx={x(index)}
-                cy={y(point.incidentsStarted)}
-                r="3.2"
-              />
-              <rect
-                className="statistics-chart__point statistics-chart__point--resolved"
-                x={x(index) - 3}
-                y={y(point.incidentsResolved) - 3}
-                width="6"
-                height="6"
-                transform={`rotate(45 ${x(index)} ${y(point.incidentsResolved)})`}
-              />
-              {showBucketAxisLabel(points, index, labelStride, language, bucketSeconds) && (
-                <text className="statistics-chart__label" x={x(index)} y={height - 13}>
-                  {formatBucketAxisLabel(language, point.startsAt, bucketSeconds)}
-                </text>
-              )}
-            </g>
-          ))}
+          {points.map((point, index) => {
+            const previousX = index === 0 ? inset.left : (x(index - 1) + x(index)) / 2;
+            const nextX =
+              index === points.length - 1 ? width - inset.right : (x(index) + x(index + 1)) / 2;
+            const label = `${formatBucketLabel(language, point.startsAt, bucketSeconds)}: ${tx(language, "начались", "started")} ${point.incidentsStarted}, ${tx(language, "разрешены", "resolved")} ${point.incidentsResolved}`;
+            const active = activePoint?.index === index;
+            return (
+              <g
+                className="statistics-chart__datum"
+                key={point.startsAt}
+                role="img"
+                tabIndex={0}
+                aria-label={label}
+                aria-describedby={active ? tooltipId : undefined}
+                onPointerEnter={(event) => showTooltip(index, event.currentTarget)}
+                onPointerLeave={(event) => {
+                  if (document.activeElement !== event.currentTarget) hideTooltip(index);
+                }}
+                onFocus={(event) => showTooltip(index, event.currentTarget)}
+                onBlur={() => hideTooltip(index)}
+              >
+                <rect
+                  className="statistics-chart__hit-area"
+                  x={previousX}
+                  y={inset.top}
+                  width={Math.max(1, nextX - previousX)}
+                  height={plotHeight}
+                />
+                <circle
+                  className="statistics-chart__point statistics-chart__point--started"
+                  cx={x(index)}
+                  cy={y(point.incidentsStarted)}
+                  r="3.2"
+                />
+                <rect
+                  className="statistics-chart__point statistics-chart__point--resolved"
+                  x={x(index) - 3}
+                  y={y(point.incidentsResolved) - 3}
+                  width="6"
+                  height="6"
+                  transform={`rotate(45 ${x(index)} ${y(point.incidentsResolved)})`}
+                />
+                {showBucketAxisLabel(points, index, labelStride, language, bucketSeconds) && (
+                  <text className="statistics-chart__label" x={x(index)} y={height - 13}>
+                    {formatBucketAxisLabel(language, point.startsAt, bucketSeconds)}
+                  </text>
+                )}
+              </g>
+            );
+          })}
         </svg>
+        {activePoint ? (
+          <FloatingChartTooltip id={tooltipId} position={activePoint.position}>
+            <strong>
+              {formatBucketLabel(
+                language,
+                points[activePoint.index]?.startsAt ?? "",
+                bucketSeconds,
+              )}
+            </strong>
+            <span className="statistics-chart-tooltip__row">
+              <i className="statistics-chart-tooltip__mark statistics-chart-tooltip__mark--started" />
+              {tx(language, "Начались", "Started")}
+              <b>{formatNumber(language, points[activePoint.index]?.incidentsStarted ?? 0)}</b>
+            </span>
+            <span className="statistics-chart-tooltip__row">
+              <i className="statistics-chart-tooltip__mark statistics-chart-tooltip__mark--resolved" />
+              {tx(language, "Разрешены", "Resolved")}
+              <b>{formatNumber(language, points[activePoint.index]?.incidentsResolved ?? 0)}</b>
+            </span>
+          </FloatingChartTooltip>
+        ) : null}
       </div>
       <table className="sr-only">
         <caption>{tx(language, "Данные динамики инцидентов", "Incident trend data")}</caption>
@@ -428,6 +479,7 @@ function DeliveryTrendChart({
   const titleId = useId();
   const descriptionId = useId();
   const failurePatternId = `${useId().replaceAll(":", "")}-delivery-failure`;
+  const { activeTooltip: activePoint, hideTooltip, showTooltip, tooltipId } = useChartTooltip();
   if (points.length === 0) {
     return (
       <article className="statistics-panel statistics-chart-panel">
@@ -479,7 +531,7 @@ function DeliveryTrendChart({
         <svg
           className="statistics-chart"
           viewBox={`0 0 ${width} ${height}`}
-          role="img"
+          role="group"
           aria-labelledby={`${titleId} ${descriptionId}`}
         >
           <defs>
@@ -518,14 +570,30 @@ function DeliveryTrendChart({
             const failedHeight = (point.deliveriesFailed / maximum) * plotHeight;
             const left = inset.left + index * slot + (slot - barWidth) / 2;
             const bottom = inset.top + plotHeight;
+            const label = `${formatBucketLabel(language, point.startsAt, bucketSeconds)}: ${point.deliveriesSucceeded} ${tx(language, "успешно", "succeeded")}, ${point.deliveriesFailed} ${tx(language, "ошибок", "failed")}, ${total} ${tx(language, "всего", "total")}`;
+            const active = activePoint?.index === index;
             return (
-              <g key={point.startsAt}>
-                <title>
-                  {formatBucketLabel(language, point.startsAt, bucketSeconds)}:{" "}
-                  {point.deliveriesSucceeded} {tx(language, "успешно", "succeeded")},{" "}
-                  {point.deliveriesFailed} {tx(language, "ошибок", "failed")}, {total}{" "}
-                  {tx(language, "всего", "total")}
-                </title>
+              <g
+                className="statistics-chart__datum"
+                key={point.startsAt}
+                role="img"
+                tabIndex={0}
+                aria-label={label}
+                aria-describedby={active ? tooltipId : undefined}
+                onPointerEnter={(event) => showTooltip(index, event.currentTarget)}
+                onPointerLeave={(event) => {
+                  if (document.activeElement !== event.currentTarget) hideTooltip(index);
+                }}
+                onFocus={(event) => showTooltip(index, event.currentTarget)}
+                onBlur={() => hideTooltip(index)}
+              >
+                <rect
+                  className="statistics-chart__hit-area"
+                  x={inset.left + index * slot}
+                  y={inset.top}
+                  width={slot}
+                  height={plotHeight}
+                />
                 <rect
                   className="statistics-chart__bar statistics-chart__bar--succeeded"
                   x={left}
@@ -552,6 +620,27 @@ function DeliveryTrendChart({
             );
           })}
         </svg>
+        {activePoint ? (
+          <FloatingChartTooltip id={tooltipId} position={activePoint.position}>
+            <strong>
+              {formatBucketLabel(
+                language,
+                points[activePoint.index]?.startsAt ?? "",
+                bucketSeconds,
+              )}
+            </strong>
+            <span className="statistics-chart-tooltip__row">
+              <i className="statistics-chart-tooltip__mark statistics-chart-tooltip__mark--succeeded" />
+              {tx(language, "Успешно", "Succeeded")}
+              <b>{formatNumber(language, points[activePoint.index]?.deliveriesSucceeded ?? 0)}</b>
+            </span>
+            <span className="statistics-chart-tooltip__row">
+              <i className="statistics-chart-tooltip__mark statistics-chart-tooltip__mark--failed" />
+              {tx(language, "Ошибки", "Failed")}
+              <b>{formatNumber(language, points[activePoint.index]?.deliveriesFailed ?? 0)}</b>
+            </span>
+          </FloatingChartTooltip>
+        ) : null}
       </div>
       <table className="sr-only">
         <caption>
