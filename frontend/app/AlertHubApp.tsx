@@ -4755,9 +4755,16 @@ function KpiCard({
       <div className="kpi-card__bottom">
         <small>{note}</small>
         {spark.length > 0 && (
-          <span className="sparkline" aria-hidden="true">
+          <span className="sparkline" role="group" aria-label={`${label}: ${spark.join(", ")}`}>
             {spark.map((point, index) => (
-              <i key={index} style={{ height: `${Math.max(14, (point / max) * 100)}%` }} />
+              <i
+                key={index}
+                role="img"
+                tabIndex={0}
+                title={`${label} · ${index + 1}: ${point}`}
+                aria-label={`${label} · ${index + 1}: ${point}`}
+                style={{ height: `${Math.max(14, (point / max) * 100)}%` }}
+              />
             ))}
           </span>
         )}
