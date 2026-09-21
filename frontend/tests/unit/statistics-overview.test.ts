@@ -41,4 +41,20 @@ describe("StatisticsOverview", () => {
     expect(markup).toContain("7 разрешений за период");
     expect(markup).toContain("среднее для начавшихся");
   });
+
+  test("makes every timeline point inspectable by pointer or keyboard", () => {
+    const markup = renderToStaticMarkup(
+      createElement(StatisticsOverview, {
+        snapshot: DEMO_STATISTICS_SNAPSHOT,
+        language: "en",
+      }),
+    );
+
+    expect(markup.match(/class="statistics-chart__datum"/g)).toHaveLength(
+      DEMO_STATISTICS_SNAPSHOT.timeline.length * 2,
+    );
+    expect(markup).toContain('tabindex="0"');
+    expect(markup).toContain("started 1, resolved 0");
+    expect(markup).toContain("8 succeeded, 0 failed, 8 total");
+  });
 });

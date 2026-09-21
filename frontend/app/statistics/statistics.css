@@ -306,6 +306,22 @@
   fill: var(--statistics-success);
 }
 
+.statistics-chart__datum {
+  cursor: crosshair;
+  outline: none;
+}
+
+.statistics-chart__datum:focus-visible .statistics-chart__hit-area {
+  stroke: var(--mint);
+  stroke-width: 2;
+}
+
+.statistics-chart__hit-area {
+  fill: transparent;
+  pointer-events: all;
+  vector-effect: non-scaling-stroke;
+}
+
 .statistics-chart__bar--succeeded {
   fill: var(--statistics-success);
 }
@@ -323,6 +339,35 @@
 .statistics-chart__failure-hatch {
   stroke: var(--surface);
   stroke-width: 2;
+}
+
+.statistics-chart-tooltip__row {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.statistics-chart-tooltip__row b {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.statistics-chart-tooltip__mark {
+  width: 7px;
+  height: 7px;
+  background: var(--blue);
+  border-radius: 50%;
+}
+
+.statistics-chart-tooltip__mark--resolved,
+.statistics-chart-tooltip__mark--succeeded {
+  background: var(--statistics-success);
+}
+
+.statistics-chart-tooltip__mark--failed {
+  background: var(--red);
 }
 
 .statistics-chart__legend {
