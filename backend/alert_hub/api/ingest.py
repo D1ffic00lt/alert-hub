@@ -10,7 +10,10 @@ from sqlalchemy.orm import Session
 from alert_hub.api.dependencies import get_db, get_settings
 from alert_hub.application.auth import add_audit
 from alert_hub.application.heartbeats import record_heartbeat_observation
-from alert_hub.application.incidents import ingest_normalized_events
+from alert_hub.application.incidents import (
+    ingest_existing_resolutions,
+    ingest_normalized_events,
+)
 from alert_hub.domain.adapters import AdapterError, normalize_alertmanager, normalize_generic
 from alert_hub.domain.events import utc_now
 from alert_hub.infrastructure.db.models import Incident, Source
@@ -113,6 +116,30 @@ async def ingest_alertmanager(
     incidents, duplicates = ingest_normalized_events(db, source, events, settings)
     db.commit()
     return _result(incidents, duplicates)
+
+
+@router.post("/alertmanager/{source_id}/recoveries")
+async def ingest_alertmanager_recoveries(
+    source_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    source = authenticated_source(request, db, settings, source_id, "alertmanager")
+    payload = await _json_body(request, settings, source.kind)
+    try:
+        events = normalize_alertmanager(payload)
+    except AdapterError as exc:
+        INGEST_ERRORS.labels(source_kind=source.kind, reason="adapter").inc()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    incidents, duplicates, ignored = ingest_existing_resolutions(
+        db,
+        source,
+        events,
+        settings,
+    )
+    db.commit()
+    return {**_result(incidents, duplicates), "ignored": ignored}
 
 
 @router.post("/events/{source_id}")

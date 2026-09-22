@@ -42,7 +42,10 @@ Alerts catalog; the regional matrix and Checks remain their own screens.
 
 ```mermaid
 flowchart LR
-    AM["Existing Alertmanager"] -->|"HTTPS webhook"| PX["Existing public reverse proxy"]
+    PROM["Existing Prometheus"] --> AM["Primary Alertmanager\nwith inhibition"]
+    PROM --> RAM["Recovery Alertmanager\nwithout inhibition"]
+    AM -->|"HTTPS webhook"| PX["Existing public reverse proxy"]
+    RAM -->|"HTTPS recovery-only webhook"| PX
     UI["Installed browser PWA"] <-->|"HTTPS / API / SSE"| PX
     PX -->|"WEB_IP:8080\nmanaged edge"| WEB["Alert Hub web container"]
     WEB -->|"private bridge :8080"| API["Alert Hub API container"]

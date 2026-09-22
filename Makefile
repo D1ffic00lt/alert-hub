@@ -9,6 +9,7 @@ BASH_SCRIPTS := \
 	deploy/scripts/check-no-secrets.sh \
 	deploy/scripts/test-backup-tool.sh \
 	deploy/scripts/test-deploy-vapid-preflight.sh \
+	deploy/scripts/ci-alertmanager-recovery-smoke.sh \
 	deploy/scripts/ci-container-smoke.sh \
 	deploy/scripts/ci-image-matrix-smoke.sh \
 	deploy/scripts/ci-three-node-failure.sh \
@@ -182,6 +183,7 @@ operations-check:
 container-smoke:
 	docker build --tag alert-hub-api:ci --file backend/Dockerfile backend
 	docker build --tag alert-hub-web:ci --file frontend/Dockerfile frontend
+	bash deploy/scripts/ci-alertmanager-recovery-smoke.sh alert-hub-api:ci
 	bash deploy/scripts/ci-image-matrix-smoke.sh alert-hub-api:ci alert-hub-web:ci
 	bash deploy/scripts/ci-three-node-failure.sh alert-hub-api:ci
 

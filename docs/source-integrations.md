@@ -100,7 +100,13 @@ inhibit_rules:
 Inhibition alone does not cover the complete correlated-alert lifecycle. A
 child can finish the root route's initial wait before its aggregate starts
 firing, and a still-firing child is eligible for delivery as soon as its
-aggregate resolves. Protect both sides of that window:
+aggregate resolves. More importantly, Alertmanager 0.32.1 applies inhibition
+before notification deduplication. If a child was delivered before its
+aggregate existed and later resolves while inhibited, the primary receiver may
+never receive that recovery. This is the upstream
+[inhibited recovery gap](https://github.com/prometheus/alertmanager/issues/5247).
+
+Protect activation and recovery independently:
 
 1. Give every route that matches an inhibition target a child-specific
    `group_wait`. With a 30-second aggregate activation lag and a 30-second rule
@@ -151,7 +157,57 @@ aggregate resolves. Protect both sides of that window:
    it does not change the synthetic quorum or the child expressions. Size the
    hold above the longest expected child cleanup lag plus one evaluation
    interval. A child that remains broken beyond the bounded hold becomes
-   independently notifiable instead of being hidden forever.
+   independently notifiable instead of being hidden forever. The hold prevents
+   a recovery-time child burst; it does not fix the inhibited recovery gap.
+
+3. Run one small recovery-shadow Alertmanager beside each primary
+   Alertmanager. Prometheus must send the same rule stream to both instances.
+   The shadow has no inhibition rules and sends its webhook stream to the
+   recovery-only URL on the same node-local Alert Hub destination used by the
+   primary:
+
+   ```yaml
+   # Prometheus fragment. Preserve the installation's TLS/auth settings.
+   alerting:
+     alertmanagers:
+       - static_configs:
+           - targets: ["primary-alertmanager:9093"]
+       - static_configs:
+           - targets: ["recovery-alertmanager:9093"]
+   ```
+
+   ```yaml
+   # recovery-alertmanager.yml: intentionally no inhibit_rules.
+   route:
+     receiver: alert-hub-recoveries
+     group_by: ["..."]
+     group_wait: 0s
+     group_interval: 30s
+     repeat_interval: 4h
+
+   receivers:
+     - name: alert-hub-recoveries
+       webhook_configs:
+         - url: https://alerts.example.com/ingest/v1/alertmanager/SOURCE_ID/recoveries
+           send_resolved: true
+           http_config:
+             authorization:
+               type: Bearer
+               credentials: SOURCE_TOKEN
+   ```
+
+   The recovery ingress authenticates with the same source token. It returns
+   success while ignoring every firing alert and every resolution for which
+   that Alert Hub node has no incident. It accepts only resolutions for an
+   existing open, acknowledged, or silenced incident. Retries are idempotent.
+   Consequently, a child suppressed for its entire lifetime does not appear in
+   Alert Hub, while a child delivered before inhibition cannot remain open
+   forever. Point both receivers at the same node-local Alert Hub destination;
+   the intentional orphan filter is not a cross-node ordering mechanism.
+
+   Keep the shadow private, give it a durable notification-log volume, and
+   monitor it like the primary. It is not an HA peer of the primary and must not
+   share the primary's inhibition configuration.
 
 Keep the detailed child rules loaded. Inhibition affects notification delivery,
 not the Prometheus alert series: inhibited children must remain queryable with
@@ -159,29 +215,38 @@ not the Prometheus alert series: inhibited children must remain queryable with
 child-route buffer before reloading the Prometheus aggregate hold, then exercise
 these cases against a non-production receiver:
 
-| Exercise                                                                      | Expected webhook result                                                   |
-| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| Child fires about 30 seconds before its aggregate                             | Aggregate only; the child is inhibited before 75 seconds elapse           |
-| Aggregate condition clears while a child remains firing for up to two minutes | No recovery-time child burst; the aggregate remains firing during cleanup |
-| One or two isolated child alerts fire without the aggregate                   | Each child is delivered after the 75-second wait                          |
-| A child is inspected while inhibited                                          | Its firing series remains in Prometheus and Grafana                       |
+| Exercise                                                                      | Expected webhook result                                                        |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Child fires about 30 seconds before its aggregate                             | Aggregate only; the child is inhibited before 75 seconds elapse                |
+| Aggregate condition clears while a child remains firing for up to two minutes | No recovery-time child burst; the aggregate remains firing during cleanup      |
+| One or two isolated child alerts fire without the aggregate                   | Each child is delivered after the 75-second wait                               |
+| Delivered child resolves after its aggregate starts inhibiting it             | Primary omits recovery; recovery shadow closes the existing Alert Hub incident |
+| Child is inhibited for its entire firing lifetime                             | Recovery ingress ignores both shadow firing and orphan resolution              |
+| A child is inspected while inhibited                                          | Its firing series remains in Prometheus and Grafana                            |
 
 Keep `send_resolved: true` when Alert Hub is the incident state owner. Turning it
 off hides recovery from Alert Hub rather than merely silencing recovery pushes.
-Use inhibition at Alertmanager and notification routing in Alert Hub to control
-fan-out without leaving incidents permanently open.
+Use inhibition at the primary Alertmanager, the uninhibited recovery shadow,
+and notification routing in Alert Hub together to control fan-out without
+leaving incidents permanently open.
 
 Route only the intended alert tree, then validate both configurations before
 reload:
 
 ```bash
 amtool check-config /path/to/alertmanager.yml
+amtool check-config /path/to/recovery-alertmanager.yml
 promtool check rules /path/to/alert-rules.yml
 ```
 
 Alertmanager groups alerts in `alerts[]`; each item is normalized separately. The adapter prefers Alertmanager's `fingerprint`. If absent, it generates a stable key from sorted labels. `summary`/`title` becomes the title, `description`/`message` becomes the description, and unknown labels/annotations remain available in the incident.
 
-During verification, send one firing alert, repeat the identical webhook, then send its resolved form. Confirm a single incident, a deduplicated repeat, and a firing→resolved timeline. Do not route all production alerts until this passes.
+During verification, exercise the exact lifecycle rather than only validating
+durations: deliver a child through the primary, start its aggregate, resolve
+the child while the primary reports it inhibited, and confirm that the
+recovery shadow produces a firing→resolved Alert Hub timeline. Also prove that
+an inhibited child which was never delivered creates no incident. Do not route
+all production alerts until both cases pass.
 
 ## Generic JSON
 

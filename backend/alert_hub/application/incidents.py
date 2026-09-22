@@ -213,6 +213,62 @@ def ingest_normalized_events(
     return affected, duplicates
 
 
+def ingest_existing_resolutions(
+    db: Session,
+    source: Source,
+    events: Iterable[NormalizedEvent],
+    settings: Settings,
+) -> tuple[list[Incident], int, int]:
+    """Apply recoveries only to incidents already known on this node.
+
+    A secondary, uninhibited Alertmanager can send its full webhook stream to
+    this path. Firing alerts and resolutions for children that the primary
+    Alertmanager never delivered are deliberately ignored, so the secondary
+    stream cannot recreate the fan-out that inhibition is intended to remove.
+    """
+
+    affected: list[Incident] = []
+    duplicates = 0
+    ignored = 0
+    for event in events:
+        if event.status != "resolved":
+            ignored += 1
+            continue
+
+        event_key = event.event_key(source.id)
+        existing_event = db.scalar(
+            select(IncidentEvent).where(IncidentEvent.event_key == event_key)
+        )
+        if existing_event is not None:
+            duplicates += 1
+            incident = db.get(Incident, existing_event.incident_id)
+            if incident is not None:
+                affected.append(incident)
+            continue
+
+        fingerprint = incident_fingerprint(source.id, event.dedup_key)
+        incident = db.scalar(
+            select(Incident).where(
+                Incident.source_id == source.id,
+                Incident.fingerprint == fingerprint,
+            )
+        )
+        if incident is None or incident.status == "resolved":
+            ignored += 1
+            continue
+
+        ingested, event_duplicates = ingest_normalized_events(
+            db,
+            source,
+            [event],
+            settings,
+        )
+        affected.extend(ingested)
+        duplicates += event_duplicates
+
+    return affected, duplicates, ignored
+
+
 def append_user_event(
     db: Session,
     incident: Incident,
