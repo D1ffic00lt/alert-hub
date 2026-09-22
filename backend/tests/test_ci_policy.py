@@ -124,39 +124,36 @@ def test_alertmanager_integration_documents_outage_inhibition() -> None:
     assert all(rule["keep_firing_for"] == "5m" for rule in aggregate_rules)
     assert 'ALERTS{alertstate="firing"}' in guide
     assert "Keep `send_resolved: true`" in guide
+    assert "/ingest/v1/alertmanager/SOURCE_ID/recoveries" in guide
+    assert "prometheus/alertmanager/issues/5247" in guide
 
 
-def test_documented_inhibition_timing_covers_activation_and_recovery_windows() -> None:
-    guide = (REPOSITORY / "docs" / "source-integrations.md").read_text(encoding="utf-8")
-    child_wait_match = re.search(r"use a `(\d+)s` child `group_wait`", guide)
-    aggregate_hold_match = re.search(r"Add a `(\d+)m` `keep_firing_for`", guide)
+def test_ci_runs_real_alertmanager_inhibited_recovery_lifecycle() -> None:
+    script_path = REPOSITORY / "deploy/scripts/ci-alertmanager-recovery-smoke.sh"
+    script = script_path.read_text(encoding="utf-8")
+    ci_run = _job_run(_workflow("ci.yml")["jobs"]["container-integration"])
+    release_run = _job_run(_workflow("release.yml")["jobs"]["release"])
 
-    assert child_wait_match is not None
-    assert aggregate_hold_match is not None
-    child_wait_seconds = int(child_wait_match.group(1))
-    aggregate_hold_seconds = int(aggregate_hold_match.group(1)) * 60
-
-    child_fired_at = 0
-    evaluation_interval_seconds = 30
-    delivery_margin_seconds = 15
-    aggregate_fired_at = 30
-    aggregate_condition_cleared_at = 10 * 60
-    child_resolved_at = aggregate_condition_cleared_at + 2 * 60
-
-    initial_child_dispatch_at = child_fired_at + child_wait_seconds
-    aggregate_resolved_at = aggregate_condition_cleared_at + aggregate_hold_seconds
-
-    assert child_wait_seconds >= (
-        aggregate_fired_at + evaluation_interval_seconds + delivery_margin_seconds
+    assert "quay.io/prometheus/alertmanager:v0.32.1@sha256:" in script
+    assert 'payload["versionInfo"]["version"] == "0.32.1"' in script
+    assert 'status.get("state") == "suppressed"' in script
+    assert 'status.get("inhibitedBy")' in script
+    assert script.index("child-firing.json") < script.index("aggregate-firing.json")
+    lifecycle_start = script.index("# Alertmanager 0.32.1 drops this recovery")
+    primary_resolution = script.index(
+        "http://primary-alertmanager:9093/api/v2/alerts",
+        lifecycle_start,
     )
-    assert aggregate_fired_at < initial_child_dispatch_at
-    assert aggregate_hold_seconds >= (
-        child_resolved_at - aggregate_condition_cleared_at + evaluation_interval_seconds
+    shadow_resolution = script.index(
+        "http://recovery-alertmanager:9093/api/v2/alerts",
+        primary_resolution,
     )
-    assert child_resolved_at < aggregate_resolved_at
-
-    isolated_child_resolved_at = 3 * 60
-    assert initial_child_dispatch_at < isolated_child_resolved_at
+    assert primary_resolution < shadow_resolution
+    assert "wait_for_child_status open" in script[primary_resolution:shadow_resolution]
+    assert "wait_for_child_status resolved" in script[shadow_resolution:]
+    assert "/ingest/v1/alertmanager/${source_id}/recoveries" in script
+    assert "ci-alertmanager-recovery-smoke.sh alert-hub-api:ci" in ci_run
+    assert "ci-alertmanager-recovery-smoke.sh alert-hub-api:release" in release_run
 
 
 def _compose(path: str) -> dict[str, Any]:

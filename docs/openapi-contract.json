@@ -54,6 +54,7 @@
     "/health/live": ["get"],
     "/health/ready": ["get"],
     "/ingest/v1/alertmanager/{source_id}": ["post"],
+    "/ingest/v1/alertmanager/{source_id}/recoveries": ["post"],
     "/ingest/v1/events/{source_id}": ["post"],
     "/ingest/v1/heartbeat/{source_id}": ["post"],
     "/internal/v1/nodes/health": ["get"],
