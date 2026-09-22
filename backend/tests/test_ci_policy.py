@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -81,10 +82,78 @@ def _workflow(name: str) -> dict[str, Any]:
 
 def test_alertmanager_integration_documents_outage_inhibition() -> None:
     guide = (REPOSITORY / "docs" / "source-integrations.md").read_text(encoding="utf-8")
+    alertmanager_section = guide.split("## Alertmanager", 1)[1].split("## Generic JSON", 1)[0]
+    yaml_examples = [
+        yaml.safe_load(textwrap.dedent(block))
+        for block in re.findall(
+            r"^[ \t]*```yaml\n(.*?)^[ \t]*```[ \t]*$",
+            alertmanager_section,
+            re.DOTALL | re.MULTILINE,
+        )
+    ]
+    inhibition = next(
+        example
+        for example in yaml_examples
+        if isinstance(example, dict) and "inhibit_rules" in example
+    )
+    routing = next(
+        example for example in yaml_examples if isinstance(example, dict) and "route" in example
+    )
+    aggregate_rules = next(example for example in yaml_examples if isinstance(example, list))
 
     assert "VlessServerDownGlobally" in guide
     assert "VlessEndpointUnreachable|VlessServerUnreachableFromSource" in guide
+    assert "SyntheticCheckFleetDegraded" in guide
+    assert (
+        "SyntheticCheckUnreachableFromInstance|"
+        "SyntheticCheckUnavailableFromMultipleInstances|"
+        "SyntheticCheckExecutionError|SyntheticEgressMismatch|"
+        "SyntheticEgressAssertionUnavailable"
+    ) in guide
+    inhibition_targets = {
+        matcher for rule in inhibition["inhibit_rules"] for matcher in rule["target_matchers"]
+    }
+    child_routes = routing["route"]["routes"]
+    route_matchers = {matcher for route in child_routes for matcher in route["matchers"]}
+    assert route_matchers == inhibition_targets
+    assert all(route["group_wait"] == "75s" for route in child_routes)
+    assert {rule["alert"] for rule in aggregate_rules} == {
+        "VlessServerDownGlobally",
+        "SyntheticCheckFleetDegraded",
+    }
+    assert all(rule["keep_firing_for"] == "5m" for rule in aggregate_rules)
+    assert 'ALERTS{alertstate="firing"}' in guide
     assert "Keep `send_resolved: true`" in guide
+    assert "/ingest/v1/alertmanager/SOURCE_ID/recoveries" in guide
+    assert "prometheus/alertmanager/issues/5247" in guide
+
+
+def test_ci_runs_real_alertmanager_inhibited_recovery_lifecycle() -> None:
+    script_path = REPOSITORY / "deploy/scripts/ci-alertmanager-recovery-smoke.sh"
+    script = script_path.read_text(encoding="utf-8")
+    ci_run = _job_run(_workflow("ci.yml")["jobs"]["container-integration"])
+    release_run = _job_run(_workflow("release.yml")["jobs"]["release"])
+
+    assert "quay.io/prometheus/alertmanager:v0.32.1@sha256:" in script
+    assert 'payload["versionInfo"]["version"] == "0.32.1"' in script
+    assert 'status.get("state") == "suppressed"' in script
+    assert 'status.get("inhibitedBy")' in script
+    assert script.index("child-firing.json") < script.index("aggregate-firing.json")
+    lifecycle_start = script.index("# Alertmanager 0.32.1 drops this recovery")
+    primary_resolution = script.index(
+        "http://primary-alertmanager:9093/api/v2/alerts",
+        lifecycle_start,
+    )
+    shadow_resolution = script.index(
+        "http://recovery-alertmanager:9093/api/v2/alerts",
+        primary_resolution,
+    )
+    assert primary_resolution < shadow_resolution
+    assert "wait_for_child_status open" in script[primary_resolution:shadow_resolution]
+    assert "wait_for_child_status resolved" in script[shadow_resolution:]
+    assert "/ingest/v1/alertmanager/${source_id}/recoveries" in script
+    assert "ci-alertmanager-recovery-smoke.sh alert-hub-api:ci" in ci_run
+    assert "ci-alertmanager-recovery-smoke.sh alert-hub-api:release" in release_run
 
 
 def _compose(path: str) -> dict[str, Any]:

@@ -141,6 +141,76 @@ def test_alertmanager_group_normalizes_each_alert_and_deduplicates(
     assert client.get("/api/v1/incidents", headers=auth).json()["total"] == 2
 
 
+def test_alertmanager_recovery_ingress_closes_only_existing_incidents(
+    client: TestClient, auth: dict[str, str]
+) -> None:
+    source = _create_source(client, auth, "alertmanager")
+    headers = {"Authorization": f"Bearer {source['token']}"}
+    primary_url = f"/ingest/v1/alertmanager/{source['id']}"
+    recovery_url = f"{primary_url}/recoveries"
+    child_firing = {
+        "version": "4",
+        "status": "firing",
+        "alerts": [
+            {
+                "status": "firing",
+                "labels": {
+                    "alertname": "ChildEndpointDown",
+                    "target_server": "edge-one",
+                    "severity": "critical",
+                },
+                "annotations": {"summary": "Child endpoint is down"},
+                "startsAt": "2026-09-01T12:00:00Z",
+                "endsAt": "0001-01-01T00:00:00Z",
+                "fingerprint": "child-edge-one",
+            }
+        ],
+    }
+    child_resolved = {
+        **child_firing,
+        "status": "resolved",
+        "alerts": [
+            {
+                **child_firing["alerts"][0],
+                "status": "resolved",
+                "endsAt": "2026-09-01T12:05:00Z",
+            }
+        ],
+    }
+
+    ignored_firing = client.post(recovery_url, headers=headers, json=child_firing)
+    ignored_orphan = client.post(recovery_url, headers=headers, json=child_resolved)
+    assert ignored_firing.status_code == 200, ignored_firing.text
+    assert ignored_firing.json() == {
+        "accepted": 0,
+        "duplicates": 0,
+        "incident_ids": [],
+        "ignored": 1,
+    }
+    assert ignored_orphan.status_code == 200, ignored_orphan.text
+    assert ignored_orphan.json()["ignored"] == 1
+    assert client.get("/api/v1/incidents", headers=auth).json()["total"] == 0
+
+    delivered = client.post(primary_url, headers=headers, json=child_firing)
+    recovered = client.post(recovery_url, headers=headers, json=child_resolved)
+    repeated = client.post(recovery_url, headers=headers, json=child_resolved)
+    assert delivered.status_code == 200, delivered.text
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["accepted"] == 1
+    assert recovered.json()["ignored"] == 0
+    assert repeated.json()["accepted"] == 0
+    assert repeated.json()["duplicates"] == 1
+
+    incident_id = delivered.json()["incident_ids"][0]
+    detail = client.get(f"/api/v1/incidents/{incident_id}", headers=auth)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["status"] == "resolved"
+    assert [event["event_type"] for event in detail.json()["timeline"]] == [
+        "firing",
+        "resolved",
+    ]
+
+
 def test_late_heartbeat_fires_then_resolves_on_next_ping(
     client: TestClient, auth: dict[str, str], app
 ) -> None:
