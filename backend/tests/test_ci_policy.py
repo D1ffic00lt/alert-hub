@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -81,10 +82,81 @@ def _workflow(name: str) -> dict[str, Any]:
 
 def test_alertmanager_integration_documents_outage_inhibition() -> None:
     guide = (REPOSITORY / "docs" / "source-integrations.md").read_text(encoding="utf-8")
+    alertmanager_section = guide.split("## Alertmanager", 1)[1].split("## Generic JSON", 1)[0]
+    yaml_examples = [
+        yaml.safe_load(textwrap.dedent(block))
+        for block in re.findall(
+            r"^[ \t]*```yaml\n(.*?)^[ \t]*```[ \t]*$",
+            alertmanager_section,
+            re.DOTALL | re.MULTILINE,
+        )
+    ]
+    inhibition = next(
+        example
+        for example in yaml_examples
+        if isinstance(example, dict) and "inhibit_rules" in example
+    )
+    routing = next(
+        example for example in yaml_examples if isinstance(example, dict) and "route" in example
+    )
+    aggregate_rules = next(example for example in yaml_examples if isinstance(example, list))
 
     assert "VlessServerDownGlobally" in guide
     assert "VlessEndpointUnreachable|VlessServerUnreachableFromSource" in guide
+    assert "SyntheticCheckFleetDegraded" in guide
+    assert (
+        "SyntheticCheckUnreachableFromInstance|"
+        "SyntheticCheckUnavailableFromMultipleInstances|"
+        "SyntheticCheckExecutionError|SyntheticEgressMismatch|"
+        "SyntheticEgressAssertionUnavailable"
+    ) in guide
+    inhibition_targets = {
+        matcher for rule in inhibition["inhibit_rules"] for matcher in rule["target_matchers"]
+    }
+    child_routes = routing["route"]["routes"]
+    route_matchers = {matcher for route in child_routes for matcher in route["matchers"]}
+    assert route_matchers == inhibition_targets
+    assert all(route["group_wait"] == "75s" for route in child_routes)
+    assert {rule["alert"] for rule in aggregate_rules} == {
+        "VlessServerDownGlobally",
+        "SyntheticCheckFleetDegraded",
+    }
+    assert all(rule["keep_firing_for"] == "5m" for rule in aggregate_rules)
+    assert 'ALERTS{alertstate="firing"}' in guide
     assert "Keep `send_resolved: true`" in guide
+
+
+def test_documented_inhibition_timing_covers_activation_and_recovery_windows() -> None:
+    guide = (REPOSITORY / "docs" / "source-integrations.md").read_text(encoding="utf-8")
+    child_wait_match = re.search(r"use a `(\d+)s` child `group_wait`", guide)
+    aggregate_hold_match = re.search(r"Add a `(\d+)m` `keep_firing_for`", guide)
+
+    assert child_wait_match is not None
+    assert aggregate_hold_match is not None
+    child_wait_seconds = int(child_wait_match.group(1))
+    aggregate_hold_seconds = int(aggregate_hold_match.group(1)) * 60
+
+    child_fired_at = 0
+    evaluation_interval_seconds = 30
+    delivery_margin_seconds = 15
+    aggregate_fired_at = 30
+    aggregate_condition_cleared_at = 10 * 60
+    child_resolved_at = aggregate_condition_cleared_at + 2 * 60
+
+    initial_child_dispatch_at = child_fired_at + child_wait_seconds
+    aggregate_resolved_at = aggregate_condition_cleared_at + aggregate_hold_seconds
+
+    assert child_wait_seconds >= (
+        aggregate_fired_at + evaluation_interval_seconds + delivery_margin_seconds
+    )
+    assert aggregate_fired_at < initial_child_dispatch_at
+    assert aggregate_hold_seconds >= (
+        child_resolved_at - aggregate_condition_cleared_at + evaluation_interval_seconds
+    )
+    assert child_resolved_at < aggregate_resolved_at
+
+    isolated_child_resolved_at = 3 * 60
+    assert initial_child_dispatch_at < isolated_child_resolved_at
 
 
 def _compose(path: str) -> dict[str, Any]:

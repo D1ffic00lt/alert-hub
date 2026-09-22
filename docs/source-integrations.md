@@ -91,17 +91,92 @@ inhibit_rules:
       - 'alertname=~"VlessEndpointUnreachable|VlessServerUnreachableFromSource"'
     equal:
       - target_server
+  - source_matchers:
+      - 'alertname="SyntheticCheckFleetDegraded"'
+    target_matchers:
+      - 'alertname=~"SyntheticCheckUnreachableFromInstance|SyntheticCheckUnavailableFromMultipleInstances|SyntheticCheckExecutionError|SyntheticEgressMismatch|SyntheticEgressAssertionUnavailable"'
 ```
+
+Inhibition alone does not cover the complete correlated-alert lifecycle. A
+child can finish the root route's initial wait before its aggregate starts
+firing, and a still-firing child is eligible for delivery as soon as its
+aggregate resolves. Protect both sides of that window:
+
+1. Give every route that matches an inhibition target a child-specific
+   `group_wait`. With a 30-second aggregate activation lag and a 30-second rule
+   evaluation interval, use a `75s` child `group_wait` (60 seconds plus a
+   15-second delivery margin). Keep the shorter root wait for aggregate and
+   unrelated alerts. Merge these settings into the first existing matching
+   child route; Alertmanager stops at the first matching sibling unless
+   `continue` is enabled.
+
+   ```yaml
+   route:
+     receiver: alert-hub
+     group_wait: 20s
+     group_interval: 2m
+     repeat_interval: 4h
+     routes:
+       - receiver: alert-hub
+         matchers:
+           - 'alertname=~"VlessEndpointUnreachable|VlessServerUnreachableFromSource"'
+         group_wait: 75s
+       - receiver: alert-hub
+         matchers:
+           - 'alertname=~"SyntheticCheckUnreachableFromInstance|SyntheticCheckUnavailableFromMultipleInstances|SyntheticCheckExecutionError|SyntheticEgressMismatch|SyntheticEgressAssertionUnavailable"'
+         group_wait: 75s
+   ```
+
+   Keep each route matcher identical to the corresponding inhibition target
+   matcher so newly protected children receive the same activation buffer. Do
+   not broaden a matcher to the aggregate itself. If the measured aggregate
+   activation lag plus one full evaluation interval can exceed 60 seconds,
+   increase the child wait by the same amount. One or two isolated child
+   failures still notify after this bounded wait because no aggregate inhibits
+   them.
+
+2. Add a `5m` `keep_firing_for` hold to each aggregate Prometheus rule. Keep
+   its existing expression, `for`, labels, and annotations unchanged:
+
+   ```yaml
+   # Fragment of the existing aggregate rules; retain the other fields.
+   - alert: VlessServerDownGlobally
+     keep_firing_for: 5m
+   - alert: SyntheticCheckFleetDegraded
+     keep_firing_for: 5m
+   ```
+
+   The hold starts when the aggregate expression stops matching. It keeps the
+   inhibitor present while correlated children finish their own recovery, but
+   it does not change the synthetic quorum or the child expressions. Size the
+   hold above the longest expected child cleanup lag plus one evaluation
+   interval. A child that remains broken beyond the bounded hold becomes
+   independently notifiable instead of being hidden forever.
+
+Keep the detailed child rules loaded. Inhibition affects notification delivery,
+not the Prometheus alert series: inhibited children must remain queryable with
+`ALERTS{alertstate="firing"}` and visible in Grafana. Apply the Alertmanager
+child-route buffer before reloading the Prometheus aggregate hold, then exercise
+these cases against a non-production receiver:
+
+| Exercise                                                                      | Expected webhook result                                                   |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Child fires about 30 seconds before its aggregate                             | Aggregate only; the child is inhibited before 75 seconds elapse           |
+| Aggregate condition clears while a child remains firing for up to two minutes | No recovery-time child burst; the aggregate remains firing during cleanup |
+| One or two isolated child alerts fire without the aggregate                   | Each child is delivered after the 75-second wait                          |
+| A child is inspected while inhibited                                          | Its firing series remains in Prometheus and Grafana                       |
 
 Keep `send_resolved: true` when Alert Hub is the incident state owner. Turning it
 off hides recovery from Alert Hub rather than merely silencing recovery pushes.
 Use inhibition at Alertmanager and notification routing in Alert Hub to control
 fan-out without leaving incidents permanently open.
 
-Route only the intended alert tree, then validate before reload:
+Route only the intended alert tree, then validate both configurations before
+reload:
 
 ```bash
 amtool check-config /path/to/alertmanager.yml
+promtool check rules /path/to/alert-rules.yml
 ```
 
 Alertmanager groups alerts in `alerts[]`; each item is normalized separately. The adapter prefers Alertmanager's `fingerprint`. If absent, it generates a stable key from sorted labels. `summary`/`title` becomes the title, `description`/`message` becomes the description, and unknown labels/annotations remain available in the incident.
