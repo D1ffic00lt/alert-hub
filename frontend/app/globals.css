@@ -7148,7 +7148,8 @@ body,
   display: block;
   min-height: 1px;
   flex-basis: 0;
-  transform: skewY(-4deg) scaleX(1.08);
+  backface-visibility: hidden;
+  transform: skewY(-14deg) scaleX(1.16) scaleY(1.08);
   transform-origin: center;
 }
 .state-history__slice--healthy,

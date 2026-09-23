@@ -2672,6 +2672,15 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
   await expect(chronologicalSlices.nth(1)).toHaveClass(/state-history__slice--warning/);
   await expect(chronologicalSlices.nth(2)).toHaveClass(/state-history__slice--healthy/);
   await expect(chronologicalSlices.nth(1)).not.toHaveCSS("transform", "none");
+  const transitionTransform = await chronologicalSlices.nth(1).evaluate((slice) => {
+    const values = getComputedStyle(slice)
+      .transform.match(/^matrix\((.+)\)$/)?.[1]
+      .split(",")
+      .map(Number);
+    return { horizontalScale: values?.[0] ?? 0, verticalSkew: values?.[1] ?? 0 };
+  });
+  expect(transitionTransform.horizontalScale).toBeGreaterThan(1.1);
+  expect(Math.abs(transitionTransform.verticalSkew)).toBeGreaterThan(0.25);
   await mixedPill.hover();
   await expect(page.getByRole("tooltip")).toContainText("%");
   const pillGeometry = await pills.first().evaluate((pill) => {
