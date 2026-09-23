@@ -32,6 +32,7 @@ from alert_hub.infrastructure.db.models import (
     Node,
     NotificationChannel,
     NotificationRoute,
+    Outbox,
     PrometheusDatasource,
     PushSubscription,
     ServiceToken,
@@ -132,6 +133,54 @@ def _generic_payload() -> dict[str, object]:
         "labels": {"service": "database"},
         "annotations": {"runbook": "db-recovery"},
     }
+
+
+def test_operator_resolution_does_not_enqueue_notification_on_any_node(
+    tmp_path: Path,
+) -> None:
+    settings_a = _settings(tmp_path, "operator-resolve-a")
+    settings_b = _settings(tmp_path, "operator-resolve-b")
+    app_a = create_app(settings_a)
+    app_b = create_app(settings_b)
+
+    with (
+        TestClient(app_a, base_url="http://testserver") as client_a,
+        TestClient(app_b, base_url="http://testserver"),
+    ):
+        auth = _bootstrap(client_a, "operator-resolve-a")
+        source_response = client_a.post(
+            "/api/v1/sources",
+            headers=auth,
+            json={"name": "Generic", "kind": "generic_json", "region": "test"},
+        )
+        assert source_response.status_code == 201, source_response.text
+        source = source_response.json()
+        ingest = client_a.post(
+            f"/ingest/v1/events/{source['id']}",
+            headers={"Authorization": f"Bearer {source['token']}"},
+            json=_generic_payload(),
+        )
+        assert ingest.status_code == 200, ingest.text
+        _pull(app_b, settings_b, app_a)
+
+        incident_id = ingest.json()["incident_ids"][0]
+        resolved = client_a.post(
+            f"/api/v1/incidents/{incident_id}/resolve",
+            headers=auth,
+            json={"reason": "operator verified recovery"},
+        )
+        assert resolved.status_code == 200, resolved.text
+        resolved_event_id = resolved.json()["event"]["id"]
+
+        with app_a.state.session_factory() as db:
+            assert db.get(Outbox, resolved_event_id) is None
+
+        _pull(app_b, settings_b, app_a)
+        with app_b.state.session_factory() as db:
+            replicated = db.get(IncidentEvent, resolved_event_id)
+            assert replicated is not None
+            assert replicated.event_type == "resolved"
+            assert db.get(Outbox, resolved_event_id) is None
 
 
 def test_empty_cursor_bootstraps_new_node_and_replicates_sensitive_state(

@@ -122,6 +122,12 @@ invalid transitions such as acknowledging a resolved incident are reported per i
 so clients must display its per-item failures. The UI keeps that result visible after clearing the
 successful selection and asks for confirmation before bulk resolve.
 
+Single and bulk resolutions performed by an authenticated operator through the UI/API update and
+replicate incident state but do not enqueue provider notifications. Source-originated `resolved`
+events still use the normal durable notification outbox. Every node derives this distinction from
+the replicated actor marker, and a current worker also completes without delivery if it encounters
+a legacy queued operator-resolution item.
+
 ## Alert catalog and observed availability API
 
 The `/alerts` screen is a technical catalog, not a second active-incident queue. It reads alerting
