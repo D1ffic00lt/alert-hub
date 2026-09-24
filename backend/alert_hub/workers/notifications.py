@@ -29,6 +29,7 @@ from alert_hub.application.notifications import (
     message_from_event,
     push_subscription_payload,
     retry_delay_seconds,
+    should_deliver_notification,
 )
 from alert_hub.domain.routing import (
     NodeCandidate,
@@ -169,6 +170,8 @@ class NotificationOutboxProcessor:
             if event is None:
                 self._complete_item(item_id, error_code="event_unavailable")
                 return None
+            if not should_deliver_notification(event):
+                return event.id, []
             incident = db.get(Incident, event.incident_id)
             if incident is None:
                 self._complete_item(item_id, error_code="incident_unavailable")

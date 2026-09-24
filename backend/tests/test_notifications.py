@@ -633,6 +633,36 @@ def _seed_event(
     return event_id, channel_id
 
 
+def test_worker_discards_legacy_outbox_for_operator_resolution(app: Any, settings: Any) -> None:
+    _initialize_processor_database(app, settings)
+    now = datetime(2026, 2, 1, tzinfo=UTC)
+    event_id, _ = _seed_event(app, settings, now=now)
+    with app.state.session_factory.begin() as db:
+        event = db.get(IncidentEvent, event_id)
+        assert event is not None
+        event.event_type = "resolved"
+        event.payload_json = {
+            **event.payload_json,
+            "actor_user_id": "operator-from-earlier-release",
+        }
+
+    provider = _SequenceProvider(DeliveryResult("succeeded", "http_204"))
+    processor = NotificationOutboxProcessor(
+        app.state.session_factory,
+        settings,
+        app.state.envelope_cipher,
+        ProviderRegistry({"generic_webhook": provider}),
+        now=_Clock(now),
+    )
+
+    assert asyncio.run(processor.run_once()) == 1
+    assert provider.calls == []
+    with app.state.session_factory() as db:
+        outbox = db.get(Outbox, event_id)
+        assert outbox is not None
+        assert outbox.completed_at == now
+
+
 def _seed_push_subscription(app: Any) -> str:
     cipher = app.state.envelope_cipher
     assert cipher is not None
