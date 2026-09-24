@@ -2353,6 +2353,34 @@ test("Checks dashboard, filters, grouping, matrix details, links, and mobile acc
   await expect(complexCoverage.locator(".check-instance-coverage")).toContainText("de-central");
   const compactCheckHistory = complexCoverage.locator(".check-history--compact");
   await expect(compactCheckHistory.locator(".state-history__pill")).toHaveCount(40);
+  const compactHistoryGeometry = await compactCheckHistory
+    .locator(".state-history__pill")
+    .evaluateAll((pills) => {
+      const first = pills[0]?.getBoundingClientRect();
+      const second = pills[1]?.getBoundingClientRect();
+      return {
+        gap: first && second ? second.left - first.right : 0,
+        height: first?.height ?? 0,
+        width: first?.width ?? 0,
+      };
+    });
+  expect(compactHistoryGeometry.gap).toBeGreaterThanOrEqual(1);
+  expect(compactHistoryGeometry.height).toBeGreaterThanOrEqual(68);
+  expect(compactHistoryGeometry.width).toBeGreaterThanOrEqual(6);
+  const compactTransition = compactCheckHistory
+    .locator(".state-history__pill")
+    .nth(35)
+    .locator(".state-history__slice")
+    .nth(1);
+  await expect(compactTransition).not.toHaveCSS("transform", "none");
+  const compactTransitionSkew = await compactTransition.evaluate((slice) => {
+    const values = getComputedStyle(slice)
+      .transform.match(/^matrix\((.+)\)$/)?.[1]
+      .split(",")
+      .map(Number);
+    return Math.abs(values?.[1] ?? 0);
+  });
+  expect(compactTransitionSkew).toBeGreaterThan(0.45);
   await expect(
     compactCheckHistory.getByRole("status", { name: "Некоторые datasources недоступны." }),
   ).toBeVisible();
@@ -2680,7 +2708,7 @@ test("Alerts groups HA rules by dynamic category, preserves datasource state, an
     return { horizontalScale: values?.[0] ?? 0, verticalSkew: values?.[1] ?? 0 };
   });
   expect(transitionTransform.horizontalScale).toBeGreaterThan(1.1);
-  expect(Math.abs(transitionTransform.verticalSkew)).toBeGreaterThan(0.25);
+  expect(Math.abs(transitionTransform.verticalSkew)).toBeGreaterThan(0.45);
   await mixedPill.hover();
   await expect(page.getByRole("tooltip")).toContainText("%");
   const pillGeometry = await pills.first().evaluate((pill) => {
