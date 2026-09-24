@@ -93,10 +93,25 @@ class ProviderRegistry:
         return self._providers.get(kind)
 
 
+def should_deliver_notification(event: IncidentEvent) -> bool:
+    """Return whether a timeline event may produce provider delivery.
+
+    Source-originated recoveries remain notifiable. An operator resolution is
+    an explicit UI/API action, so delivering another recovery notification for
+    that action is redundant. The actor marker is replicated with the event,
+    which keeps this decision identical on every node and also recognizes
+    operator resolutions created by earlier releases.
+    """
+
+    if event.event_type not in {"firing", "resolved"}:
+        return False
+    return not (event.event_type == "resolved" and "actor_user_id" in event.payload_json)
+
+
 def enqueue_notification_event(db: Session, event: IncidentEvent) -> Outbox | None:
     """Create exactly one durable local work item for a firing/resolved timeline event."""
 
-    if event.event_type not in {"firing", "resolved"}:
+    if not should_deliver_notification(event):
         return None
     existing = db.get(Outbox, event.id)
     if existing is not None:

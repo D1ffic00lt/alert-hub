@@ -61,7 +61,7 @@ def test_bootstrap_status_login_refresh_and_me(client: TestClient, auth: dict[st
 
 
 def test_generic_ingest_is_idempotent_and_incident_can_be_resolved(
-    client: TestClient, auth: dict[str, str]
+    client: TestClient, auth: dict[str, str], app
 ) -> None:
     source = _create_source(client, auth, "generic_json")
     payload = {
@@ -101,11 +101,14 @@ def test_generic_ingest_is_idempotent_and_incident_can_be_resolved(
     )
     assert resolved.status_code == 200, resolved.text
     assert resolved.json()["incident"]["status"] == "resolved"
+    resolved_event_id = resolved.json()["event"]["id"]
     detail = client.get(f"/api/v1/incidents/{incident_id}", headers=auth)
     assert [item["event_type"] for item in detail.json()["timeline"]] == [
         "firing",
         "resolved",
     ]
+    with app.state.session_factory() as db:
+        assert db.get(Outbox, resolved_event_id) is None
 
 
 def test_alertmanager_group_normalizes_each_alert_and_deduplicates(
@@ -142,7 +145,7 @@ def test_alertmanager_group_normalizes_each_alert_and_deduplicates(
 
 
 def test_alertmanager_recovery_ingress_closes_only_existing_incidents(
-    client: TestClient, auth: dict[str, str]
+    client: TestClient, auth: dict[str, str], app
 ) -> None:
     source = _create_source(client, auth, "alertmanager")
     headers = {"Authorization": f"Bearer {source['token']}"}
@@ -209,6 +212,9 @@ def test_alertmanager_recovery_ingress_closes_only_existing_incidents(
         "firing",
         "resolved",
     ]
+    resolved_event_id = detail.json()["timeline"][-1]["id"]
+    with app.state.session_factory() as db:
+        assert db.get(Outbox, resolved_event_id) is not None
 
 
 def test_late_heartbeat_fires_then_resolves_on_next_ping(
