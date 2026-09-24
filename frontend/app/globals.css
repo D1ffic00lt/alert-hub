@@ -7149,7 +7149,7 @@ body,
   min-height: 1px;
   flex-basis: 0;
   backface-visibility: hidden;
-  transform: skewY(-14deg) scaleX(1.16) scaleY(1.08);
+  transform: skewY(-22deg) scaleX(1.2) scaleY(1.14);
   transform-origin: center;
 }
 .state-history__slice--healthy,
@@ -7206,16 +7206,20 @@ body,
 }
 .state-history--compact {
   display: flex;
-  min-width: 220px;
+  width: min(100%, 420px);
+  min-width: 340px;
   align-items: stretch;
   gap: 5px;
   margin-top: 8px;
 }
 .state-history--compact .state-history__pills {
   flex: 1 1 auto;
-  height: 28px;
+  height: clamp(68px, 6vw, 92px);
   margin-top: 0;
-  grid-template-columns: repeat(40, clamp(2px, 0.3vw, 4px));
+  grid-template-columns: repeat(40, clamp(5px, 0.48vw, 6px));
+}
+.state-history--compact .state-history__pills-wrap {
+  flex: 1 1 auto;
 }
 .state-history__partial-marker {
   display: inline-flex;
@@ -9477,6 +9481,15 @@ button.checks-summary__item.active {
 }
 
 @media (max-width: 720px) {
+  .state-history--compact {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .state-history--compact .state-history__pills {
+    grid-template-columns: repeat(40, clamp(4px, 1.25vw, 5px));
+  }
+
   .checks-summary__item {
     min-height: 70px;
     padding: 10px;
