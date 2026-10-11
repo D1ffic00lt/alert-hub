@@ -518,3 +518,36 @@ def test_deep_health_reports_web_push_sender_capability(
     assert disabled["providers"]["web_push"]["status"] == "worker_disabled"
     assert disabled["providers"]["web_push"]["issues"] == ["notification_worker_disabled"]
     assert client.get("/health/ready").status_code == 200
+
+
+def test_notification_worker_fault_is_visible_without_disabling_local_api(
+    settings: Settings, monkeypatch
+) -> None:
+    import time
+
+    from sqlalchemy.exc import OperationalError
+
+    from alert_hub.main import create_app
+    from alert_hub.workers.notifications import NotificationOutboxProcessor
+
+    def failed_claim(self) -> list[str]:
+        raise OperationalError("test statement", {}, RuntimeError("injected claim fault"))
+
+    monkeypatch.setattr(NotificationOutboxProcessor, "_claim_batch", failed_claim)
+    runtime = settings.model_copy(update={"notification_retry_base_seconds": 0.1})
+    app = create_app(runtime)
+    with TestClient(app) as client:
+        deadline = time.monotonic() + 3
+        while app.state.notification_worker_status.failures == 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert client.get("/health/ready").status_code == 200
+        worker = client.get("/health/deep").json()["notification_worker"]
+        assert worker["running"]
+        assert worker["last_error_type"] == "OperationalError"
+        assert worker["failures"] >= 1
+        metrics = client.get("/metrics")
+        assert metrics.status_code == 200
+        assert "alert_hub_notification_worker_up 1.0" in metrics.text
+        assert "alert_hub_notification_worker_enabled 1.0" in metrics.text
+    assert not app.state.notification_worker_status.running
