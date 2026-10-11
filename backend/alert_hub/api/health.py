@@ -12,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from alert_hub.api.dependencies import get_db, get_settings
+from alert_hub.application.notifications import update_notification_backlog_metrics
 from alert_hub.infrastructure.db.models import (
     ClusterEvent,
     Delivery,
@@ -21,7 +22,7 @@ from alert_hub.infrastructure.db.models import (
     Outbox,
 )
 from alert_hub.infrastructure.vapid import VapidConfigurationError, vapid_public_key
-from alert_hub.metrics import BUILD_INFO, DB_ERRORS, INCIDENTS_OPEN, OUTBOX_PENDING
+from alert_hub.metrics import BUILD_INFO, DB_ERRORS, INCIDENTS_OPEN, NOTIFICATION_WORKER_ENABLED
 from alert_hub.settings import Settings
 
 router = APIRouter(tags=["operations"])
@@ -194,6 +195,7 @@ def deep(
         ),
         # Remote peer/channel failures are informational and never change local readiness.
         "peers": peers,
+        "notification_worker": request.app.state.notification_worker_status.snapshot(),
         "channels": {
             "status": channel_status,
             "enabled": enabled_channels,
@@ -212,9 +214,8 @@ def prometheus_metrics(
     INCIDENTS_OPEN.set(
         int(db.scalar(select(func.count(Incident.id)).where(Incident.status != "resolved")) or 0)
     )
-    OUTBOX_PENDING.set(
-        int(db.scalar(select(func.count(Outbox.id)).where(Outbox.completed_at.is_(None))) or 0)
-    )
+    NOTIFICATION_WORKER_ENABLED.set(int(settings.notify_enabled))
+    update_notification_backlog_metrics(db, settings)
     BUILD_INFO.info(
         {
             "version": settings.software_version,

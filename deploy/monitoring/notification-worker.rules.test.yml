@@ -1,0 +1,266 @@
+rule_files:
+  - notification-worker.rules.yml
+evaluation_interval: 1m
+tests:
+  - name: healthy worker
+    interval: 1m
+    input_series:
+      - series: up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_enabled{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_last_progress_timestamp_seconds{job="alert-hub",instance="example"}
+        values: 0+60x30
+      - series: alert_hub_notification_owned_pending{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_owned_oldest_timestamp_seconds{job="alert-hub",instance="example"}
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AlertHubMetricsUnavailable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationWorkerUnavailable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationTelemetryMissing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationBacklogAging
+        exp_alerts: []
+  - name: stopped worker
+    interval: 1m
+    input_series:
+      - series: up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_enabled{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_up{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_worker_last_progress_timestamp_seconds{job="alert-hub",instance="example"}
+        values: 0+60x30
+      - series: alert_hub_notification_owned_pending{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_owned_oldest_timestamp_seconds{job="alert-hub",instance="example"}
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: AlertHubMetricsUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: AlertHubNotificationWorkerUnavailable
+        exp_alerts:
+          - exp_labels:
+              job: alert-hub
+              instance: example
+              severity: critical
+              service: alert-hub
+            exp_annotations: &id001
+              summary: Alert Hub notification worker stopped making progress
+              description: API readiness alone does not prove that notifications are being
+                sent.
+      - eval_time: 2m
+        alertname: AlertHubNotificationTelemetryMissing
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: AlertHubNotificationBacklogAging
+        exp_alerts: []
+  - name: missing scrape
+    interval: 1m
+    input_series:
+      - series: up{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_worker_enabled{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_last_progress_timestamp_seconds{job="alert-hub",instance="example"}
+        values: 0+60x30
+      - series: alert_hub_notification_owned_pending{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_owned_oldest_timestamp_seconds{job="alert-hub",instance="example"}
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: AlertHubMetricsUnavailable
+        exp_alerts:
+          - exp_labels:
+              job: alert-hub
+              instance: example
+              severity: critical
+              service: alert-hub
+            exp_annotations:
+              summary: Alert Hub operational metrics cannot be scraped
+              description: Check the local API and private monitoring connection.
+      - eval_time: 2m
+        alertname: AlertHubNotificationWorkerUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: AlertHubNotificationTelemetryMissing
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: AlertHubNotificationBacklogAging
+        exp_alerts: []
+  - name: missing telemetry
+    interval: 1m
+    input_series:
+      - series: up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_last_progress_timestamp_seconds{job="alert-hub",instance="example"}
+        values: 0+60x30
+      - series: alert_hub_notification_owned_pending{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_owned_oldest_timestamp_seconds{job="alert-hub",instance="example"}
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: AlertHubMetricsUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: AlertHubNotificationWorkerUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: AlertHubNotificationTelemetryMissing
+        exp_alerts:
+          - exp_labels:
+              job: alert-hub
+              instance: example
+              severity: warning
+              service: alert-hub
+            exp_annotations:
+              summary: Alert Hub notification worker telemetry is missing
+              description: Verify the deployed API version and notification worker metrics.
+      - eval_time: 2m
+        alertname: AlertHubNotificationBacklogAging
+        exp_alerts: []
+  - name: sustained owned backlog
+    interval: 1m
+    input_series:
+      - series: up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_enabled{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_last_progress_timestamp_seconds{job="alert-hub",instance="example"}
+        values: 0+60x30
+      - series: alert_hub_notification_owned_pending{job="alert-hub",instance="example"}
+        values: 4x30
+      - series: alert_hub_notification_owned_oldest_timestamp_seconds{job="alert-hub",instance="example"}
+        values: 1x30
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AlertHubMetricsUnavailable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationWorkerUnavailable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationTelemetryMissing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationBacklogAging
+        exp_alerts:
+          - exp_labels:
+              job: alert-hub
+              instance: example
+              severity: warning
+              service: alert-hub
+            exp_annotations:
+              summary: Locally owned Alert Hub notification work is older than fifteen minutes
+              description: Inspect provider errors and durable delivery receipts. Remote
+                owner waits are excluded.
+  - name: disabled worker
+    interval: 1m
+    input_series:
+      - series: up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_enabled{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_worker_up{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_worker_last_progress_timestamp_seconds{job="alert-hub",instance="example"}
+        values: 0+60x30
+      - series: alert_hub_notification_owned_pending{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_owned_oldest_timestamp_seconds{job="alert-hub",instance="example"}
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AlertHubMetricsUnavailable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationWorkerUnavailable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationTelemetryMissing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationBacklogAging
+        exp_alerts: []
+  - name: remote owner wait
+    interval: 1m
+    input_series:
+      - series: up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_enabled{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_last_progress_timestamp_seconds{job="alert-hub",instance="example"}
+        values: 0+60x30
+      - series: alert_hub_notification_owned_pending{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_owned_oldest_timestamp_seconds{job="alert-hub",instance="example"}
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AlertHubMetricsUnavailable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationWorkerUnavailable
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationTelemetryMissing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: AlertHubNotificationBacklogAging
+        exp_alerts: []
+  - name: stale progress with API alive
+    interval: 1m
+    input_series:
+      - series: up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_enabled{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_up{job="alert-hub",instance="example"}
+        values: 1x30
+      - series: alert_hub_notification_worker_last_progress_timestamp_seconds{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_owned_pending{job="alert-hub",instance="example"}
+        values: "0x30"
+      - series: alert_hub_notification_owned_oldest_timestamp_seconds{job="alert-hub",instance="example"}
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AlertHubMetricsUnavailable
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: AlertHubNotificationWorkerUnavailable
+        exp_alerts:
+          - exp_labels:
+              job: alert-hub
+              instance: example
+              severity: critical
+              service: alert-hub
+            exp_annotations: *id001
+      - eval_time: 5m
+        alertname: AlertHubNotificationTelemetryMissing
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: AlertHubNotificationBacklogAging
+        exp_alerts: []

@@ -196,3 +196,37 @@ def test_request_logs_and_request_id_cover_early_and_exception_responses(
     assert "request-header-secret" not in rendered
     assert "request-cookie-secret" not in rendered
     assert "query-secret" not in rendered
+
+
+def test_long_uvicorn_lifespan_trace_keeps_exception_class_and_final_frame() -> None:
+    trace = (
+        "Traceback (most recent call last):\n"
+        + "  File startup.py, line 1\n" * 500
+        + '  File "notifications.py", line 681, in notification_worker_loop\n'
+        + "OperationalError: password=hidden-secret worker failed"
+    )
+    record = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1, trace, (), None)
+    payload = json.loads(JsonLogFormatter().format(record))
+    assert len(payload["message"]) <= 2048
+    assert "OperationalError" in payload["message"]
+    assert "notification_worker_loop" in payload["message"]
+    assert "hidden-secret" not in payload["message"]
+    assert "truncated" in payload["message"]
+    assert "OperationalError" in TextLogFormatter().format(record)
+
+
+def test_uvicorn_trace_preserves_structured_cause_when_sql_tail_is_large() -> None:
+    trace = (
+        "Traceback (most recent call last):\n"
+        '  File "notifications.py", line 681, in notification_worker_loop\n'
+        "sqlalchemy.exc.OperationalError: database failed\n"
+        + "[SQL: "
+        + "placeholder " * 3000
+        + "]\npassword=hidden-secret"
+    )
+    record = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1, trace, (), None)
+    payload = json.loads(JsonLogFormatter().format(record))
+    assert payload["exception_type"] == "OperationalError"
+    assert payload["exception_frame"] == "notifications.py:681:notification_worker_loop"
+    assert "hidden-secret" not in json.dumps(payload)
+    assert len(payload["message"]) <= 2048

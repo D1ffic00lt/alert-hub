@@ -54,7 +54,7 @@ from alert_hub.infrastructure.rate_limit import LocalRateLimiter
 from alert_hub.infrastructure.request_security import resolve_client_ip
 from alert_hub.settings import Settings, get_settings
 from alert_hub.workers.heartbeat import heartbeat_loop
-from alert_hub.workers.notifications import notification_worker_loop
+from alert_hub.workers.notifications import NotificationWorkerStatus, notification_worker_supervisor
 from alert_hub.workers.sync import PeerSyncWorker
 
 logger = logging.getLogger("alert_hub")
@@ -322,11 +322,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sync_task = asyncio.create_task(sync_worker.run(), name="peer-sync")
         if runtime_settings.notify_enabled:
             notification_task = asyncio.create_task(
-                notification_worker_loop(
+                notification_worker_supervisor(
                     session_factory,
                     runtime_settings,
                     app.state.envelope_cipher,
                     app.state.notification_providers,
+                    status=app.state.notification_worker_status,
                 ),
                 name="notification-outbox",
             )
@@ -355,6 +356,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/api/openapi.json",
     )
     app.state.settings = runtime_settings
+    app.state.notification_worker_status = NotificationWorkerStatus(runtime_settings.notify_enabled)
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.envelope_cipher = build_envelope_cipher(runtime_settings)

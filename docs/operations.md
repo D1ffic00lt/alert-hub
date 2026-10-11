@@ -688,3 +688,37 @@ restore drill exist. Real provider delivery and multi-region partition evidence 
 acceptance gates.
 
 See the [failure and rollback runbook](runbooks/failure-and-rollback.md) for decision procedures.
+
+## Notification worker recovery and backlog
+
+The local notification task recovers claim, retry-release, and metric-update failures with capped
+exponential backoff (at most 30 seconds). A supervisor restarts unexpected exits with the same
+backoff; normal cancellation propagates immediately. Failures record the exception class and
+final file/line/function without SQL statements, bind parameters, or provider values. Bounded
+logs keep both the beginning and end of long traces, including Uvicorn lifespan messages.
+
+`/health/ready` continues to prove local database readiness independently of peers or notification
+providers. `/health/deep` exposes `notification_worker` running state, last successful progress,
+last exception type, and recovered failure count. Scrape the private `/metrics` independently of
+readiness. It exposes worker enablement, liveness, progress timestamp, failure counters, locally
+owned pending count, and the oldest owned event receipt timestamp. Retry scheduling does not
+reset age; waiting for a remote owner's receipt does not count as locally owned work. The scrape
+computes ownership even if the dispatch task is stopped. Example rules live in
+[`deploy/monitoring/notification-worker.rules.yml`](../deploy/monitoring/notification-worker.rules.yml).
+A missing scrape or missing telemetry also raises an alert.
+
+For transitions older than `NOTIFICATION_BACKLOG_AGE_SECONDS` (default 900), the rank-zero owner
+records a terminal `failed` delivery receipt with `provider_status=policy_skipped` and reason
+`backlog_superseded` when a newer firing/recovery transition exists, or `backlog_expired_recovery`
+for an old source recovery. It does not call a provider. Original timeline events and completed
+outbox rows remain intact; these deterministic receipts replicate to reserves. This policy does
+not resolve incidents or delete history. Recent transitions retain normal delivery semantics.
+The latest old firing transition remains deliverable and uses its original deterministic delivery
+identity and event snapshot. Its provider calls are paced by
+`NOTIFICATION_BACKLOG_SPACING_SECONDS` (default two seconds). Delivery policy is checked again
+following that delay in case recovery arrived meanwhile. Reserve nodes never promote themselves
+after a timeout; an unavailable owner remains visible as queued work.
+
+After a rollout, check each node's progress timestamp advances, owned queue age decreases, and
+receipts converge across peers. Do not inject production alerts or replay old provider requests
+as a health test. Validate rules with `promtool check rules` and isolated rule tests before reload.

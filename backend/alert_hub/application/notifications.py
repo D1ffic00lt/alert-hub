@@ -11,13 +11,169 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from alert_hub.domain.routing import (
+    NodeCandidate,
+    RouteRule,
+    parse_matcher,
+    rank_delivery_nodes,
+    select_channel_ids,
+)
 from alert_hub.infrastructure.db.models import (
     Delivery,
     Incident,
     IncidentEvent,
+    Node,
+    NotificationChannel,
+    NotificationRoute,
     Outbox,
     PushSubscription,
 )
+from alert_hub.metrics import NOTIFICATION_OWNED_OLDEST, NOTIFICATION_OWNED_PENDING, OUTBOX_PENDING
+from alert_hub.settings import Settings
+
+
+def notification_route_rules(db: Session) -> list[RouteRule]:
+    routes: list[RouteRule] = []
+    for row in db.scalars(
+        select(NotificationRoute)
+        .where(NotificationRoute.enabled.is_(True))
+        .order_by(NotificationRoute.priority, NotificationRoute.id)
+    ):
+        try:
+            routes.append(
+                RouteRule(
+                    route_id=row.id,
+                    priority=row.priority,
+                    source_filter=frozenset(str(value) for value in row.source_filter),
+                    severity_filter=frozenset(str(value) for value in row.severity_filter),
+                    label_matchers=tuple(parse_matcher(value) for value in row.label_matchers),
+                    channel_ids=tuple(str(value) for value in row.channel_ids),
+                    continue_matching=row.continue_matching,
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return routes
+
+
+def delivery_rank(
+    db: Session,
+    settings: Settings,
+    event_identity: str,
+    channel: NotificationChannel,
+    *,
+    candidates: list[NodeCandidate] | None = None,
+) -> tuple[int | None, bool]:
+    candidates = (
+        list(candidates)
+        if candidates is not None
+        else [
+            NodeCandidate(node.id, node.region, frozenset(node.enabled_roles))
+            for node in db.scalars(select(Node).order_by(Node.id))
+        ]
+    )
+    known = {candidate.node_id for candidate in candidates}
+    configured = {
+        str(value)
+        for value in (channel.eligible_nodes_or_regions or {}).get("node_ids", [])
+        if str(value)
+    }
+    candidates.extend(
+        NodeCandidate(node_id, "", frozenset({"notify"})) for node_id in sorted(configured - known)
+    )
+    ranking = rank_delivery_nodes(
+        event_identity, channel.id, candidates, channel.eligible_nodes_or_regions or {}
+    )
+    try:
+        return ranking.index(settings.node_id), True
+    except ValueError:
+        return None, bool(ranking)
+
+
+def update_notification_backlog_metrics(db: Session, settings: Settings) -> dict[str, int | float]:
+    """Measure local ownership even when the dispatch task is stopped.
+
+    Awaiting an unfenced remote owner is diagnostic pending work, not a local
+    delivery outage. Use event receipt time because retries rewrite available_at.
+    """
+    items = db.execute(
+        select(IncidentEvent, Incident)
+        .join(Incident)
+        .join(Outbox, Outbox.payload_json["event_id"].as_string() == IncidentEvent.id)
+        .where(Outbox.topic == "notification_event", Outbox.completed_at.is_(None))
+    ).all()
+    if not items:
+        OUTBOX_PENDING.set(0)
+        NOTIFICATION_OWNED_PENDING.set(0)
+        NOTIFICATION_OWNED_OLDEST.set(0)
+        return {"pending": 0, "owned_pending": 0, "owned_oldest_timestamp": 0.0}
+    routes = notification_route_rules(db)
+    candidates = [
+        NodeCandidate(node.id, node.region, frozenset(node.enabled_roles))
+        for node in db.scalars(select(Node).order_by(Node.id))
+    ]
+    channels = {
+        channel.id: channel
+        for channel in db.scalars(
+            select(NotificationChannel).where(
+                NotificationChannel.enabled.is_(True), NotificationChannel.deleted_at.is_(None)
+            )
+        )
+    }
+    deliveries = (
+        {
+            (item.event_id, item.channel_id, item.subscription_id): item.status
+            for item in db.scalars(
+                select(Delivery).where(Delivery.event_id.in_([event.id for event, _ in items]))
+            )
+        }
+        if items
+        else {}
+    )
+    # Match provider eligibility without mutating subscriptions during a scrape.
+    from alert_hub.application.auth import push_subscription_session_state
+
+    subscriptions = [
+        item
+        for item in db.scalars(
+            select(PushSubscription).where(PushSubscription.disabled_at.is_(None))
+        )
+        if push_subscription_session_state(db, item) == "active"
+    ]
+    owned = 0
+    oldest = 0.0
+    for event, incident in items:
+        if not should_deliver_notification(event):
+            continue
+        selected = select_channel_ids(
+            routes,
+            source_id=incident.source_id,
+            severity=incident.severity,
+            labels=incident.labels_json,
+        )
+        for channel_id in selected:
+            channel = channels.get(channel_id)
+            if (
+                channel is None
+                or delivery_rank(db, settings, event.event_key, channel, candidates=candidates)[0]
+                != 0
+            ):
+                continue
+            targets = [item.id for item in subscriptions] if channel.kind == "web_push" else [None]
+            if any(
+                deliveries.get((event.id, channel_id, target))
+                not in {"succeeded", "failed", "gone"}
+                for target in targets
+            ):
+                owned += 1
+                timestamp = event.received_at.timestamp()
+                oldest = min(oldest, timestamp) if oldest else timestamp
+                break
+    OUTBOX_PENDING.set(len(items))
+    NOTIFICATION_OWNED_PENDING.set(owned)
+    NOTIFICATION_OWNED_OLDEST.set(oldest)
+    return {"pending": len(items), "owned_pending": owned, "owned_oldest_timestamp": oldest}
+
 
 DeliveryOutcome = Literal["succeeded", "retryable", "permanent", "gone"]
 

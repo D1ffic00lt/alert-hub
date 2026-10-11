@@ -31,6 +31,7 @@ _SAFE_EXTRA_FIELDS: Final[tuple[str, ...]] = (
     "db_lane",
     "error_code",
     "exception_type",
+    "exception_frame",
 )
 _SENSITIVE_VALUE = re.compile(
     r"(?i)\b([a-z0-9_-]*(?:authorization|set-cookie|cookie|password|passwd|token|secret|"
@@ -40,13 +41,32 @@ _SENSITIVE_VALUE = re.compile(
 _BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+")
 _MAX_FIELD_LENGTH: Final = 2_048
 _MAX_TRACE_LENGTH: Final = 16_384
+_TRACE_FRAME = re.compile(r'(?m)^\s*File "([^"\n]+)", line (\d+), in ([^\n]+)')
+_TRACE_CLASS = re.compile(r"(?m)^([A-Za-z_][\w.]*):(?:\s|$)")
+
+
+def _embedded_exception(record: logging.LogRecord) -> dict[str, str]:
+    """Uvicorn lifespan errors carry a preformatted trace instead of exc_info."""
+    message = record.getMessage()
+    if not record.name.startswith("uvicorn") or "Traceback (most recent call last)" not in message:
+        return {}
+    frames = _TRACE_FRAME.findall(message)
+    classes = _TRACE_CLASS.findall(message)
+    fields: dict[str, str] = {}
+    if classes:
+        fields["exception_type"] = classes[-1].rsplit(".", 1)[-1]
+    if frames:
+        fields["exception_frame"] = _redact(":".join(frames[-1]))
+    return fields
 
 
 def _redact(value: str, *, limit: int = _MAX_FIELD_LENGTH) -> str:
     redacted = _BEARER_VALUE.sub("Bearer [REDACTED]", value)
     redacted = _SENSITIVE_VALUE.sub(lambda match: f"{match.group(1)}=[REDACTED]", redacted)
     if len(redacted) > limit:
-        return f"{redacted[:limit]}...[truncated]"
+        marker = "...[truncated]..."
+        head = limit // 4
+        return redacted[:head] + marker + redacted[-(limit - head - len(marker)) :]
     return redacted
 
 
@@ -96,6 +116,7 @@ class JsonLogFormatter(logging.Formatter):
             value = _safe_extra(getattr(record, field, None))
             if value is not None:
                 payload[field] = value
+        payload.update(_embedded_exception(record))
         exception = _exception_fields(self, record)
         if exception is not None:
             payload["exception"] = {"type": exception[0], "trace": exception[1]}
@@ -112,6 +133,9 @@ class TextLogFormatter(logging.Formatter):
             value = _safe_extra(getattr(record, field, None))
             if value is not None:
                 parts.append(f"{field}={json.dumps(value, ensure_ascii=False)}")
+        parts.extend(
+            f"{key}={json.dumps(value)}" for key, value in _embedded_exception(record).items()
+        )
         exception = _exception_fields(self, record)
         if exception is not None:
             parts.append(f"exception_type={exception[0]}")

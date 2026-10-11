@@ -1736,7 +1736,7 @@ test("a quiet SSE failure immediately moves live updates and data reads to the r
   await expect
     .poll(() =>
       page.evaluate(() =>
-        (window as unknown as { __alertHubStreamUrls: string[] }).__alertHubStreamUrls.at(-1),
+        (window as unknown as { __alertHubStreamUrls: string[] }).__alertHubStreamUrls?.at(-1),
       ),
     )
     .toBe(`${reserve}/api/v1/stream`);
@@ -1905,6 +1905,7 @@ test("client failover starts on a reserve API and keeps mutations on the selecte
     incidentListRequests: [],
     incidents,
     lateTokenRequests: [],
+    liveEventSource: true,
     logoutRequests: 0,
     primaryUnavailable: false,
     refreshGate: null,
@@ -1915,10 +1916,24 @@ test("client failover starts on a reserve API and keeps mutations on the selecte
   await installClientFailoverRuntime(page, primaryBase, reserveBase);
   await installApi(page, state);
   await signIn(page);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as unknown as { __alertHubStreamUrls: string[] }).__alertHubStreamUrls?.at(-1),
+      ),
+    )
+    .toBe(`${primaryBase}/api/v1/stream`);
 
   state.primaryUnavailable = true;
   await page.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
   await expect(page.getByText("Peer incident 0", { exact: true })).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as unknown as { __alertHubStreamUrls: string[] }).__alertHubStreamUrls?.at(-1),
+      ),
+    )
+    .toBe(`${reserveBase}/api/v1/stream`);
   await page.getByLabel("Выбрать текущую страницу").check();
   await expect(page.getByRole("button", { name: "Выбрать все 52 результатов" })).toBeVisible();
   await page.getByRole("button", { name: "Выбрать все 52 результатов" }).click();

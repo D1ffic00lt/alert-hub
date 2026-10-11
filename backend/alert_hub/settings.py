@@ -220,6 +220,8 @@ class Settings(BaseSettings):
     notification_retry_max_seconds: float = Field(default=900.0, ge=1.0, le=86_400.0)
     notification_failover_base_seconds: float = Field(default=15.0, ge=0.0, le=3_600.0)
     notification_provider_timeout_seconds: float = Field(default=10.0, ge=0.1, le=120.0)
+    notification_backlog_age_seconds: float = Field(default=900.0, ge=60.0, le=86_400.0)
+    notification_backlog_spacing_seconds: float = Field(default=2.0, ge=0.1, le=60.0)
     web_push_ttl_seconds: int = Field(default=300, ge=0, le=86_400)
     vapid_subject: str = "mailto:admin@example.invalid"
     sse_poll_seconds: float = Field(default=2.0, ge=0.25, le=30.0)

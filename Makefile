@@ -113,7 +113,7 @@ format-check:
 
 repository-quality:
 	"$(FRONTEND_BIN)/prettier" --check . --ignore-unknown
-	"$(FRONTEND_BIN)/markdownlint-cli2" "**/*.md" "!frontend/node_modules/**" "!frontend/dist/**" "!.venv/**" "!backend/.venv/**"
+	node frontend/scripts/lint-markdown.mjs
 	"$(PYTHON)" -m yamllint -c .yamllint.yaml .yamllint.yaml .github deploy docker-compose.yml docker-compose.split.yml docker-compose.api-only.yml
 	"$(PYTHON)" deploy/scripts/check-ci-policy.py
 	bash -n $(BASH_SCRIPTS)

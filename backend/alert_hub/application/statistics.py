@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from heapq import nsmallest
 from threading import Lock
 from time import monotonic
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -639,7 +639,11 @@ def _statistics_snapshot(
         for source_id, name, region in source_rows
     ]
     sources.sort(
-        key=lambda item: (-int(item["count"]), str(item["name"]).casefold(), item["source_id"])
+        key=lambda item: (
+            -cast(int, item["count"]),
+            str(item["name"]).casefold(),
+            item["source_id"],
+        )
     )
     top_channel_ids = nsmallest(
         _TOP_ACTIVITY_LIMIT,

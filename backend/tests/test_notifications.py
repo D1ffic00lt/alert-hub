@@ -1297,3 +1297,248 @@ def test_live_web_push_test_tombstones_unbound_legacy_subscription(
         )
         assert tombstone is not None
         assert tombstone.payload_json["session_id"] is None
+
+
+@pytest.mark.parametrize("method", ["_claim_batch", "_update_pending_metric", "_release_item"])
+def test_worker_recovers_database_failures_and_cancels_cleanly(
+    app: Any, settings: Any, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    from alert_hub.workers.notifications import NotificationWorkerStatus, notification_worker_loop
+
+    _initialize_processor_database(app, settings)
+    runtime = settings.model_copy(
+        update={"notification_retry_base_seconds": 0.1, "notification_poll_seconds": 0.1}
+    )
+    if method == "_release_item":
+        _seed_event(app, settings, now=utc_now())
+
+        async def broken_item(self: Any, item_id: str) -> None:
+            raise RuntimeError("per-item fault")
+
+        monkeypatch.setattr(NotificationOutboxProcessor, "_process_item", broken_item)
+    original = getattr(NotificationOutboxProcessor, method)
+    attempts = 0
+
+    def transient(self: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise OperationalError("test statement", {}, RuntimeError("test fault"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(NotificationOutboxProcessor, method, transient)
+    status = NotificationWorkerStatus(True)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            notification_worker_loop(
+                app.state.session_factory, runtime, app.state.envelope_cipher, status=status
+            )
+        )
+        try:
+            async with asyncio.timeout(3):
+                while (
+                    status.failures < (1 if method == "_release_item" else 2)
+                    or not status.last_progress_at
+                ):
+                    await asyncio.sleep(0.01)
+            assert not task.done()
+            assert status.running
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not status.running
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+    asyncio.run(exercise())
+    if method == "_release_item":
+        with app.state.session_factory() as db:
+            assert db.query(Outbox).one().completed_at is None
+
+
+def test_supervisor_recovers_unexpected_exit_without_tight_restart_loop(
+    app: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import alert_hub.workers.notifications as worker
+
+    runtime = settings.model_copy(update={"notification_retry_base_seconds": 0.1})
+    attempts = 0
+
+    async def exited(*args: Any, **kwargs: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("unexpected exit")
+        if attempts == 2:
+            return
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(worker, "notification_worker_loop", exited)
+    status = worker.NotificationWorkerStatus(True)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            worker.notification_worker_supervisor(
+                app.state.session_factory, runtime, app.state.envelope_cipher, status=status
+            )
+        )
+        await asyncio.sleep(0.04)
+        assert attempts == 1
+        async with asyncio.timeout(2):
+            while attempts < 3:
+                await asyncio.sleep(0.01)
+        assert status.failures == 2
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)
+        assert attempts == 3
+
+    asyncio.run(exercise())
+
+
+def test_restart_skips_obsolete_backlog_with_durable_replicable_receipts(
+    app: Any, settings: Any
+) -> None:
+    _initialize_processor_database(app, settings)
+    old = utc_now() - timedelta(days=2)
+    firing_id, _ = _seed_event(app, settings, now=old)
+    recovery_id = new_id()
+    with app.state.session_factory.begin() as db:
+        firing = db.get(IncidentEvent, firing_id)
+        recovery = IncidentEvent(
+            id=recovery_id,
+            origin_node_id="remote-origin",
+            origin_seq=2,
+            event_key=f"event-{recovery_id}",
+            incident_id=firing.incident_id,
+            event_type="resolved",
+            occurred_at=old + timedelta(minutes=1),
+            received_at=old + timedelta(minutes=1),
+            payload_json={},
+        )
+        db.add(recovery)
+        db.flush()
+        enqueue_notification_event(db, recovery)
+    provider = _SequenceProvider()
+    processor = NotificationOutboxProcessor(
+        app.state.session_factory,
+        settings,
+        app.state.envelope_cipher,
+        ProviderRegistry({"generic_webhook": provider}),
+    )
+    assert asyncio.run(processor.run_once()) == 2
+    assert provider.calls == []
+    assert asyncio.run(processor.run_once()) == 0
+    with app.state.session_factory() as db:
+        assert db.get(IncidentEvent, firing_id).event_type == "firing"
+        assert db.get(IncidentEvent, recovery_id).event_type == "resolved"
+        assert db.query(Outbox).count() == 2
+        assert all(item.completed_at for item in db.query(Outbox))
+        deliveries = db.query(Delivery).all()
+        assert {item.error_code for item in deliveries} == {
+            "backlog_superseded",
+            "backlog_expired_recovery",
+        }
+        assert all(
+            item.attempt == 0 and item.provider_status == "policy_skipped" for item in deliveries
+        )
+        receipts = db.query(ClusterEvent).filter_by(entity_type="delivery_receipt").all()
+        assert len(receipts) == 2
+        assert db.query(IncidentEvent).filter_by(event_type="delivery_failed").count() == 2
+
+
+def test_old_active_incident_is_paced_and_delivered_once_after_restart(
+    app: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import alert_hub.workers.notifications as worker
+
+    _initialize_processor_database(app, settings)
+    event_id, _ = _seed_event(app, settings, now=utc_now() - timedelta(days=2))
+    provider = _SequenceProvider(DeliveryResult("succeeded", "http_204"))
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(worker.asyncio, "sleep", record_sleep)
+    processor = NotificationOutboxProcessor(
+        app.state.session_factory,
+        settings,
+        app.state.envelope_cipher,
+        ProviderRegistry({"generic_webhook": provider}),
+    )
+    assert asyncio.run(processor.run_once()) == 1
+    assert delays == [settings.notification_backlog_spacing_seconds]
+    assert len(provider.calls) == 1
+    assert asyncio.run(processor.run_once()) == 0
+    with app.state.session_factory() as db:
+        assert db.get(Outbox, event_id).completed_at is not None
+        assert db.query(Delivery).one().status == "succeeded"
+
+
+def test_owned_backlog_age_ignores_unavailable_remote_owner_and_retry_time(
+    app: Any, settings: Any
+) -> None:
+    from alert_hub.application.notifications import update_notification_backlog_metrics
+
+    _initialize_processor_database(app, settings)
+    old = utc_now() - timedelta(days=2)
+    event_id, channel_id = _seed_event(app, settings, now=old)
+    with app.state.session_factory.begin() as db:
+        db.get(Outbox, event_id).available_at = utc_now() + timedelta(days=1)
+    with app.state.session_factory() as db:
+        snapshot = update_notification_backlog_metrics(db, settings)
+    assert snapshot["owned_pending"] == 1
+    assert snapshot["owned_oldest_timestamp"] == old.timestamp()
+    with app.state.session_factory.begin() as db:
+        db.get(NotificationChannel, channel_id).eligible_nodes_or_regions = {
+            "node_ids": ["unavailable-owner"]
+        }
+    with app.state.session_factory() as db:
+        snapshot = update_notification_backlog_metrics(db, settings)
+    assert snapshot["pending"] == 1
+    assert snapshot["owned_pending"] == 0
+    assert snapshot["owned_oldest_timestamp"] == 0
+
+
+def test_sustained_active_backlog_is_paced_across_restarts_and_age_does_not_reset(
+    app: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import alert_hub.workers.notifications as worker
+    from alert_hub.application.notifications import update_notification_backlog_metrics
+
+    _initialize_processor_database(app, settings)
+    old = utc_now() - timedelta(days=2)
+    for _ in range(5):
+        event_id, _ = _seed_event(app, settings, now=old)
+        with app.state.session_factory.begin() as db:
+            db.get(IncidentEvent, event_id).origin_node_id = event_id
+    runtime = settings.model_copy(update={"notification_batch_size": 2})
+    provider = _SequenceProvider(*[DeliveryResult("succeeded", "http_204") for _ in range(5)])
+    delays: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(worker.asyncio, "sleep", sleep)
+    for remaining in (3, 1, 0):
+        processor = NotificationOutboxProcessor(
+            app.state.session_factory,
+            runtime,
+            app.state.envelope_cipher,
+            ProviderRegistry({"generic_webhook": provider}),
+        )
+        asyncio.run(processor.run_once())
+        with app.state.session_factory() as db:
+            snapshot = update_notification_backlog_metrics(db, runtime)
+            assert snapshot["owned_pending"] == remaining
+            assert snapshot["owned_oldest_timestamp"] == (old.timestamp() if remaining else 0)
+    assert delays == [runtime.notification_backlog_spacing_seconds] * 5
+    assert len(provider.calls) == 5
