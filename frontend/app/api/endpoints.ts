@@ -297,6 +297,7 @@ export class ApiEndpointManager {
       replayRefresh?: boolean;
       revalidateBeforeMutation?: boolean;
       retryNotFound?: boolean;
+      retryUnavailableData?: boolean;
     } = {},
   ): Promise<Response> {
     const method = (init.method ?? "GET").toUpperCase();
@@ -312,6 +313,7 @@ export class ApiEndpointManager {
       safeRead || options.replayRefresh ? this.requestTimeoutMs : this.mutationTimeoutMs;
     let firstRetryableResponse: Response | null = null;
     let firstNotFoundResponse: Response | null = null;
+    let firstUnavailableResponse: Response | null = null;
     let deferredAuthRejection: Response | null = null;
     let deferredAuthRejectionUntil = 0;
     let lastError: unknown = null;
@@ -343,6 +345,19 @@ export class ApiEndpointManager {
           this.markHealthy(origin);
           continue;
         }
+        if (safeRead && options.retryUnavailableData && response.ok) {
+          const payload = await response
+            .clone()
+            .json()
+            .catch(() => null);
+          if (payload?.status === "unavailable") {
+            firstUnavailableResponse ??= response;
+            this.markFailed(origin, "Monitoring data unavailable");
+            if (!canReplay) return response;
+            if (attempted.size < maximumAttempts) await this.prepare();
+            continue;
+          }
+        }
         if (response.status < 500) {
           this.markHealthy(origin);
           if (!firstNotFoundResponse) {
@@ -364,6 +379,7 @@ export class ApiEndpointManager {
       }
       if (attempted.size < maximumAttempts) await this.prepare();
     }
+    if (firstUnavailableResponse) return firstUnavailableResponse;
     if (firstRetryableResponse) return firstRetryableResponse;
     if (deferredAuthRejection && deferredAuthRejectionUntil > this.now()) {
       return new Response(
@@ -422,11 +438,52 @@ export class ApiEndpointManager {
     const forwardCallerAbort = () => controller.abort(callerSignal?.reason);
     if (callerSignal?.aborted) forwardCallerAbort();
     else callerSignal?.addEventListener("abort", forwardCallerAbort, { once: true });
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let rejectAbort: () => void = () => undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      rejectAbort = () => reject(controller.signal.reason);
+      if (controller.signal.aborted) rejectAbort();
+      else controller.signal.addEventListener("abort", rejectAbort, { once: true });
+    });
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      return await this.fetchImpl(url, { ...init, signal: controller.signal });
+      const request = async () => {
+        controller.signal.throwIfAborted();
+        const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
+        controller.signal.throwIfAborted();
+        if (!response.body) return response;
+        // Fetch resolves at headers. Keep the same deadline while reading the JSON body
+        // so a stalled body cannot leave the UI waiting forever on the failed origin.
+        reader = response.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let length = 0;
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          chunks.push(chunk.value);
+          length += chunk.value.byteLength;
+        }
+        reader.releaseLock();
+        reader = undefined;
+        const body = new Uint8Array(length);
+        let offset = 0;
+        for (const chunk of chunks) {
+          body.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      };
+      return await Promise.race([request(), aborted]);
+    } catch (error) {
+      void reader?.cancel().catch(() => undefined);
+      throw error;
     } finally {
       clearTimeout(timer);
+      controller.signal.removeEventListener("abort", rejectAbort);
       callerSignal?.removeEventListener("abort", forwardCallerAbort);
     }
   }

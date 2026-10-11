@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import NAMESPACE_URL, uuid5
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from alert_hub.application.auth import (
@@ -24,29 +25,24 @@ from alert_hub.application.notifications import (
     NotificationMessage,
     ProviderRegistry,
     apply_delivery_receipt,
+    delivery_rank,
     delivery_receipt_payload,
     deterministic_delivery_id,
     message_from_event,
+    notification_route_rules,
     push_subscription_payload,
     retry_delay_seconds,
     should_deliver_notification,
+    update_notification_backlog_metrics,
 )
-from alert_hub.domain.routing import (
-    NodeCandidate,
-    RouteRule,
-    parse_matcher,
-    rank_delivery_nodes,
-    select_channel_ids,
-)
+from alert_hub.domain.routing import select_channel_ids
 from alert_hub.infrastructure.db.base import utc_now
 from alert_hub.infrastructure.db.models import (
     ClusterEvent,
     Delivery,
     Incident,
     IncidentEvent,
-    Node,
     NotificationChannel,
-    NotificationRoute,
     Outbox,
     PushSubscription,
 )
@@ -56,10 +52,59 @@ from alert_hub.infrastructure.notifications.secrets import (
     decrypt_channel_config,
     decrypt_push_subscription,
 )
-from alert_hub.metrics import DELIVERY_FAILURES, DELIVERY_TOTAL, OUTBOX_PENDING
+from alert_hub.metrics import (
+    DELIVERY_FAILURES,
+    DELIVERY_TOTAL,
+    NOTIFICATION_WORKER_ERRORS,
+    NOTIFICATION_WORKER_PROGRESS,
+    NOTIFICATION_WORKER_UP,
+)
 from alert_hub.settings import Settings
 
 logger = logging.getLogger("alert_hub.notifications")
+
+
+@dataclass(slots=True)
+class NotificationWorkerStatus:
+    enabled: bool
+    running: bool = False
+    last_progress_at: float = 0.0
+    last_error_type: str | None = None
+    failures: int = 0
+
+    def progress(self) -> None:
+        self.last_progress_at = utc_now().timestamp()
+        self.last_error_type = None
+        NOTIFICATION_WORKER_PROGRESS.set(self.last_progress_at)
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "running": self.running,
+            "last_progress_timestamp": self.last_progress_at,
+            "last_error_type": self.last_error_type,
+            "failures": self.failures,
+        }
+
+
+def _log_worker_failure(exc: Exception, *, stage: str, item_id: str | None = None) -> None:
+    frames = traceback.extract_tb(exc.__traceback__)
+    frame = frames[-1] if frames else None
+    # SQLAlchemy exception text can contain SQL bind values. Keep type and final
+    # frame without logging provider credentials, statements, or parameters.
+    logger.error(
+        "notification_worker_failed",
+        extra={
+            "event": "notification_worker_failed",
+            "scope": stage,
+            "item_id": item_id,
+            "exception_type": type(exc).__name__,
+            "exception_frame": (
+                f"{frame.filename}:{frame.lineno}:{frame.name}" if frame else "unavailable"
+            ),
+        },
+    )
+    NOTIFICATION_WORKER_ERRORS.labels(stage=stage).inc()
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,12 +131,14 @@ class NotificationOutboxProcessor:
         providers: ProviderRegistry | None = None,
         *,
         now: Callable[[], datetime] = utc_now,
+        status: NotificationWorkerStatus | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._settings = settings
         self._cipher = cipher
         self._providers = providers or build_provider_registry(settings)
         self._now = now
+        self._status = status
 
     async def run_once(self) -> int:
         item_ids = self._claim_batch()
@@ -99,20 +146,15 @@ class NotificationOutboxProcessor:
             try:
                 await self._process_item(item_id)
             except Exception as exc:
-                logger.warning(
-                    "notification_work_item_failed",
-                    extra={
-                        "event": "notification_work_item_failed",
-                        "item_id": item_id,
-                        "exception_type": type(exc).__name__,
-                    },
-                )
+                _log_worker_failure(exc, stage="item", item_id=item_id)
                 self._release_item(
                     item_id,
                     available_at=self._now()
                     + timedelta(seconds=self._settings.notification_retry_base_seconds),
                     error_code="worker_error",
                 )
+            if self._status is not None:
+                self._status.progress()
         self._update_pending_metric()
         return len(item_ids)
 
@@ -145,7 +187,11 @@ class NotificationOutboxProcessor:
             self._complete_item(item_id)
             return
 
-        progress = [await self._process_target(event_id, descriptor) for descriptor in targets]
+        progress: list[_TargetProgress] = []
+        for descriptor in targets:
+            progress.append(await self._process_target(event_id, descriptor))
+            if self._status is not None:
+                self._status.progress()
         pending = [item for item in progress if not item.terminal]
         if not pending:
             errors = sorted({item.error_code for item in progress if item.error_code})
@@ -177,29 +223,7 @@ class NotificationOutboxProcessor:
                 self._complete_item(item_id, error_code="incident_unavailable")
                 return None
 
-            route_rows = db.scalars(
-                select(NotificationRoute)
-                .where(NotificationRoute.enabled.is_(True))
-                .order_by(NotificationRoute.priority, NotificationRoute.id)
-            ).all()
-            routes: list[RouteRule] = []
-            for row in route_rows:
-                try:
-                    routes.append(
-                        RouteRule(
-                            route_id=row.id,
-                            priority=row.priority,
-                            source_filter=frozenset(str(value) for value in row.source_filter),
-                            severity_filter=frozenset(str(value) for value in row.severity_filter),
-                            label_matchers=tuple(
-                                parse_matcher(value) for value in row.label_matchers
-                            ),
-                            channel_ids=tuple(str(value) for value in row.channel_ids),
-                            continue_matching=row.continue_matching,
-                        )
-                    )
-                except (TypeError, ValueError):
-                    continue
+            routes = notification_route_rules(db)
             selected_ids = select_channel_ids(
                 routes,
                 source_id=incident.source_id,
@@ -288,6 +312,17 @@ class NotificationOutboxProcessor:
                 descriptor,
             )
 
+        obsolete, historical = self._backlog_policy(event_id)
+        if obsolete is not None:
+            return self._skip_historical_delivery(delivery_id, event_id, descriptor, obsolete)
+        if historical:
+            # A still-active old incident remains notifiable. Pace its individual
+            # provider calls so restart recovery cannot burst through the backlog.
+            await asyncio.sleep(self._settings.notification_backlog_spacing_seconds)
+            obsolete, _ = self._backlog_policy(event_id)
+            if obsolete is not None:
+                return self._skip_historical_delivery(delivery_id, event_id, descriptor, obsolete)
+
         delivery = self._begin_delivery(delivery_id, event_id, descriptor)
         if delivery is None:
             return _TargetProgress(True, error_code="target_unavailable")
@@ -317,44 +352,64 @@ class NotificationOutboxProcessor:
                     )
         return self._record_result(delivery_id, descriptor, result, attempt)
 
+    def _backlog_policy(self, event_id: str) -> tuple[str | None, bool]:
+        with self._session_factory() as db:
+            event = db.get(IncidentEvent, event_id)
+            if event is None:
+                return None, False
+            historical = (self._now() - event.occurred_at).total_seconds() > (
+                self._settings.notification_backlog_age_seconds
+            )
+            if not historical:
+                return None, False
+            latest = db.scalar(
+                select(IncidentEvent)
+                .where(
+                    IncidentEvent.incident_id == event.incident_id,
+                    IncidentEvent.event_type.in_(["firing", "resolved"]),
+                )
+                .order_by(IncidentEvent.occurred_at.desc(), IncidentEvent.event_key.desc())
+                .limit(1)
+            )
+            if latest is not None and latest.id != event.id:
+                return "backlog_superseded", True
+            if event.event_type == "resolved":
+                return "backlog_expired_recovery", True
+            return None, True
+
+    def _skip_historical_delivery(
+        self, delivery_id: str, event_id: str, descriptor: _TargetDescriptor, reason: str
+    ) -> _TargetProgress:
+        with self._session_factory.begin() as db:
+            delivery = db.get(Delivery, delivery_id)
+            if delivery is not None and delivery.status in {"succeeded", "failed", "gone"}:
+                return _TargetProgress(True, error_code=delivery.error_code)
+            if delivery is None:
+                delivery = Delivery(
+                    id=delivery_id,
+                    event_id=event_id,
+                    channel_id=descriptor.channel_id,
+                    subscription_id=descriptor.subscription_id,
+                    owner_node_id=self._settings.node_id,
+                    attempt=0,
+                    status="failed",
+                )
+                db.add(delivery)
+            delivery.status = "failed"
+            delivery.provider_status = "policy_skipped"
+            delivery.error_code = reason
+            delivery.finished_at = self._now()
+            db.flush()
+            self._append_receipt(db, delivery)
+        return _TargetProgress(True, error_code=reason)
+
     def _delivery_rank(
         self,
         db: Session,
         event_identity: str,
         channel: NotificationChannel,
     ) -> tuple[int | None, bool]:
-        nodes = db.scalars(select(Node).order_by(Node.id)).all()
-        candidates = [
-            NodeCandidate(
-                node_id=node.id,
-                region=node.region,
-                enabled_roles=frozenset(node.enabled_roles),
-            )
-            for node in nodes
-        ]
-        known_node_ids = {candidate.node_id for candidate in candidates}
-        configured_node_ids = {
-            str(node_id)
-            for node_id in (channel.eligible_nodes_or_regions or {}).get("node_ids", [])
-            if str(node_id)
-        }
-        # Explicit channel eligibility is replicated with the channel and is more
-        # stable than a partially synchronized Node projection. Retain configured
-        # candidates even if their inventory row has not arrived on this node yet.
-        candidates.extend(
-            NodeCandidate(node_id=node_id, region="", enabled_roles=frozenset({"notify"}))
-            for node_id in sorted(configured_node_ids - known_node_ids)
-        )
-        ranking = rank_delivery_nodes(
-            event_identity,
-            channel.id,
-            candidates,
-            channel.eligible_nodes_or_regions or {},
-        )
-        try:
-            return ranking.index(self._settings.node_id), True
-        except ValueError:
-            return None, bool(ranking)
+        return delivery_rank(db, self._settings, event_identity, channel)
 
     def _defer_no_eligible_node(
         self,
@@ -646,16 +701,7 @@ class NotificationOutboxProcessor:
 
     def _update_pending_metric(self) -> None:
         with self._session_factory() as db:
-            pending = int(
-                db.scalar(
-                    select(func.count(Outbox.id)).where(
-                        Outbox.topic == "notification_event",
-                        Outbox.completed_at.is_(None),
-                    )
-                )
-                or 0
-            )
-            OUTBOX_PENDING.set(pending)
+            update_notification_backlog_metrics(db, self._settings)
 
 
 def _safe_provider_value(value: str | None) -> str | None:
@@ -669,16 +715,76 @@ async def notification_worker_loop(
     settings: Settings,
     cipher: EnvelopeCipher | None,
     providers: ProviderRegistry | None = None,
+    *,
+    status: NotificationWorkerStatus | None = None,
 ) -> None:
     """Run the durable notification processor until its task is cancelled."""
 
+    status = status or NotificationWorkerStatus(enabled=True)
     processor = NotificationOutboxProcessor(
         session_factory,
         settings,
         cipher,
         providers,
+        status=status,
     )
+    failures = 0
+    status.running = True
+    NOTIFICATION_WORKER_UP.set(1)
+    try:
+        while True:
+            try:
+                processed = await processor.run_once()
+            except Exception as exc:
+                failures += 1
+                status.failures += 1
+                status.last_error_type = type(exc).__name__
+                _log_worker_failure(exc, stage="iteration")
+                await asyncio.sleep(
+                    retry_delay_seconds(
+                        min(failures, 10),
+                        settings.notification_retry_base_seconds,
+                        min(30.0, settings.notification_retry_max_seconds),
+                    )
+                )
+            else:
+                failures = 0
+                status.progress()
+                # Always yield, including a permanently busy queue, for clean
+                # cancellation and independent HTTP/peer/heartbeat processing.
+                await asyncio.sleep(settings.notification_poll_seconds if processed == 0 else 0)
+    finally:
+        status.running = False
+        NOTIFICATION_WORKER_UP.set(0)
+
+
+async def notification_worker_supervisor(
+    session_factory: sessionmaker[Session],
+    settings: Settings,
+    cipher: EnvelopeCipher | None,
+    providers: ProviderRegistry | None = None,
+    *,
+    status: NotificationWorkerStatus,
+) -> None:
+    """Restart unexpected task exits without an unbounded tight restart loop."""
+    failures = 0
     while True:
-        processed = await processor.run_once()
-        if processed == 0:
-            await asyncio.sleep(settings.notification_poll_seconds)
+        try:
+            await notification_worker_loop(
+                session_factory, settings, cipher, providers, status=status
+            )
+            raise RuntimeError("notification worker exited unexpectedly")
+        except Exception as exc:
+            failures += 1
+            status.running = False
+            NOTIFICATION_WORKER_UP.set(0)
+            status.failures += 1
+            status.last_error_type = type(exc).__name__
+            _log_worker_failure(exc, stage="supervisor")
+            await asyncio.sleep(
+                retry_delay_seconds(
+                    min(failures, 10),
+                    settings.notification_retry_base_seconds,
+                    min(30.0, settings.notification_retry_max_seconds),
+                )
+            )

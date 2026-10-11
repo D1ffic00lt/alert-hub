@@ -143,6 +143,86 @@ describe("API endpoint manager", () => {
     expect(manager.snapshot().activeOrigin).toBe(DEAD);
   });
 
+  it("fails over an unavailable monitoring envelope even when HTTP readiness is healthy", async () => {
+    const calls: string[] = [];
+    const manager = clientManager(
+      vi.fn(async (input) => {
+        const url = String(input);
+        calls.push(url);
+        if (url.endsWith("/health/ready")) return new Response("{}", { status: 200 });
+        return Response.json({
+          status: new URL(url).origin === DEAD ? "unavailable" : "ok",
+          samples: [],
+        });
+      }) as typeof fetch,
+    );
+
+    const response = await manager.fetchApi(
+      "/metrics/queries/firing_alerts",
+      {},
+      { retryUnavailableData: true },
+    );
+
+    expect(await response.json()).toMatchObject({ status: "ok" });
+    expect(manager.snapshot().activeOrigin).toBe(LIVE);
+    expect(calls.filter((url) => url.includes("/api/v1/"))).toEqual([
+      `${DEAD}/api/v1/metrics/queries/firing_alerts`,
+      `${LIVE}/api/v1/metrics/queries/firing_alerts`,
+    ]);
+  });
+
+  it.each(["partial", "empty", "not_configured"])(
+    "preserves the authoritative %s monitoring envelope",
+    async (status) => {
+      const fetchImpl = vi.fn(async () => Response.json({ status, samples: [] })) as typeof fetch;
+      const manager = clientManager(fetchImpl);
+      const response = await manager.fetchApi(
+        "/metrics/reachability",
+        {},
+        { retryUnavailableData: true },
+      );
+      expect(await response.json()).toMatchObject({ status });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("preserves unavailable evidence when every monitoring peer is unavailable", async () => {
+    const payload = { status: "unavailable", errors: [{ code: "http_error" }] };
+    const manager = clientManager(
+      vi.fn(async (input) =>
+        String(input).endsWith("/health/ready")
+          ? Response.json({ status: "ok" })
+          : Response.json(payload),
+      ) as typeof fetch,
+    );
+    const response = await manager.fetchApi(
+      "/metrics/reachability",
+      {},
+      { retryUnavailableData: true },
+    );
+    expect(await response.json()).toEqual(payload);
+  });
+
+  it("bounds a stalled response body and retries a safe read on the reserve", async () => {
+    const cancelled = vi.fn();
+    const manager = new ApiEndpointManager(
+      { mode: "client-failover", nodePublicApiUrl: DEAD, candidates: [DEAD, LIVE] },
+      {
+        affinityStorage: null,
+        requestTimeoutMs: 10,
+        fetchImpl: vi.fn(async (input) =>
+          String(input) === `${DEAD}/api/v1/incidents`
+            ? new Response(new ReadableStream({ cancel: cancelled }), { status: 200 })
+            : Response.json({ incidents: [] }),
+        ) as typeof fetch,
+      },
+    );
+    const response = await manager.fetchApi("/incidents");
+    expect(await response.json()).toEqual({ incidents: [] });
+    expect(manager.snapshot().activeOrigin).toBe(LIVE);
+    expect(cancelled).toHaveBeenCalledTimes(1);
+  });
+
   it("returns an explicit Check 404 after every healthy API reports it missing", async () => {
     const fetchImpl = vi.fn(async () => new Response("{}", { status: 404 })) as typeof fetch;
     const manager = clientManager(fetchImpl);

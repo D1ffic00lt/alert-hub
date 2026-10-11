@@ -2172,10 +2172,13 @@ async function apiFetch(
   if (typeof init.body === "string" && !headers.has("Content-Type"))
     headers.set("Content-Type", "application/json");
   const requestInit = { ...init, credentials: "include" as RequestCredentials, headers };
-  let response = await apiEndpointManager.fetchApi(path, requestInit, {
+  const requestOptions = {
     replayRefresh: path === "/auth/refresh",
     retryNotFound: endpointOptions.retryNotFound,
-  });
+    retryUnavailableData:
+      path.split("?", 1)[0] === "/metrics/reachability" || path.startsWith("/metrics/queries/"),
+  };
+  let response = await apiEndpointManager.fetchApi(path, requestInit, requestOptions);
   assertExpectedAuthContext();
   if (response.status === 401 && !path.startsWith("/auth/")) {
     const refreshed =
@@ -2185,7 +2188,7 @@ async function apiFetch(
     if (refreshed && memoryAccessToken) {
       headers.set("Authorization", `Bearer ${memoryAccessToken}`);
       if (memorySessionId) headers.set("X-Alert-Hub-Cache-Partition", memorySessionId);
-      response = await apiEndpointManager.fetchApi(path, requestInit, endpointOptions);
+      response = await apiEndpointManager.fetchApi(path, requestInit, requestOptions);
       assertExpectedAuthContext();
     }
   }
@@ -3131,6 +3134,7 @@ function useHubData(
     let retryTimer: number | undefined;
     let renewalTimer: number | undefined;
     let stream: EventSource | undefined;
+    let streamOrigin = apiEndpointManager.snapshot().activeOrigin;
     let renewal: Promise<void> | null = null;
     let reconnectAttempt = 0;
     const eventRefresh = createRefreshBurstCoalescer(async () => {
@@ -3186,25 +3190,32 @@ function useHubData(
       if (stopped) return;
       retryTimer = undefined;
       stream?.close();
+      streamOrigin = apiEndpointManager.snapshot().activeOrigin;
       // EventSource cannot attach a bearer header. The backend's short-lived,
       // HttpOnly stream cookie is renewed together with the access token.
-      stream = new EventSource(apiEndpointManager.apiUrl("/stream"), {
+      const connectedStream = new EventSource(apiEndpointManager.apiUrl("/stream"), {
         withCredentials: true,
       });
+      stream = connectedStream;
       stream.onopen = () => {
-        if (stopped) return;
+        if (stopped || stream !== connectedStream) return;
         if (poller) window.clearInterval(poller);
         poller = undefined;
         reconnectAttempt = 0;
         setLiveUpdates(true);
         scheduleRenewal();
       };
-      stream.onmessage = eventRefresh.request;
+      stream.onmessage = () => {
+        if (!stopped && stream === connectedStream) eventRefresh.request();
+      };
       stream.onerror = () => {
-        if (stopped) return;
+        if (stopped || stream !== connectedStream) return;
         setLiveUpdates(false);
         stream?.close();
         startPolling();
+        // A quiet stream can be the first sign of node loss. Safe reads immediately
+        // test the data path and select a reserve instead of waiting for the poll interval.
+        eventRefresh.request();
         if (memoryAccessExpiresAt && memoryAccessExpiresAt - Date.now() <= 30_000) {
           void renewStream();
           return;
@@ -3214,9 +3225,19 @@ function useHubData(
         scheduleRetry(connect, delay);
       };
     };
+    const unsubscribeEndpoint = apiEndpointManager.subscribe(() => {
+      if (stopped || apiEndpointManager.snapshot().activeOrigin === streamOrigin) return;
+      stream?.close();
+      clearTimers();
+      setLiveUpdates(false);
+      startPolling();
+      reconnectAttempt = 0;
+      connect();
+    });
     connect();
     return () => {
       stopped = true;
+      unsubscribeEndpoint();
       stream?.close();
       eventRefresh.cancel();
       if (poller) window.clearInterval(poller);

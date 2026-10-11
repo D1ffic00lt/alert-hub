@@ -17,6 +17,28 @@ HEARTBEAT_EVALUATION_ERRORS = Counter(
 )
 INCIDENTS_OPEN = Gauge("alert_hub_incidents_open", "Current non-resolved incidents")
 OUTBOX_PENDING = Gauge("alert_hub_outbox_pending", "Pending outbox records")
+NOTIFICATION_WORKER_UP = Gauge(
+    "alert_hub_notification_worker_up", "Local notification task running"
+)
+NOTIFICATION_WORKER_ENABLED = Gauge(
+    "alert_hub_notification_worker_enabled", "Local notification worker configured"
+)
+NOTIFICATION_WORKER_PROGRESS = Gauge(
+    "alert_hub_notification_worker_last_progress_timestamp_seconds",
+    "Last successful notification work item or idle iteration",
+)
+NOTIFICATION_WORKER_ERRORS = Counter(
+    "alert_hub_notification_worker_errors_total",
+    "Recovered notification worker failures",
+    ("stage",),
+)
+NOTIFICATION_OWNED_PENDING = Gauge(
+    "alert_hub_notification_owned_pending", "Pending work with at least one locally owned target"
+)
+NOTIFICATION_OWNED_OLDEST = Gauge(
+    "alert_hub_notification_owned_oldest_timestamp_seconds",
+    "Receipt timestamp of oldest locally owned pending work, zero when empty",
+)
 DELIVERY_TOTAL = Counter(
     "alert_hub_delivery_total", "Notification delivery attempts", ("channel_kind", "status")
 )

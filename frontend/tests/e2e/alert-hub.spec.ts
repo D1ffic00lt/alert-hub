@@ -161,10 +161,15 @@ async function installApi(page: Page, state: MockState) {
         onmessage: (() => void) | null = null;
         onerror: (() => void) | null = null;
 
-        constructor() {
+        constructor(url: string) {
+          const streams =
+            (window as unknown as { __alertHubStreamUrls?: string[] }).__alertHubStreamUrls ?? [];
+          streams.push(url);
           Object.assign(window, {
+            __alertHubStreamUrls: streams,
             __alertHubStreamReady: () => true,
             __emitAlertHubStreamMessage: () => this.onmessage?.(),
+            __emitAlertHubStreamError: () => this.onerror?.(),
           });
           queueMicrotask(() => this.onopen?.());
         }
@@ -1703,6 +1708,43 @@ test("incidents use stable skeletons and keep tab counts while a filter loads", 
   await expect(page.locator(".incident-table-skeleton")).toHaveCount(0);
 });
 
+test("a quiet SSE failure immediately moves live updates and data reads to the reserve API", async ({
+  page,
+}) => {
+  const primary = "https://api-primary.alerts.example.test";
+  const reserve = "https://api-reserve.alerts.example.test";
+  const state: MockState = {
+    authoritativeUnauthorized: false,
+    lateTokenRequests: [],
+    liveEventSource: true,
+    logoutRequests: 0,
+    primaryUnavailable: false,
+    refreshGate: null,
+    refreshRequests: 0,
+    refreshStarted: null,
+    sourceRequest: null,
+  };
+  await installClientFailoverRuntime(page, primary, reserve);
+  await installApi(page, state);
+  await signIn(page);
+  await expect(page.getByText("В реальном времени", { exact: true })).toBeVisible();
+
+  state.primaryUnavailable = true;
+  await page.evaluate(() =>
+    (window as unknown as { __emitAlertHubStreamError: () => void }).__emitAlertHubStreamError(),
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as unknown as { __alertHubStreamUrls: string[] }).__alertHubStreamUrls?.at(-1),
+      ),
+    )
+    .toBe(`${reserve}/api/v1/stream`);
+  await expect(page.getByText("В реальном времени", { exact: true })).toBeVisible();
+  await page.locator(".sidebar__nav").getByRole("button", { name: "Настройки" }).click();
+  await expect(page.getByText(`Активный API: ${reserve}`)).toBeVisible();
+});
+
 test("incidents load once without waiting for metrics and report partial bulk results", async ({
   page,
 }) => {
@@ -1863,6 +1905,7 @@ test("client failover starts on a reserve API and keeps mutations on the selecte
     incidentListRequests: [],
     incidents,
     lateTokenRequests: [],
+    liveEventSource: true,
     logoutRequests: 0,
     primaryUnavailable: false,
     refreshGate: null,
@@ -1873,10 +1916,24 @@ test("client failover starts on a reserve API and keeps mutations on the selecte
   await installClientFailoverRuntime(page, primaryBase, reserveBase);
   await installApi(page, state);
   await signIn(page);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as unknown as { __alertHubStreamUrls: string[] }).__alertHubStreamUrls?.at(-1),
+      ),
+    )
+    .toBe(`${primaryBase}/api/v1/stream`);
 
   state.primaryUnavailable = true;
   await page.locator(".sidebar__nav").getByRole("button", { name: "Инциденты" }).click();
   await expect(page.getByText("Peer incident 0", { exact: true })).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as unknown as { __alertHubStreamUrls: string[] }).__alertHubStreamUrls?.at(-1),
+      ),
+    )
+    .toBe(`${reserveBase}/api/v1/stream`);
   await page.getByLabel("Выбрать текущую страницу").check();
   await expect(page.getByRole("button", { name: "Выбрать все 52 результатов" })).toBeVisible();
   await page.getByRole("button", { name: "Выбрать все 52 результатов" }).click();

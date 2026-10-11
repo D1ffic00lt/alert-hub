@@ -1,0 +1,48 @@
+groups:
+  - name: alert-hub-notifications
+    rules:
+      - alert: AlertHubMetricsUnavailable
+        expr: up{job="alert-hub"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: alert-hub
+        annotations:
+          summary: Alert Hub operational metrics cannot be scraped
+          description: Check the local API and private monitoring connection.
+      - alert: AlertHubNotificationWorkerUnavailable
+        expr: |
+          (alert_hub_notification_worker_enabled{job="alert-hub"} == 1)
+          and on (job, instance)
+          ((alert_hub_notification_worker_up{job="alert-hub"} == 0)
+          or (time() - alert_hub_notification_worker_last_progress_timestamp_seconds{job="alert-hub"} > 120))
+        for: 2m
+        labels:
+          severity: critical
+          service: alert-hub
+        annotations:
+          summary: Alert Hub notification worker stopped making progress
+          description: API readiness alone does not prove that notifications are being sent.
+      - alert: AlertHubNotificationTelemetryMissing
+        expr: |
+          (up{job="alert-hub"} == 1)
+          unless on (job, instance) alert_hub_notification_worker_enabled{job="alert-hub"}
+        for: 2m
+        labels:
+          severity: warning
+          service: alert-hub
+        annotations:
+          summary: Alert Hub notification worker telemetry is missing
+          description: Verify the deployed API version and notification worker metrics.
+      - alert: AlertHubNotificationBacklogAging
+        expr: |
+          (alert_hub_notification_owned_pending{job="alert-hub"} > 0)
+          and on (job, instance)
+          (time() - alert_hub_notification_owned_oldest_timestamp_seconds{job="alert-hub"} > 900)
+        for: 2m
+        labels:
+          severity: warning
+          service: alert-hub
+        annotations:
+          summary: Locally owned Alert Hub notification work is older than fifteen minutes
+          description: Inspect provider errors and durable delivery receipts. Remote owner waits are excluded.

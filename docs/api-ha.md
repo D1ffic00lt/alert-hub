@@ -80,7 +80,14 @@ probe burst across concurrent callers, probes only shallow `/health/ready`, and
 prefers the current healthy endpoint. Each read/refresh attempt and health probe
 has a finite timeout. Network errors, timeouts, and `5xx` responses place an
 endpoint in exponential backoff and allow a safe `GET` or `HEAD` to move to the
-next candidate. Concurrent failures share one recovery probe instead of each
+next candidate. The request deadline includes the complete response body, so
+receiving headers alone cannot leave a safe read indefinitely blocked.
+Reachability and named metric reads also try a reserve when their HTTP `200`
+envelope explicitly reports `status: unavailable`; shallow readiness does not
+prove datasource availability. Partial, empty, and unconfigured results remain
+authoritative. If every candidate lacks monitoring evidence, the original
+unavailable envelope is preserved with its diagnostic errors.
+Concurrent failures share one recovery probe instead of each
 starting another probe burst. An authoritative `4xx` never triggers failover, except that a
 `401/403` from a non-issuing node is treated as temporary unavailability while a fresh session's
 bounded issuing-node affinity is active.
@@ -97,7 +104,10 @@ ordinary replication lag for logout.
 Normal `POST`, `PATCH`, `PUT`, and `DELETE` requests are never replayed after an
 ambiguous network failure. Refresh recovery is the narrow exception: it may try
 another eligible API, and concurrent refresh work remains coalesced. SSE follows
-the current selected endpoint after token renewal. Settings shows the mode,
+the current selected endpoint immediately when routing changes, as well as
+after token renewal. A stream error initiates safe data reads immediately to
+detect node loss without waiting for the next polling interval. Closed stream
+callbacks cannot modify the replacement stream's state. Settings shows the mode,
 active origin, aggregate health counts, health/backoff state, the last switch,
 and degraded routing reason. Candidate origins are not seeded from
 `localStorage`; authenticated cluster inventory may only add another validated

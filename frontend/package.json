@@ -4,7 +4,9 @@
   "license": "MIT",
   "private": true,
   "overrides": {
-    "smol-toml": "1.8.0"
+    "brace-expansion": "5.0.12",
+    "source-map-js": "1.2.2",
+    "katex": "0.18.2"
   },
   "engines": {
     "node": ">=22.13.0"
@@ -18,7 +20,7 @@
     "format": "prettier --write . --ignore-unknown",
     "format:check": "prettier --check . --ignore-unknown",
     "lint": "eslint . --max-warnings=0 --ignore-pattern dist --ignore-pattern .next --ignore-pattern .venv",
-    "lint:markdown": "markdownlint-cli2 \"**/*.md\" \"!node_modules/**\" \"!dist/**\" \"!.venv/**\" \"!backend/.venv/**\"",
+    "lint:markdown": "node scripts/lint-markdown.mjs",
     "audit": "npm audit --audit-level=high",
     "typecheck": "tsc --noEmit"
   },
@@ -41,13 +43,14 @@
     "eslint-plugin-react-hooks": "7.1.1",
     "eslint-plugin-react-refresh": "0.5.6",
     "globals": "17.12.0",
-    "markdownlint-cli2": "0.23.2",
     "prettier": "3.9.6",
     "tailwindcss": "4.3.3",
     "typescript": "5.9.3",
     "typescript-eslint": "8.69.0",
     "vite": "8.2.2",
-    "vitest": "4.1.11"
+    "vitest": "4.1.11",
+    "markdownlint": "0.41.1",
+    "jsonc-parser": "3.3.1"
   },
   "type": "module"
 }
