@@ -1,0 +1,45 @@
+name: Deployment runner status
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alert-hub-production-rollout
+  cancel-in-progress: false
+
+jobs:
+  status_ru:
+    runs-on: [self-hosted, alert-hub-ru]
+    environment:
+      name: production-ru
+    timeout-minutes: 5
+    steps:
+      - name: Verify RU through the installed boundary
+        env:
+          NODE_NAME: ru
+        run: sudo /usr/local/sbin/docker-status-node.sh
+  status_nl:
+    needs: status_ru
+    runs-on: [self-hosted, alert-hub-nl]
+    environment:
+      name: production-nl
+    timeout-minutes: 5
+    steps:
+      - name: Verify NL through the installed boundary
+        env:
+          NODE_NAME: nl
+        run: sudo /usr/local/sbin/docker-status-node.sh
+  status_de:
+    needs: status_nl
+    runs-on: [self-hosted, alert-hub-de]
+    environment:
+      name: production-de
+    timeout-minutes: 5
+    steps:
+      - name: Verify DE through the installed boundary
+        env:
+          NODE_NAME: de
+        run: sudo /usr/local/sbin/docker-status-node.sh

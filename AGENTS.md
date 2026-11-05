@@ -114,7 +114,7 @@ Keep dependencies pointing inward. Do not invent repository classes for trivial 
 ## Git and CI
 
 - Work in small reviewable commits; never commit generated databases, runtime secrets, `.env`, caches, build output, or provider artifacts.
-- Pull requests target `main`. Required PR jobs must be read-only with least-privilege permissions and must not publish images or deploy.
+- Pull requests target `main`. Required PR jobs must be read-only with least-privilege permissions and must not publish images or deploy. Trusted same-repository CI runs in the existing isolated, capped CI VM; fork PRs use GitHub-hosted runners through the exact audited selector. All external-contributor runs require operator approval before execution; review workflow changes before approving them. Production CD runs separately without Docker membership or workspace checkouts.
 - Third-party GitHub Actions are pinned to full commit SHAs. Production images use an immutable tag/digest; never deploy `latest`.
 - `main` may publish only an immutable candidate. Releases originate from validated `vX.Y.Z` tags; deployment remains an explicit protected workflow.
 - Do not force-push, rewrite shared history, dismiss checks, loosen branch protection, or push/deploy unless the user explicitly authorizes that external mutation.

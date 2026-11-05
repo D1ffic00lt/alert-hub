@@ -18,7 +18,7 @@ jobs:
   preview_policy:
     name: Check preview eligibility
     if: github.ref == 'refs/heads/dev'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, ru3-ci-alert-hub]
     timeout-minutes: 5
     outputs:
       should_run: ${{ steps.decision.outputs.should_run }}
@@ -44,7 +44,7 @@ jobs:
     name: Build and publish frontend preview
     needs: preview_policy
     if: needs.preview_policy.outputs.should_run == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, ru3-ci-alert-hub]
     timeout-minutes: 20
     permissions:
       contents: read
@@ -52,6 +52,8 @@ jobs:
     outputs:
       image_ref: ${{ steps.image.outputs.image_ref }}
       compatibility: ${{ steps.image.outputs.compatibility }}
+    env:
+      DOCKER_CONFIG: ${{ runner.temp }}/alert-hub-registry-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -89,6 +91,12 @@ jobs:
           digest=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "${metadata_file}")
           printf 'image_ref=%s@%s\n' "${repository}" "${digest}" >>"${GITHUB_OUTPUT}"
           printf 'compatibility=%s\n' "${compatibility}" >>"${GITHUB_OUTPUT}"
+
+      - name: Remove ephemeral registry authentication
+        if: always()
+        run: |
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          rm -rf -- "${DOCKER_CONFIG}"
 
   deploy_ru:
     name: Deploy preview to RU

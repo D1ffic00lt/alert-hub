@@ -41,13 +41,21 @@ REQUIRED_AGENT_MARKERS = {
     "## Security rules",
     "## Tests and definition of done",
 }
-PRODUCTION_WORKFLOWS = {"deploy.yml", "rollback.yml"}
+PRODUCTION_WORKFLOWS = {"deploy.yml", "rollback.yml", "deployment-status.yml"}
 RELEASE_WORKFLOW = "release.yml"
 PREVIEW_WORKFLOW = "dev-preview.yml"
 PREVIEW_POLICY_JOB = "preview_policy"
 PREVIEW_PUBLISH_JOB = "build"
 SELF_HOSTED_WORKFLOWS = {*PRODUCTION_WORKFLOWS, PREVIEW_WORKFLOW}
 GITHUB_HOSTED_RUNNERS = {"ubuntu-24.04"}
+TRUSTED_CI_LABELS = ("self-hosted", "linux", "x64", "ru3-ci-alert-hub")
+TRUSTED_CI_RUNNER = (
+    "${{ fromJSON((github.event_name != 'pull_request' || "
+    "github.event.pull_request.head.repo.full_name == github.repository) && "
+    '\'["self-hosted","linux","x64","ru3-ci-alert-hub"]\' || '
+    "'[\"ubuntu-24.04\"]') }}"
+)
+CI_WORKFLOWS = {"ci.yml", "codeql.yml", RELEASE_WORKFLOW, PREVIEW_WORKFLOW, *PRODUCTION_WORKFLOWS}
 PRODUCTION_RUNNER_LABELS = {
     ("self-hosted", "alert-hub-ru"),
     ("self-hosted", "alert-hub-nl"),
@@ -369,6 +377,17 @@ def _runner_errors(path: Path, workflow: Mapping[str, Any]) -> list[str]:
             continue
         runs_on = job.get("runs-on")
         if isinstance(runs_on, str) and runs_on in GITHUB_HOSTED_RUNNERS:
+            continue
+        # This exact selector keeps fork PRs on hosted machines. Arbitrary
+        # dynamic selectors, missing predicates and other labels remain invalid.
+        if path.name in {"ci.yml", "codeql.yml"} and runs_on == TRUSTED_CI_RUNNER:
+            continue
+        if (
+            path.name in CI_WORKFLOWS
+            and isinstance(runs_on, list)
+            and tuple(runs_on) == TRUSTED_CI_LABELS
+            and "pull_request" not in workflow.get("on", {})
+        ):
             continue
         if _is_approved_self_hosted_job(path, job):
             continue

@@ -1423,7 +1423,7 @@ def test_dev_preview_is_one_dev_only_frontend_pipeline() -> None:
     preview_policy = workflow["jobs"]["preview_policy"]
     policy_run = _job_run(preview_policy)
     assert preview_policy["if"] == "github.ref == 'refs/heads/dev'"
-    assert preview_policy["runs-on"] == "ubuntu-24.04"
+    assert preview_policy["runs-on"] == list(_checker().TRUSTED_CI_LABELS)
     checkout = next(
         step
         for step in preview_policy["steps"]
@@ -1438,7 +1438,7 @@ def test_dev_preview_is_one_dev_only_frontend_pipeline() -> None:
     build_run = _job_run(build)
     assert build["needs"] == "preview_policy"
     assert build["if"] == "needs.preview_policy.outputs.should_run == 'true'"
-    assert build["runs-on"] == "ubuntu-24.04"
+    assert build["runs-on"] == list(_checker().TRUSTED_CI_LABELS)
     assert build["permissions"] == {"contents": "read", "packages": "write"}
     assert sum("docker buildx build" in str(step.get("run", "")) for step in build["steps"]) == 1
     assert "--file frontend/Dockerfile" in build_run
@@ -2984,3 +2984,21 @@ def test_failed_manual_rollback_restores_starting_config_before_starting_image()
         'activate_config_snapshot "${config_checksum}"',
         'apply_target "${component}" "${api_ref}" "${web_ref}" false',
     )
+
+
+def test_trusted_ci_selector_keeps_fork_gate_exact() -> None:
+    checker = _checker()
+    workflow = checker._load_workflow(REPOSITORY / ".github/workflows/ci.yml")
+    assert all(job["runs-on"] == checker.TRUSTED_CI_RUNNER for job in workflow["jobs"].values())
+    assert checker._runner_errors(Path("ci.yml"), workflow) == []
+    broken = dict(workflow)
+    broken["jobs"] = {
+        "unsafe": {
+            "runs-on": checker.TRUSTED_CI_RUNNER.replace(
+                "github.event.pull_request.head.repo.full_name == github.repository", "true"
+            )
+        }
+    }
+    assert checker._runner_errors(Path("ci.yml"), broken)
+    broken["jobs"] = {"unsafe": {"runs-on": list(checker.TRUSTED_CI_LABELS)}}
+    assert checker._runner_errors(Path("ci.yml"), broken)

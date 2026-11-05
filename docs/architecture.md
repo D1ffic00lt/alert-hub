@@ -272,3 +272,5 @@ before API migration, updates only the requested service, gates readiness, and r
 component's prior digest if the candidate fails. The separate manual deploy and rollback workflows
 select protected RU/NL/DE GitHub Environments; those names and runner labels are automation
 topology, not application logic.
+
+See [remote CI/CD operations](runbooks/remote-ci-cd.md) for the isolated VM, separate CD listener, restricted SSH transport and acceptance procedure.

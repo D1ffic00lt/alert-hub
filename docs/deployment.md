@@ -759,3 +759,5 @@ Never attach application env files, Actions secrets, token values, SQLite data,
 Docker auth configuration, or secret directories to workflow artifacts or
 issues. DNS records and certificates remain installation changes and are not
 created by these repository workflows.
+
+See [remote CI/CD operations](runbooks/remote-ci-cd.md) for the isolated VM, separate CD listener, restricted SSH transport and acceptance procedure.

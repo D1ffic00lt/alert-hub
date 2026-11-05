@@ -28,8 +28,10 @@ env:
 jobs:
   release:
     name: Test, publish, and attest compatible API and web images
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, ru3-ci-alert-hub]
     timeout-minutes: 120
+    env:
+      DOCKER_CONFIG: ${{ runner.temp }}/alert-hub-registry-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -86,7 +88,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e './backend[dev]' -e './integrations/alert-hub-mcp[dev]'
           npm --prefix frontend ci
-          npm --prefix frontend exec -- playwright install --with-deps chromium
+          npm --prefix frontend exec -- playwright install chromium
       - name: Run complete source and recovery gates
         env:
           APP_ENV: test
@@ -633,3 +635,9 @@ jobs:
             mv -- "${published_release}" release-state.json
           fi
           jq -e '.draft == false' release-state.json >/dev/null
+
+      - name: Remove ephemeral registry authentication
+        if: always()
+        run: |
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          rm -rf -- "${DOCKER_CONFIG}"

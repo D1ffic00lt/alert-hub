@@ -33,7 +33,7 @@ concurrency:
 jobs:
   prepare:
     name: Validate rollback request
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, ru3-ci-alert-hub]
     timeout-minutes: 5
     steps:
       - name: Fail closed on malformed input
