@@ -109,9 +109,11 @@ jobs:
           api_ref=$(jq -r '.images.api.reference' "${temporary}/release-manifest.json")
           web_ref=$(jq -r '.images.web.reference' "${temporary}/release-manifest.json")
           compatibility=$(jq -r '.compatibility' "${temporary}/release-manifest.json")
-          printf 'api_ref=%s\n' "${api_ref}" >>"${GITHUB_OUTPUT}"
-          printf 'web_ref=%s\n' "${web_ref}" >>"${GITHUB_OUTPUT}"
-          printf 'compatibility=%s\n' "${compatibility}" >>"${GITHUB_OUTPUT}"
+          {
+            printf 'api_ref=%s\n' "${api_ref}"
+            printf 'web_ref=%s\n' "${web_ref}"
+            printf 'compatibility=%s\n' "${compatibility}"
+          } >>"${GITHUB_OUTPUT}"
 
   deploy_ru:
     name: Deploy RU

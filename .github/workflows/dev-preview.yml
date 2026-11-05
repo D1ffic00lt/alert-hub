@@ -52,9 +52,12 @@ jobs:
     outputs:
       image_ref: ${{ steps.image.outputs.image_ref }}
       compatibility: ${{ steps.image.outputs.compatibility }}
-    env:
-      DOCKER_CONFIG: ${{ runner.temp }}/alert-hub-registry-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
+      - name: Create private registry authentication directory
+        run: |
+          umask 077
+          registry_auth_dir=$(mktemp -d "${RUNNER_TEMP}/alert-hub-registry.XXXXXX")
+          printf 'DOCKER_CONFIG=%s\n' "${registry_auth_dir}" >>"${GITHUB_ENV}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -93,10 +96,10 @@ jobs:
           printf 'compatibility=%s\n' "${compatibility}" >>"${GITHUB_OUTPUT}"
 
       - name: Remove ephemeral registry authentication
-        if: always()
+        if: always() && env.DOCKER_CONFIG != ''
         run: |
           docker logout ghcr.io >/dev/null 2>&1 || true
-          rm -rf -- "${DOCKER_CONFIG}"
+          rm -f -- "${DOCKER_CONFIG}/config.json"
 
   deploy_ru:
     name: Deploy preview to RU
