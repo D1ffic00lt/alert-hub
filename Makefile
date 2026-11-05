@@ -8,6 +8,7 @@ BASH_SCRIPTS := \
 	deploy/scripts/ci-migrations.sh \
 	deploy/scripts/check-no-secrets.sh \
 	deploy/scripts/test-backup-tool.sh \
+	deploy/scripts/ci-backup-tool.sh \
 	deploy/scripts/test-deploy-vapid-preflight.sh \
 	deploy/scripts/ci-alertmanager-recovery-smoke.sh \
 	deploy/scripts/ci-container-smoke.sh \
@@ -27,7 +28,8 @@ SH_SCRIPTS := \
 DEPLOY_PYTHON := \
 	deploy/scripts/check-codeql-sarif.py \
 	deploy/scripts/check-ci-policy.py \
-	deploy/scripts/check-openapi.py
+	deploy/scripts/check-openapi.py \
+	deploy/scripts/ci-remote-node.py
 override RUNTIME_ROOT := $(abspath runtime)
 override RUNTIME_SECRETS_DIR := $(RUNTIME_ROOT)/secrets
 
@@ -178,7 +180,7 @@ operations-check:
 		ALERT_HUB_CI_SINK_IP=10.253.250.5 \
 		docker compose -f deploy/docker-compose.ci-three-node.yaml config --quiet
 	bash deploy/scripts/test-deploy-vapid-preflight.sh
-	sudo bash deploy/scripts/test-backup-tool.sh
+	bash deploy/scripts/ci-backup-tool.sh
 
 container-smoke:
 	docker build --tag alert-hub-api:ci --file backend/Dockerfile backend
