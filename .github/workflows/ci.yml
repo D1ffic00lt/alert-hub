@@ -52,6 +52,15 @@ jobs:
           docker-compose.split.yml
       - name: Workflow trust policy
         run: python deploy/scripts/check-ci-policy.py
+      - name: Validate workflow syntax and expression contexts
+        run: |
+          actionlint_archive="${RUNNER_TEMP}/actionlint_1.7.12_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "${actionlint_archive}" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          printf '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  %s\n' "${actionlint_archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "${actionlint_archive}" --directory "${RUNNER_TEMP}" actionlint
+          "${RUNNER_TEMP}/actionlint" -color
       - name: Parse shell scripts
         run: |
           bash -n \

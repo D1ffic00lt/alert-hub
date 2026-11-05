@@ -1,0 +1,6 @@
+self-hosted-runner:
+  labels:
+    - ru3-ci-alert-hub
+    - alert-hub-ru
+    - alert-hub-nl
+    - alert-hub-de
