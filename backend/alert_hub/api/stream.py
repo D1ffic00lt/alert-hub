@@ -52,7 +52,9 @@ def _stream_claims(request: Request, db: Session, settings: Settings) -> dict[st
 def _event_snapshot(db: Session) -> tuple[int, ClusterEvent | None]:
     count = int(db.scalar(select(func.count(ClusterEvent.event_id))) or 0)
     latest = db.scalar(
-        select(ClusterEvent).order_by(ClusterEvent.received_at.desc(), ClusterEvent.event_id.desc())
+        select(ClusterEvent)
+        .order_by(ClusterEvent.received_at.desc(), ClusterEvent.event_id.desc())
+        .limit(1)
     )
     return count, latest
 

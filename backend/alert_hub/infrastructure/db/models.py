@@ -274,6 +274,7 @@ class ClusterEvent(Base):
     __table_args__ = (
         UniqueConstraint("origin_node_id", "origin_seq", name="uq_cluster_events_origin_seq"),
         Index("ix_cluster_events_origin_cursor", "origin_node_id", "origin_seq"),
+        Index("ix_cluster_events_received_at_event_id", "received_at", "event_id"),
         Index(
             "ix_cluster_events_type_operation_time",
             "entity_type",

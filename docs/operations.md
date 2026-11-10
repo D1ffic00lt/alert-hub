@@ -106,6 +106,10 @@ exist. The live UI owns one filtered page request while on `/incidents`, publish
 response independently of Prometheus latency, and coalesces short SSE bursts into at most one
 in-flight refresh plus one trailing refresh.
 
+The browser event stream polls the total cluster event count and fetches only the newest row
+using the `(received_at, event_id)` index. The index migration retains the event history and is
+compatible with the previous API image.
+
 `POST /api/v1/incidents/bulk-action` supports one of two explicit selection modes:
 
 - `ids`: up to 500 unique `incident_ids` selected across visible pages;
