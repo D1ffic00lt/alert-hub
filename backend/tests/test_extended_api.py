@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import create_engine, event, select
+from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
 
+from alert_hub.api.stream import _event_snapshot
 from alert_hub.api.stream import stream as stream_endpoint
 from alert_hub.application.notifications import (
     DeliveryResult,
@@ -663,6 +666,48 @@ def test_stream_cookie_authenticates_initial_sse_event(
     value = asyncio.run(first_event())
     assert "data:" in value
     assert '"type":"ready"' in value
+
+
+def test_stream_snapshot_only_loads_the_newest_event() -> None:
+    now = datetime.now(UTC)
+    engine = create_engine("sqlite://")
+    ClusterEvent.__table__.create(engine)
+    session_factory = sessionmaker(engine)
+    with session_factory.begin() as db:
+        for sequence, (event_id, received_at) in enumerate(
+            [("z-older", now - timedelta(seconds=1)), ("a-tie", now), ("b-newest", now)],
+            start=1,
+        ):
+            db.add(
+                ClusterEvent(
+                    event_id=event_id,
+                    origin_node_id="test-origin",
+                    origin_seq=sequence,
+                    entity_type="test",
+                    entity_id="test-entity",
+                    operation="update",
+                    occurred_at=now,
+                    received_at=received_at,
+                    payload_json={},
+                )
+            )
+
+    loaded: list[str] = []
+
+    def record_load(row: ClusterEvent, context: object) -> None:
+        loaded.append(row.event_id)
+
+    event.listen(ClusterEvent, "load", record_load)
+    try:
+        with session_factory() as db:
+            count, latest = _event_snapshot(db)
+    finally:
+        event.remove(ClusterEvent, "load", record_load)
+        engine.dispose()
+
+    assert count == 3
+    assert latest is not None and latest.event_id == "b-newest"
+    assert loaded == ["b-newest"]
 
 
 def test_production_startup_requires_master_key(tmp_path: Path) -> None:
